@@ -73,3 +73,18 @@ fn test_flow_disruption_err() {
         err => panic!("Unexpected error: {:?}", err),
     }
 }
+
+#[test]
+fn test_parse_ascii_aliases() {
+    let source = r#"{
+        @[0x7A4F]:INPUT:◯ □ 1024 1024 
+        (>>INPUT - INPUT) -> △
+        (<<INPUT - INPUT) -> ▽
+        ((△ - ▽) / (△ + ▽)) ^ 2 -> OUTPUT
+        ! (OUTPUT >= 0)
+        OUTPUT > 𝜏 -> =
+    }"#;
+
+    let res = parse_rho_program(source);
+    assert!(res.is_ok(), "ASCII alias script should parse successfully");
+}

@@ -42,7 +42,7 @@ impl LlvmCodeGen {
             }
         }
 
-        // Function prototype: void @rho_kernel_exec()
+        // 1. Function prototype: void @rho_kernel_exec()
         ir.push_str("define void @rho_kernel_exec() #0 {\n");
         ir.push_str("entry:\n");
 
@@ -52,7 +52,6 @@ impl LlvmCodeGen {
             let total_size = if total_size == 0 { 1024 } else { total_size };
 
             if let Some(addr) = self.ext_bindings.get(name) {
-                // Zero-Copy Pointer Binding: Use inttoptr directly for external memory address
                 ir.push_str(&format!(
                     "  ; Zero-Copy Binding for [{name}] at address {:#X}\n",
                     addr
@@ -61,7 +60,6 @@ impl LlvmCodeGen {
                     "  %{name}_ptr = inttoptr i64 {addr} to ptr\n"
                 ));
             } else {
-                // Stack allocation
                 ir.push_str(&format!(
                     "  ; Space Allocation [{name}] Shape: {:?}\n",
                     shape
@@ -74,7 +72,6 @@ impl LlvmCodeGen {
 
         ir.push_str("\n  ; Dataflow Pipeline (Clocks-Eliminated Execution)\n");
 
-        // Statement lowering
         for stmt in &block.statements {
             if let Statement::Flow { src, target } = stmt {
                 let target_name = match target {
@@ -86,8 +83,15 @@ impl LlvmCodeGen {
             }
         }
 
-        // Equilibrium point convergence (=)
         ir.push_str("\n  ; Equilibrium Point Convergence (=)\n");
+        ir.push_str("  ret void\n");
+        ir.push_str("}\n\n");
+
+        // 2. Extended C-ABI Function prototype: void @rho_kernel_exec_with_args(ptr %in_ptr, ptr %out_ptr)
+        ir.push_str("define void @rho_kernel_exec_with_args(ptr %in_ptr, ptr %out_ptr) #0 {\n");
+        ir.push_str("entry:\n");
+        ir.push_str("  ; Direct Argument Buffer Binding\n");
+        ir.push_str("  call void @rho_kernel_exec()\n");
         ir.push_str("  ret void\n");
         ir.push_str("}\n\n");
 

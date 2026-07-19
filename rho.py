@@ -37,10 +37,29 @@ class RhoEngine:
 
         print(f"[RhoEngine] Zero-Copy Memory Address bound: {hex(address)}")
 
-        # Call generated C-ABI function @rho_kernel_exec
         kernel_fn = getattr(self._lib, "rho_kernel_exec", None)
         if kernel_fn is None:
             raise AttributeError("Function @rho_kernel_exec not found in shared library")
 
         kernel_fn()
+        return True
+
+    def execute_kernel_with_args(self, input_buf, output_buf=None):
+        """Execute ρ kernel with direct argument pointers for input & output buffers"""
+        if self._lib is None:
+            self._load_library()
+
+        in_addr = input_buf.ctypes.data if hasattr(input_buf, "ctypes") else ctypes.addressof(input_buf)
+        out_addr = output_buf.ctypes.data if hasattr(output_buf, "ctypes") else (ctypes.addressof(output_buf) if output_buf else in_addr)
+
+        print(f"[RhoEngine] Input Address: {hex(in_addr)}, Output Address: {hex(out_addr)}")
+
+        kernel_fn = getattr(self._lib, "rho_kernel_exec_with_args", None)
+        if kernel_fn is not None:
+            kernel_fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            kernel_fn(ctypes.c_void_p(in_addr), ctypes.c_void_p(out_addr))
+        else:
+            # Fallback to standard kernel
+            self.execute_kernel(input_buf)
+
         return True

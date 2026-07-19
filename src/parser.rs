@@ -53,13 +53,24 @@ pub fn check_forbidden_keywords(input: &str) -> Result<()> {
     Ok(())
 }
 
+/// Normalize ASCII symbol aliases to Unicode RHO topological symbols
+pub fn normalize_ascii_aliases(input: &str) -> String {
+    input
+        .replace("->", "→")
+        .replace("=>", "→")
+        .replace(">>", "▷")
+        .replace("<<", "▽")
+        .replace("@", "&")
+}
+
 /// Top-level parser for ρ (RHO) Language source code
 pub fn parse_rho_program(input: &str) -> Result<ToposBlock> {
-    validate_symbols(input)?;
-    check_forbidden_keywords(input)?;
+    let normalized_input = normalize_ascii_aliases(input);
+    validate_symbols(&normalized_input)?;
+    check_forbidden_keywords(&normalized_input)?;
 
     let mut statements = Vec::new();
-    let clean_code = remove_comments(input);
+    let clean_code = remove_comments(&normalized_input);
 
     let trimmed = clean_code.trim();
     let content = if trimmed.starts_with('{') && trimmed.ends_with('}') {

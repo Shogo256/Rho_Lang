@@ -1,7 +1,7 @@
 # $\rho$ (RHO) Language Compiler
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](https://github.com/shogo/rho_lang)
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](https://github.com/Escoffier1156/Rho_Lang)
 [![LLVM Version](https://img.shields.io/badge/LLVM-22.1.8-dragon.svg)](https://llvm.org)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 
@@ -72,40 +72,52 @@ In Wasan, mathematical problems were solved not by step-by-step temporal loops, 
 
 ---
 
-## ⚡ Quick Start
+## ⚡ Quick Start & Installation
 
-### Prerequisites
+### 1. Clone Repository
+
+```bash
+git clone https://github.com/Escoffier1156/Rho_Lang.git
+cd Rho_Lang
+```
+
+### 2. Prerequisites
 
 - Rust (`cargo 1.80+`)
 - LLVM 22 / Clang 22
 
-### Build Compiler
+### 3. Build & Run Compiler CLI (`rhoc`)
 
 ```bash
+# Build compiler
 cargo build --release
-```
 
-### Run Compiler CLI (`rhoc`)
-
-```bash
-# Compile RHO source script to shared library (.so)
+# Compile RHO script to native shared library (.so)
 cargo run -- examples/teichmuller.rho
 
 # Dump Active Audit DAG Trace ($) & generated LLVM 22 IR
 cargo run -- examples/teichmuller.rho --dump-dag --dump-llvm
 ```
 
-### Python Zero-Copy Integration Demo
+### 4. Python Zero-Copy Integration Demo
 
 ```bash
 python3 examples/python_demo.py
 ```
 
-### Run Tests
+### 5. Run Tests
 
 ```bash
 cargo test
 ```
+
+---
+
+## 🧩 VS Code Extension Support
+
+To enable 20-symbol syntax highlighting and autocomplete snippets (`\shiftright` -> `▷`, `\space` -> `◯ □`):
+1. Copy or link the `editors/code/` folder into your VS Code extensions directory (`~/.vscode/extensions/rho-lang-vscode`).
+2. Open any `.rho` file in VS Code.
 
 ---
 

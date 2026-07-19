@@ -1,0 +1,15 @@
+{
+    /* Map existing tensor from external memory */
+    &[0x7A4F]:INPUT:◯ □ 1024 1024 
+    
+    /* Calculate spatial differences (Gradient extraction) */
+    (▷INPUT - INPUT) → △
+    (▽INPUT - INPUT) → ▽
+    
+    /* Calculate and verify spatial distortion ratio */
+    ((△ - ▽) / (△ + ▽)) ^ 2 → OUTPUT
+    ! (OUTPUT >= 0)
+    
+    /* Output regions exceeding threshold */
+    OUTPUT > 𝜏 → =
+}

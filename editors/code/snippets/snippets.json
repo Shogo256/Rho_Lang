@@ -1,0 +1,32 @@
+{
+  "Space Declaration": {
+    "prefix": ["space", "\\space"],
+    "body": ["${1:SPACE_NAME}:◯ □ ${2:1024} ${3:1024}"],
+    "description": "Declare a multi-dimensional spatial tensor matrix"
+  },
+  "Zero-Copy External Binding": {
+    "prefix": ["bind", "\\bind", "&"],
+    "body": ["&[0x${1:7A4F}]:${2:INPUT}:◯ □ ${3:1024} ${4:1024}"],
+    "description": "Bind external memory buffer with zero copy"
+  },
+  "Shift Right Operator": {
+    "prefix": ["\\shiftright", "\\right", "▷"],
+    "body": ["▷${1:INPUT}"],
+    "description": "Positive spatial vector shift right (▷)"
+  },
+  "Shift Left Operator": {
+    "prefix": ["\\shiftleft", "\\left", "▽"],
+    "body": ["▽${1:INPUT}"],
+    "description": "Negative spatial vector shift left (▽)"
+  },
+  "Flow Statement": {
+    "prefix": ["flow", "\\flow", "->"],
+    "body": ["${1:EXPRESSION} → ${2:TARGET}"],
+    "description": "Flow computation energy to target space or equilibrium point (=)"
+  },
+  "Constraint Solver": {
+    "prefix": ["constraint", "\\assert", "!"],
+    "body": ["! (${1:OUTPUT} >= 0)"],
+    "description": "Static constraint solver evaluation"
+  }
+}

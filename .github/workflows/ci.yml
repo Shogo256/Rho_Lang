@@ -1,0 +1,35 @@
+name: ρ (RHO) Language Compiler CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install LLVM & Clang
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang llvm
+
+    - name: Build Compiler (`rhoc`)
+      run: cargo build --verbose
+
+    - name: Run Unit Tests
+      run: cargo test --verbose
+
+    - name: Run Sample Compilation (`teichmuller.rho`)
+      run: cargo run -- examples/teichmuller.rho --dump-dag --dump-llvm

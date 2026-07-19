@@ -1,0 +1,46 @@
+{
+  "name": "rho-lang-vscode",
+  "displayName": "ρ (RHO) Language Support",
+  "description": "Syntax highlighting and language support for ρ (RHO) Topological Dataflow Language.",
+  "version": "0.1.0",
+  "publisher": "rho-lang",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shogo/rho_lang"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "rho",
+        "aliases": [
+          "ρ",
+          "RHO",
+          "rho"
+        ],
+        "extensions": [
+          ".rho"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "rho",
+        "scopeName": "source.rho",
+        "path": "./syntaxes/rho.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "rho",
+        "path": "./snippets/snippets.json"
+      }
+    ]
+  }
+}

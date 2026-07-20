@@ -1,9 +1,10 @@
 import ctypes
 import os
+import json
 import subprocess
 
 class RhoEngine:
-    """Python wrapper for ρ (RHO) Language Compiler Kernel"""
+    """Python wrapper for ρ (RHO) Language Compiler Kernel with Metadata & Safety Checks"""
 
     def __init__(self, kernel_so_path="libkernel.so"):
         self.kernel_so_path = os.path.abspath(kernel_so_path)
@@ -22,6 +23,19 @@ class RhoEngine:
             self._lib = ctypes.CDLL(self.kernel_so_path)
         else:
             raise FileNotFoundError(f"Shared library not found: {self.kernel_so_path}")
+
+    def get_metadata(self):
+        """Retrieve C-ABI JSON Metadata from compiled kernel"""
+        if self._lib is None:
+            self._load_library()
+
+        meta_fn = getattr(self._lib, "rho_kernel_metadata", None)
+        if meta_fn is not None:
+            meta_fn.restype = ctypes.c_char_p
+            raw_str = meta_fn()
+            if raw_str:
+                return json.loads(raw_str.decode("utf-8"))
+        return {"spaces": []}
 
     def execute_kernel(self, array_or_wrapper):
         """Execute ρ kernel directly on memory array buffer via Zero-Copy address"""
@@ -59,7 +73,6 @@ class RhoEngine:
             kernel_fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
             kernel_fn(ctypes.c_void_p(in_addr), ctypes.c_void_p(out_addr))
         else:
-            # Fallback to standard kernel
             self.execute_kernel(input_buf)
 
         return True

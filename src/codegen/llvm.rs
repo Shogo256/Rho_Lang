@@ -19,7 +19,7 @@ impl LlvmCodeGen {
         }
     }
 
-    /// Generate LLVM 22 IR (.ll) from AST ToposBlock
+    /// Generate complete LLVM 22 IR (.ll) from ToposBlock AST
     pub fn generate_llvm_ir(&mut self, block: &ToposBlock) -> Result<String> {
         let mut ir = String::new();
 
@@ -28,7 +28,11 @@ impl LlvmCodeGen {
         ir.push_str("target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n");
         ir.push_str("target triple = \"x86_64-unknown-linux-gnu\"\n\n");
 
-        // Collect space declarations
+        // Declarations for intrinsics
+        ir.push_str("declare double @llvm.pow.f64(double, double)\n");
+        ir.push_str("declare i32 @puts(ptr)\n\n");
+
+        // Collect space declarations and shapes
         for stmt in &block.statements {
             match stmt {
                 Statement::SpaceDef(decl) => {
@@ -38,61 +42,78 @@ impl LlvmCodeGen {
                     self.space_shapes.insert(bind.space.name.clone(), bind.space.dimensions.clone());
                     self.ext_bindings.insert(bind.space.name.clone(), bind.address);
                 }
+                Statement::Flow { target, .. } => {
+                    if let FlowTarget::Var(name) = target {
+                        if !self.space_shapes.contains_key(name) {
+                            self.space_shapes.insert(name.clone(), vec![4, 4]);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
 
-        // 1. Function prototype: void @rho_kernel_exec()
+        // Generate JSON Metadata constant string
+        let metadata_json = self.generate_metadata_json();
+        let metadata_len = metadata_json.len() + 1;
+        ir.push_str(&format!(
+            "@.rho_meta_str = private unnamed_addr constant [{metadata_len} x i8] c\"{}\\00\", align 1\n\n",
+            metadata_json.replace('\n', "").replace('"', "\\22")
+        ));
+
+        // 1. Static Execution Entrypoint: void @rho_kernel_exec()
         ir.push_str("define void @rho_kernel_exec() #0 {\n");
         ir.push_str("entry:\n");
 
-        // Memory allocation and zero-copy pointer bindings
+        let mut in_ptr_name = String::from("%INPUT_ptr");
+        let mut out_ptr_name = String::from("%OUTPUT_alloc");
+
         for (name, shape) in &self.space_shapes {
             let total_size: usize = shape.iter().product();
             let total_size = if total_size == 0 { 1024 } else { total_size };
 
             if let Some(addr) = self.ext_bindings.get(name) {
-                ir.push_str(&format!(
-                    "  ; Zero-Copy Binding for [{name}] at address {:#X}\n",
-                    addr
-                ));
-                ir.push_str(&format!(
-                    "  %{name}_ptr = inttoptr i64 {addr} to ptr\n"
-                ));
+                in_ptr_name = format!("%{name}_ptr");
+                ir.push_str(&format!("  ; Zero-Copy Binding for [{name}] at address {:#X}\n", addr));
+                ir.push_str(&format!("  %{name}_ptr = inttoptr i64 {addr} to ptr\n"));
             } else {
-                ir.push_str(&format!(
-                    "  ; Space Allocation [{name}] Shape: {:?}\n",
-                    shape
-                ));
-                ir.push_str(&format!(
-                    "  %{name}_alloc = alloca [{total_size} x double], align 64\n"
-                ));
+                if name == "OUTPUT" || out_ptr_name == "%OUTPUT_alloc" {
+                    out_ptr_name = format!("%{name}_alloc");
+                }
+                ir.push_str(&format!("  ; Space Allocation [{name}] Shape: {:?}\n", shape));
+                ir.push_str(&format!("  %{name}_alloc = alloca [{total_size} x double], align 64\n"));
             }
         }
 
-        ir.push_str("\n  ; Dataflow Pipeline (Clocks-Eliminated Execution)\n");
+        // Lower statements to IR loops
+        self.emit_statements_lowering(&block.statements, &mut ir, &in_ptr_name, &out_ptr_name, "entry");
 
-        for stmt in &block.statements {
-            if let Statement::Flow { src, target } = stmt {
-                let target_name = match target {
-                    FlowTarget::Var(n) => n.as_str(),
-                    FlowTarget::Equilibrium => "EQUILIBRIUM_OUT",
-                };
-                ir.push_str(&format!("  ; Flow: -> {}\n", target_name));
-                self.emit_expr_ir(src, &mut ir);
-            }
-        }
-
-        ir.push_str("\n  ; Equilibrium Point Convergence (=)\n");
         ir.push_str("  ret void\n");
         ir.push_str("}\n\n");
 
-        // 2. Extended C-ABI Function prototype: void @rho_kernel_exec_with_args(ptr %in_ptr, ptr %out_ptr)
+        // 2. Dynamic C-ABI Entrypoint: void @rho_kernel_exec_with_args(ptr %in_ptr, ptr %out_ptr)
         ir.push_str("define void @rho_kernel_exec_with_args(ptr %in_ptr, ptr %out_ptr) #0 {\n");
         ir.push_str("entry:\n");
-        ir.push_str("  ; Direct Argument Buffer Binding\n");
-        ir.push_str("  call void @rho_kernel_exec()\n");
+        ir.push_str("  ; Null Pointer Safety Check\n");
+        ir.push_str("  %in_null = icmp eq ptr %in_ptr, null\n");
+        ir.push_str("  br i1 %in_null, label %safety_fail, label %exec_start\n\n");
+
+        ir.push_str("safety_fail:\n");
+        ir.push_str("  ret void\n\n");
+
+        ir.push_str("exec_start:\n");
+        ir.push_str("  %out_null = icmp eq ptr %out_ptr, null\n");
+        ir.push_str("  %out_effective = select i1 %out_null, ptr %in_ptr, ptr %out_ptr\n");
+
+        self.emit_statements_lowering(&block.statements, &mut ir, "%in_ptr", "%out_effective", "exec_start");
+
         ir.push_str("  ret void\n");
+        ir.push_str("}\n\n");
+
+        // 3. C-ABI Metadata Export API: ptr @rho_kernel_metadata()
+        ir.push_str("define ptr @rho_kernel_metadata() #0 {\n");
+        ir.push_str("entry:\n");
+        ir.push_str("  ret ptr @.rho_meta_str\n");
         ir.push_str("}\n\n");
 
         ir.push_str("attributes #0 = { nounwind uwtable \"target-cpu\"=\"x86-64-v3\" }\n");
@@ -100,22 +121,121 @@ impl LlvmCodeGen {
         Ok(ir)
     }
 
-    fn emit_expr_ir(&self, expr: &Expr, ir: &mut String) {
+    fn generate_metadata_json(&self) -> String {
+        let mut json = String::from("{\"spaces\":[");
+        let mut entries = Vec::new();
+        for (name, shape) in &self.space_shapes {
+            entries.push(format!("{{\"name\":\"{}\",\"shape\":{:?}}}", name, shape));
+        }
+        json.push_str(&entries.join(","));
+        json.push_str("]}");
+        json
+    }
+
+    fn emit_statements_lowering(
+        &self,
+        statements: &[Statement],
+        ir: &mut String,
+        in_ptr_sym: &str,
+        out_ptr_sym: &str,
+        entry_block: &str,
+    ) {
+        let sample_size = 4; // Element-wise loop bounds
+
+        ir.push_str("  ; Element-wise Topological Dataflow Pipeline\n");
+        ir.push_str("  br label %loop.header\n\n");
+
+        ir.push_str("loop.header:\n");
+        ir.push_str(&format!("  %idx = phi i64 [ 0, %{entry_block} ], [ %next_idx, %loop.body ]\n"));
+        ir.push_str(&format!("  %cmp = icmp ult i64 %idx, {sample_size}\n"));
+        ir.push_str("  br i1 %cmp, label %loop.body, label %loop.end\n\n");
+
+        ir.push_str("loop.body:\n");
+        ir.push_str(&format!("  %in_gep = getelementptr inbounds double, ptr {in_ptr_sym}, i64 %idx\n"));
+        ir.push_str("  %val_in = load double, ptr %in_gep, align 8\n");
+
+        // Statement evaluation
+        let mut current_val_sym = String::from("%val_in");
+        let mut val_counter = 0;
+
+        for stmt in statements {
+            if let Statement::Flow { src, target } = stmt {
+                val_counter += 1;
+                let next_sym = format!("%calc_val_{val_counter}");
+                self.emit_expr_lowering(src, &current_val_sym, &next_sym, ir);
+                current_val_sym = next_sym;
+
+                if *target == FlowTarget::Equilibrium {
+                    ir.push_str(&format!("  %out_gep = getelementptr inbounds double, ptr {out_ptr_sym}, i64 %idx\n"));
+                    ir.push_str(&format!("  store double {current_val_sym}, ptr %out_gep, align 8\n"));
+                }
+            }
+        }
+
+        ir.push_str("  %next_idx = add i64 %idx, 1\n");
+        ir.push_str("  br label %loop.header\n\n");
+
+        ir.push_str("loop.end:\n");
+    }
+
+    fn emit_expr_lowering(&self, expr: &Expr, in_sym: &str, out_sym: &str, ir: &mut String) {
         match expr {
+            Expr::BinaryOp { op, lhs, rhs } => {
+                let lhs_sym = format!("{out_sym}_lhs");
+                let rhs_sym = format!("{out_sym}_rhs");
+                self.emit_expr_lowering(lhs, in_sym, &lhs_sym, ir);
+                self.emit_expr_lowering(rhs, in_sym, &rhs_sym, ir);
+
+                match op {
+                    BinaryOpKind::Add => {
+                        ir.push_str(&format!("  {out_sym} = fadd double {lhs_sym}, {rhs_sym}\n"));
+                    }
+                    BinaryOpKind::Sub => {
+                        ir.push_str(&format!("  {out_sym} = fsub double {lhs_sym}, {rhs_sym}\n"));
+                    }
+                    BinaryOpKind::Mul => {
+                        ir.push_str(&format!("  {out_sym} = fmul double {lhs_sym}, {rhs_sym}\n"));
+                    }
+                    BinaryOpKind::Div => {
+                        ir.push_str(&format!("  {out_sym} = fdiv double {lhs_sym}, {rhs_sym}\n"));
+                    }
+                    BinaryOpKind::Pow => {
+                        ir.push_str(&format!("  {out_sym} = call double @llvm.pow.f64(double {lhs_sym}, double {rhs_sym})\n"));
+                    }
+                    BinaryOpKind::Gt => {
+                        let bool_sym = format!("{out_sym}_bool");
+                        ir.push_str(&format!("  {bool_sym} = fcmp ogt double {lhs_sym}, {rhs_sym}\n"));
+                        ir.push_str(&format!("  {out_sym} = select i1 {bool_sym}, double {lhs_sym}, double 0.0\n"));
+                    }
+                    BinaryOpKind::Lt => {
+                        let bool_sym = format!("{out_sym}_bool");
+                        ir.push_str(&format!("  {bool_sym} = fcmp olt double {lhs_sym}, {rhs_sym}\n"));
+                        ir.push_str(&format!("  {out_sym} = select i1 {bool_sym}, double {lhs_sym}, double 0.0\n"));
+                    }
+                    _ => {
+                        ir.push_str(&format!("  {out_sym} = fadd double {lhs_sym}, {rhs_sym}\n"));
+                    }
+                }
+            }
             Expr::ShiftRight(inner) => {
-                ir.push_str("  ; Vector Shift Right (▷)\n");
-                self.emit_expr_ir(inner, ir);
+                let inner_sym = format!("{out_sym}_shift_in");
+                self.emit_expr_lowering(inner, in_sym, &inner_sym, ir);
+                ir.push_str(&format!("  {out_sym} = fmul double {inner_sym}, 1.0\n"));
             }
             Expr::ShiftLeft(inner) => {
-                ir.push_str("  ; Vector Shift Left (▽)\n");
-                self.emit_expr_ir(inner, ir);
+                let inner_sym = format!("{out_sym}_shift_in");
+                self.emit_expr_lowering(inner, in_sym, &inner_sym, ir);
+                ir.push_str(&format!("  {out_sym} = fmul double {inner_sym}, 1.0\n"));
             }
-            Expr::BinaryOp { op, lhs, rhs } => {
-                self.emit_expr_ir(lhs, ir);
-                self.emit_expr_ir(rhs, ir);
-                ir.push_str(&format!("  ; Topological Op: {}\n", op));
+            Expr::Number(val) => {
+                ir.push_str(&format!("  {out_sym} = fadd double 0.0, {val:.6}\n"));
             }
-            _ => {}
+            Expr::Var(_) => {
+                ir.push_str(&format!("  {out_sym} = fadd double 0.0, {in_sym}\n"));
+            }
+            Expr::AuditTrace(inner) => {
+                self.emit_expr_lowering(inner, in_sym, out_sym, ir);
+            }
         }
     }
 

@@ -34,6 +34,10 @@ def main():
     engine.compile_rho_file("examples/teichmuller.rho")
     print("  └─ Kernel compiled successfully!")
 
+    # Retrieve C-ABI Metadata
+    metadata = engine.get_metadata()
+    print(f"  └─ C-ABI Metadata Inspection: {metadata}")
+
     # 3. Execute with arguments
     print("\n[Step 3] Executing ρ-Kernel with Argument Pointer Coupling...")
     start_time = time.perf_counter()
@@ -41,6 +45,8 @@ def main():
     elapsed = (time.perf_counter() - start_time) * 1000.0
 
     print(f"  └─ Execution Completed in {elapsed:.3f} ms!")
+    print(f"  └─ Sample Output Result Values: {[output_tensor[i] for i in range(4)]}")
+
     print("\n=====================================================")
     print("  [SUCCESS] Advanced FFI Pointer Coupling OK")
     print("=====================================================")

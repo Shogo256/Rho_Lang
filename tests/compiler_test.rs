@@ -111,3 +111,26 @@ fn test_end_to_end_kernel_codegen() {
     let so_result = codegen.compile_to_so(&ir, "target/test_kernel.so");
     assert!(so_result.is_ok(), "LLVM to Native .so compilation should succeed");
 }
+
+#[test]
+fn test_generated_kernel_writes_output_values() {
+    let source = r#"{
+        &[0x7A4F]:INPUT:◯ □ 4 1
+        (INPUT + 1.0) → OUTPUT
+        OUTPUT → =
+    }"#;
+
+    let block = parse_rho_program(source).unwrap();
+    let mut codegen = LlvmCodeGen::new("runtime_kernel");
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    let so_path = "target/runtime_kernel.so";
+    assert!(codegen.compile_to_so(&ir, so_path).is_ok());
+
+    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
+    let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> = unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let input = [1.0, 2.0, 3.0, 4.0];
+    let mut output = [0.0; 4];
+    unsafe { func(input.as_ptr(), output.as_mut_ptr()) };
+
+    assert_eq!(output, [2.0, 3.0, 4.0, 5.0]);
+}

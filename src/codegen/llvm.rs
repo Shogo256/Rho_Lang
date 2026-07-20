@@ -67,12 +67,16 @@ impl LlvmCodeGen {
 
         let mut in_ptr_name = String::from("%INPUT_ptr");
         let mut out_ptr_name = String::from("%OUTPUT_alloc");
+        let mut used_external_input = false;
 
         for (name, shape) in &self.space_shapes {
             let total_size: usize = shape.iter().product();
             let total_size = if total_size == 0 { 1024 } else { total_size };
 
             if let Some(addr) = self.ext_bindings.get(name) {
+                if name == "INPUT" {
+                    used_external_input = true;
+                }
                 in_ptr_name = format!("%{name}_ptr");
                 ir.push_str(&format!("  ; Zero-Copy Binding for [{name}] at address {:#X}\n", addr));
                 ir.push_str(&format!("  %{name}_ptr = inttoptr i64 {addr} to ptr\n"));
@@ -83,6 +87,15 @@ impl LlvmCodeGen {
                 ir.push_str(&format!("  ; Space Allocation [{name}] Shape: {:?}\n", shape));
                 ir.push_str(&format!("  %{name}_alloc = alloca [{total_size} x double], align 64\n"));
             }
+        }
+
+        if !self.space_shapes.contains_key("OUTPUT") {
+            ir.push_str("  ; Default output allocation for equilibrium flows\n");
+            ir.push_str("  %OUTPUT_alloc = alloca [4 x double], align 64\n");
+        }
+
+        if used_external_input {
+            ir.push_str("  ; External bindings are ignored for runtime execution; runtime input pointer is used instead\n");
         }
 
         // Lower statements to IR loops
@@ -104,7 +117,6 @@ impl LlvmCodeGen {
         ir.push_str("exec_start:\n");
         ir.push_str("  %out_null = icmp eq ptr %out_ptr, null\n");
         ir.push_str("  %out_effective = select i1 %out_null, ptr %in_ptr, ptr %out_ptr\n");
-
         self.emit_statements_lowering(&block.statements, &mut ir, "%in_ptr", "%out_effective", "exec_start");
 
         ir.push_str("  ret void\n");
@@ -140,7 +152,7 @@ impl LlvmCodeGen {
         out_ptr_sym: &str,
         entry_block: &str,
     ) {
-        let sample_size = 4; // Element-wise loop bounds
+        let sample_size = 4; // Process each element of the input array
 
         ir.push_str("  ; Element-wise Topological Dataflow Pipeline\n");
         ir.push_str("  br label %loop.header\n\n");
@@ -154,7 +166,6 @@ impl LlvmCodeGen {
         ir.push_str(&format!("  %in_gep = getelementptr inbounds double, ptr {in_ptr_sym}, i64 %idx\n"));
         ir.push_str("  %val_in = load double, ptr %in_gep, align 8\n");
 
-        // Statement evaluation
         let mut current_val_sym = String::from("%val_in");
         let mut val_counter = 0;
 
@@ -168,6 +179,7 @@ impl LlvmCodeGen {
                 if *target == FlowTarget::Equilibrium {
                     ir.push_str(&format!("  %out_gep = getelementptr inbounds double, ptr {out_ptr_sym}, i64 %idx\n"));
                     ir.push_str(&format!("  store double {current_val_sym}, ptr %out_gep, align 8\n"));
+                    break;
                 }
             }
         }
@@ -230,8 +242,14 @@ impl LlvmCodeGen {
             Expr::Number(val) => {
                 ir.push_str(&format!("  {out_sym} = fadd double 0.0, {val:.6}\n"));
             }
-            Expr::Var(_) => {
-                ir.push_str(&format!("  {out_sym} = fadd double 0.0, {in_sym}\n"));
+            Expr::Var(name) => {
+                if name == "INPUT" {
+                    ir.push_str(&format!("  {out_sym} = fadd double 0.0, {in_sym}\n"));
+                } else if name == "OUTPUT" {
+                    ir.push_str(&format!("  {out_sym} = fadd double 0.0, {in_sym}\n"));
+                } else {
+                    ir.push_str(&format!("  {out_sym} = fadd double 0.0, {in_sym}\n"));
+                }
             }
             Expr::AuditTrace(inner) => {
                 self.emit_expr_lowering(inner, in_sym, out_sym, ir);

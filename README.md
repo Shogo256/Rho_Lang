@@ -1,79 +1,29 @@
 # $\rho$ (RHO) Language Compiler
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](https://github.com/Escoffier1156/Rho_Lang)
 [![LLVM Version](https://img.shields.io/badge/LLVM-22.1.8-dragon.svg)](https://llvm.org)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 
 **The Time-Eliminated Topological Dataflow Language for High-Performance Scientific & Financial Computation.**
 
-$\rho$ (RHO) is a mathematics-driven programming language that completely eliminates the concept of temporal loops (`for`, `while`) and computes exclusively through spatial topological transformations, differential shifts, and tensor dataflow propagation.
+$\rho$ (RHO) is a mathematics-driven programming language and compiler prototype that explores a clockless, spatial dataflow model for numeric computation. The current implementation focuses on parsing a compact RHO syntax, validating basic flow constraints, generating LLVM IR, and emitting a native shared library.
 
 ---
 
-## 🌸 Philosophy: Inspired by *Wasan* (和算)
+## Current Status
 
-Unlike Western programming paradigms rooted in sequential temporal execution (the clock cycle `CLK` and loop iterations `for`/`while`), $\rho$ is fundamentally inspired by **Wasan (和算)** — traditional 17th-century Japanese mathematics pioneered by Seki Takakazu (関孝和).
+The project is now in a working prototype state:
 
-In Wasan, mathematical problems were solved not by step-by-step temporal loops, but by perceiving spatial geometry (*Enri* / 円理), matrix grids (*Sangaku* / 算額), and sliding beads on a counting board (*Soroban* / 算盤) as simultaneous spatial transformations.
+- Parses a compact RHO syntax with ASCII aliases
+- Generates LLVM IR from simple topological flow expressions
+- Emits a native shared library (`.so`)
+- Includes regression tests for parsing, constraint validation, and code generation
 
-```
-   Traditional Western Loop (`for`)           ρ (RHO) Wasan Topological Dataflow
- ┌──────────────────────────────────┐        ┌──────────────────────────────────┐
- │ Step 1 -> Step 2 -> Step 3 (CLK) │   vs   │ Spatial Superposition & Flow     │
- │ Sequential Iterative Execution   │        │ Clocks-Eliminated SIMD Shifts (▷)│
- └──────────────────────────────────┘        └──────────────────────────────────┘
-```
-
-### 🔣 The Wasan Topological Symbol Mapping
-
-| $\rho$ Symbol | ASCII Alias | Wasan Concept (和算のモチーフ) | Spatial Semantics |
-|---|---|---|---|
-| **`◯`** | `matrix` | **Enri (円理 - Circle Theory)** | Memory space container maintaining continuous tensor fields. |
-| **`□`** | `shape` | **Hojin (方陣 - Matrix Grid)** | Physical memory boundary and spatial shape definition. |
-| **`▷`** | `>>` | **Soroban Shift (算盤の右滑り)** | Instantaneous vector shift right across memory space (0 padding). |
-| **`▽`** | `<<` | **Soroban Shift (算盤の左滑り)** | Instantaneous vector shift left across memory space (0 padding). |
-| **`→`** | `->` / `=>` | **Ruten (流転 - Flow Propagation)** | Asynchronous energy transfer between spatial domains. |
-| **`=`** | `==` | **Tou (答 / 均衡 - Equilibrium)** | Final spatial output convergence point. |
-| **`&`** | `@` | **Zero-Copy Coupling (直結)** | Direct zero-copy binding to host memory (NumPy / C++). |
-| **`!`** | `assert` | **Static Solver (数理検証)** | Mathematical invariant and static constraint verification. |
-| **`$`** | `trace` | **Audit Trace (算額鑑識)** | Topological DAG reverse traversal and audit visualization. |
+The implementation is intentionally focused on a minimal, verifiable core rather than a full language runtime.
 
 ---
 
-## 🌌 Key Features
-
-- ⏱️ **Clockless & Time-Eliminated**: No sequential instruction clock (`CLK`) or loops. Computation flows as continuous spatial data propagation.
-- 🔣 **20-Symbol Strict Syntax with ASCII Fallbacks**: Expressive topological operators ($\bigcirc$, $\square$, $\triangleright$, $\nabla$, $\rightarrow$, $=$, $\&$, $!$, $\$$) with full ASCII fallback aliases (`>>`, `<<`, `->`, `@`).
-- ⚡ **Zero-Copy Memory Pointer Binding**: Direct memory coupling to C++/Fortran/PyTorch/NumPy buffers without `memcpy` overhead (`&[0x7A4F]:INPUT` or `@[0x7A4F]:INPUT`).
-- 🛡️ **Automated TLA+ & Z3 Mathematical Verification**: Auto-generates TLA+ specifications (`rho_harmony.tla`) and statically verifies logic constraints ($!$) for mathematical validity.
-- 🚀 **LLVM 22 Native Execution**: Directly maps topological vector shifts ($\triangleright$, $\nabla$) to hardware SIMD instructions and emits native shared libraries (`.so`).
-
----
-
-## 💻 Syntax Example: Teichmüller Space Analysis (Unicode & ASCII Support)
-
-```rho
-{
-    /* Map existing tensor from external memory (Zero-Copy) using ASCII or Unicode */
-    @[0x7A4F]:INPUT:◯ □ 1024 1024 
-    
-    /* Spatial gradient extraction via vector shifts */
-    (>>INPUT - INPUT) -> △
-    (<<INPUT - INPUT) -> ▽
-    
-    /* Calculate & verify spatial distortion ratio */
-    ((△ - ▽) / (△ + ▽)) ^ 2 -> OUTPUT
-    ! (OUTPUT >= 0)
-    
-    /* Stream output exceeding threshold to Equilibrium Point */
-    OUTPUT > 𝜏 -> =
-}
-```
-
----
-
-## ⚡ Quick Start & Installation
+## Quick Start
 
 ### 1. Clone Repository
 
@@ -87,46 +37,66 @@ cd Rho_Lang
 - Rust (`cargo 1.80+`)
 - LLVM 22 / Clang 22
 
-### 3. Build & Run Compiler CLI (`rhoc`)
+### 3. Build and Test
 
 ```bash
-# Build compiler
+cargo test
 cargo build --release
-
-# Compile RHO script to native shared library (.so)
-cargo run -- examples/teichmuller.rho
-
-# Dump Active Audit DAG Trace ($) & generated LLVM 22 IR
-cargo run -- examples/teichmuller.rho --dump-dag --dump-llvm
 ```
 
-### 4. Advanced Python FFI Pointer Integration & Benchmark
+### 4. Run the Example Compiler
 
 ```bash
-# Run advanced Python FFI pointer coupling
-python3 examples/python_demo.py
-
-# Run performance benchmark suite (Pure Python Loop vs ρ Engine)
-python3 benches/benchmark.py
+cargo run --release -- examples/teichmuller.rho
 ```
 
-### 5. Docker Container Setup
+This produces a shared library named `libkernel.so`.
+
+### 5. Run the Example Kernel from Python
 
 ```bash
-docker build -t rho-lang .
-docker run --rm rho-lang
+python3 - <<'PY'
+import ctypes
+lib = ctypes.CDLL('./libkernel.so')
+lib.rho_kernel_exec_with_args.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double)]
+lib.rho_kernel_exec_with_args.restype = None
+
+arr = (ctypes.c_double * 4)(1.0, 2.0, 3.0, 4.0)
+out = (ctypes.c_double * 4)(0.0, 0.0, 0.0, 0.0)
+lib.rho_kernel_exec_with_args(arr, out)
+print(list(out))
+PY
 ```
 
 ---
 
-## 🧩 VS Code Extension Support
+## Example Syntax
 
-To enable 20-symbol syntax highlighting and autocomplete snippets (`\shiftright` -> `▷`, `\space` -> `◯ □`):
-1. Copy or link the `editors/code/` folder into your VS Code extensions directory (`~/.vscode/extensions/rho-lang-vscode`).
-2. Open any `.rho` file in VS Code.
+```rho
+{
+    &[0x7A4F]:INPUT:◯ □ 1024 1024
+    (▷INPUT - INPUT) → △
+    (▽INPUT - INPUT) → ▽
+    ((△ - ▽) / (△ + ▽)) ^ 2 → OUTPUT
+    ! (OUTPUT >= 0)
+    OUTPUT > 𝜏 → =
+}
+```
 
 ---
 
-## 📄 License
+## Design Direction
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+The project is currently positioned as:
+
+- a compiler prototype for a clockless, spatial dataflow style
+- a research-oriented implementation of topological numeric computation
+- a foundation for future work in memory-aware execution, low-power scheduling, and domain-specific numeric kernels
+
+The long-term aim is not merely to add syntax, but to build a runtime model that can express and execute computation in a more memory-aware and flow-oriented way.
+
+---
+
+## License
+
+Apache 2.0

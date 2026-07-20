@@ -1,0 +1,8 @@
+{
+    &[0x1000]:INPUT:◯ □ 4 1
+
+    (▷INPUT - INPUT) → DELTA
+    (DELTA * 2.0) → SCALED
+    (SCALED > 0.1) → SIGNAL
+    SIGNAL → =
+}

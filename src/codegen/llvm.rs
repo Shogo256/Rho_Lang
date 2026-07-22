@@ -269,7 +269,8 @@ impl LlvmCodeGen {
                     ir.push_str(&format!("  {out_sym} = fadd double 0.0, {in_sym}\n"));
                 } else {
                     let sanitized = self.sanitize_ident(name);
-                    let load_sym = format!("{out_sym}_load");
+                    let clean_out_sym = out_sym.trim_start_matches('%');
+                    let load_sym = format!("{clean_out_sym}_load");
                     ir.push_str(&format!("  %gep_{load_sym} = getelementptr inbounds double, ptr %{sanitized}_alloc, i64 %idx\n"));
                     ir.push_str(&format!("  %{load_sym} = load double, ptr %gep_{load_sym}, align 8\n"));
                     ir.push_str(&format!("  {out_sym} = fadd double 0.0, %{load_sym}\n"));

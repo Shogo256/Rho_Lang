@@ -118,6 +118,17 @@ impl LlvmCodeGen {
         ir.push_str("exec_start:\n");
         ir.push_str("  %out_null = icmp eq ptr %out_ptr, null\n");
         ir.push_str("  %out_effective = select i1 %out_null, ptr %in_ptr, ptr %out_ptr\n");
+
+        for (name, shape) in &self.space_shapes {
+            if name != "INPUT" && name != "OUTPUT" {
+                let sanitized = self.sanitize_ident(name);
+                let total_size: usize = shape.iter().product();
+                let total_size = if total_size == 0 { 1024 } else { total_size };
+                ir.push_str(&format!("  ; Temporary Space Allocation [{name}]\n"));
+                ir.push_str(&format!("  %{sanitized}_alloc = alloca [{total_size} x double], align 64\n"));
+            }
+        }
+
         self.emit_statements_lowering(&block.statements, &mut ir, "%in_ptr", "%out_effective", "exec_start");
 
         ir.push_str("  ret void\n");

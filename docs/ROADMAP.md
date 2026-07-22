@@ -79,3 +79,12 @@ $\rho$ (RHO) is a mathematics-driven dataflow DSL designed to enable highly effi
 * Translate mathematical constraint failure messages (e.g., Z3 SAT/UNSAT or array bounds issues) into natural Wasan terminology (e.g., "Hojin boundary exceeds Enri tensor space").
 * Guide users to debug complex shape mismatches using traditional geometric concepts.
 
+### Step 5.6: PyPI Binary Wheel Distribution (`pip install rho-lang`)
+* Automate multi-platform cross-compilation (Linux, macOS, Windows) using GitHub Actions to package the compiler as a pre-compiled Python Wheel.
+* Distribute RHO to PyPI so Python developers can immediately import and compile RHO inline acceleration blocks without installing LLVM or Rust locally.
+
+### Step 5.7: Standard Dockerized Development Workspace
+* Provide a single, unified development container pre-packaged with LLVM/Clang, Rustup, and Python environment definitions.
+* Enable seamless execution of compiler tests and FFI executions out-of-the-box using standard Docker tooling.
+
+

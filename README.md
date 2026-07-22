@@ -25,20 +25,23 @@ The implementation is intentionally focused on a minimal, verifiable core rather
 
 ## Quick Start
 
-### 1. Clone Repository
+The easiest way to set up the ρ (RHO) compiler development environment with all toolchains (Rust, LLVM, Clang, Python) pre-configured is using the official Docker container.
 
+### 1. Build and Run via Docker
 ```bash
+# Clone repository
 git clone https://github.com/Escoffier1156/Rho_Lang.git
 cd Rho_Lang
+
+# Build the official Docker container
+docker build -t escoffier1156/rho-lang .
+
+# Run the interactive workspace container
+docker run -it escoffier1156/rho-lang
 ```
 
-### 2. Prerequisites
-
-- Rust (`cargo 1.80+`)
-- LLVM 22 / Clang 22
-
-### 3. Build and Test
-
+### 2. Build and Test inside Container
+Once inside the container, you can compile and test the compiler directly:
 ```bash
 cargo test
 cargo build --release

@@ -134,3 +134,36 @@ fn test_generated_kernel_writes_output_values() {
 
     assert_eq!(output, [2.0, 3.0, 4.0, 5.0]);
 }
+
+#[test]
+fn test_dimension_disruption_for_shape_mismatch() {
+    let source = r#"{
+        INPUT:◯ □ 2 2
+        TEMP:◯ □ 3 3
+        INPUT → TEMP
+        TEMP → =
+    }"#;
+
+    let res = parse_rho_program(source);
+    assert!(res.is_err());
+    if let Err(e) = res {
+        assert!(matches!(e, HarmonyDisruption::DimensionErr { .. }));
+    }
+}
+
+#[test]
+fn test_codegen_uses_declared_shape_for_loop_bound() {
+    let source = r#"{
+        INPUT:◯ □ 8 1
+        (INPUT + 1.0) → OUTPUT
+        OUTPUT → =
+    }"#;
+
+    let block = parse_rho_program(source).unwrap();
+    let mut codegen = LlvmCodeGen::new("dynamic_bound_kernel");
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+
+    // The primary space has shape [8, 1], meaning sample_size = 8
+    assert!(ir.contains("icmp ult i64 %idx, 8"));
+}
+

@@ -152,7 +152,12 @@ impl LlvmCodeGen {
         out_ptr_sym: &str,
         entry_block: &str,
     ) {
-        let sample_size = 4; // Process each element of the input array
+        let mut sample_size = 4;
+        if let Some(shape) = self.space_shapes.get("INPUT") {
+            sample_size = shape.iter().product();
+        } else if let Some(shape) = self.space_shapes.values().next() {
+            sample_size = shape.iter().product();
+        }
 
         ir.push_str("  ; Element-wise Topological Dataflow Pipeline\n");
         ir.push_str("  br label %loop.header\n\n");

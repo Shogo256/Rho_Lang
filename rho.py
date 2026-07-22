@@ -76,3 +76,37 @@ class RhoEngine:
             self.execute_kernel(input_buf)
 
         return True
+
+def compile(func):
+    """Decorator to inline compile RHO code directly inside Python docstring"""
+    import tempfile
+
+    doc = func.__doc__
+    if not doc:
+        raise ValueError("No docstring containing RHO block found in function")
+
+    start_idx = doc.find('{')
+    end_idx = doc.rfind('}')
+    if start_idx == -1 or end_idx == -1:
+        raise ValueError("RHO code block not found inside docstring (must be enclosed in { ... })")
+
+    rho_code = doc[start_idx:end_idx+1]
+
+    with tempfile.NamedTemporaryFile(suffix=".rho", delete=False, mode="w", encoding="utf-8") as f:
+        f.write(rho_code)
+        temp_rho_path = f.name
+
+    so_path = temp_rho_path.replace(".rho", ".so")
+
+    engine = RhoEngine(kernel_so_path=so_path)
+    try:
+        engine.compile_rho_file(temp_rho_path)
+    finally:
+        if os.path.exists(temp_rho_path):
+            os.remove(temp_rho_path)
+
+    def wrapper(input_buf, output_buf=None):
+        return engine.execute_kernel_with_args(input_buf, output_buf)
+
+    return wrapper
+

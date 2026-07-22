@@ -66,3 +66,16 @@ $\rho$ (RHO) is a mathematics-driven dataflow DSL designed to enable highly effi
 
 ### Step 5.2: Benchmark Suites & Case Studies
 * Include concrete performance comparisons (e.g., Convolution 2D, FFT, Matrix Mul) benchmarking ρ (RHO) against raw NumPy and BLAS libraries.
+
+### Step 5.3: Inline `@rho.compile` Decorator for Python
+* Allow developers to write inline ρ language blocks directly inside Python function docstrings.
+* Automatically handle background compilation (LLVM) and dynamic CDLL bindings, mapping function calls to low-overhead C-ABI calls seamlessly.
+
+### Step 5.4: Topological DAG Visualizer
+* Build an automated visualization tool that parses RHO code and renders its topological dataflow (directed acyclic graph) into an intuitive, beautiful circuit-style layout in the browser.
+* Express the movement of values analogously to Wasan counting board beads.
+
+### Step 5.5: Wasan-Themed Error Harmonizer
+* Translate mathematical constraint failure messages (e.g., Z3 SAT/UNSAT or array bounds issues) into natural Wasan terminology (e.g., "Hojin boundary exceeds Enri tensor space").
+* Guide users to debug complex shape mismatches using traditional geometric concepts.
+

@@ -70,6 +70,7 @@ impl LlvmCodeGen {
         let mut used_external_input = false;
 
         for (name, shape) in &self.space_shapes {
+            let sanitized = self.sanitize_ident(name);
             let total_size: usize = shape.iter().product();
             let total_size = if total_size == 0 { 1024 } else { total_size };
 
@@ -77,15 +78,15 @@ impl LlvmCodeGen {
                 if name == "INPUT" {
                     used_external_input = true;
                 }
-                in_ptr_name = format!("%{name}_ptr");
+                in_ptr_name = format!("%{sanitized}_ptr");
                 ir.push_str(&format!("  ; Zero-Copy Binding for [{name}] at address {:#X}\n", addr));
-                ir.push_str(&format!("  %{name}_ptr = inttoptr i64 {addr} to ptr\n"));
+                ir.push_str(&format!("  %{sanitized}_ptr = inttoptr i64 {addr} to ptr\n"));
             } else {
                 if name == "OUTPUT" || out_ptr_name == "%OUTPUT_alloc" {
-                    out_ptr_name = format!("%{name}_alloc");
+                    out_ptr_name = format!("%{sanitized}_alloc");
                 }
                 ir.push_str(&format!("  ; Space Allocation [{name}] Shape: {:?}\n", shape));
-                ir.push_str(&format!("  %{name}_alloc = alloca [{total_size} x double], align 64\n"));
+                ir.push_str(&format!("  %{sanitized}_alloc = alloca [{total_size} x double], align 64\n"));
             }
         }
 
@@ -181,10 +182,24 @@ impl LlvmCodeGen {
                 self.emit_expr_lowering(src, &current_val_sym, &next_sym, ir);
                 current_val_sym = next_sym;
 
-                if *target == FlowTarget::Equilibrium {
-                    ir.push_str(&format!("  %out_gep = getelementptr inbounds double, ptr {out_ptr_sym}, i64 %idx\n"));
-                    ir.push_str(&format!("  store double {current_val_sym}, ptr %out_gep, align 8\n"));
-                    break;
+                match target {
+                    FlowTarget::Var(var_name) => {
+                        let sanitized = self.sanitize_ident(var_name);
+                        let target_ptr = if var_name == "OUTPUT" {
+                            out_ptr_sym.to_string()
+                        } else {
+                            format!("%{sanitized}_alloc")
+                        };
+                        let gep_sym = format!("%out_gep_{sanitized}_{val_counter}");
+                        ir.push_str(&format!("  {gep_sym} = getelementptr inbounds double, ptr {target_ptr}, i64 %idx\n"));
+                        ir.push_str(&format!("  store double {current_val_sym}, ptr {gep_sym}, align 8\n"));
+                    }
+                    FlowTarget::Equilibrium => {
+                        let gep_sym = format!("%out_gep_eq_{val_counter}");
+                        ir.push_str(&format!("  {gep_sym} = getelementptr inbounds double, ptr {out_ptr_sym}, i64 %idx\n"));
+                        ir.push_str(&format!("  store double {current_val_sym}, ptr {gep_sym}, align 8\n"));
+                        break;
+                    }
                 }
             }
         }
@@ -253,7 +268,11 @@ impl LlvmCodeGen {
                 } else if name == "OUTPUT" {
                     ir.push_str(&format!("  {out_sym} = fadd double 0.0, {in_sym}\n"));
                 } else {
-                    ir.push_str(&format!("  {out_sym} = fadd double 0.0, {in_sym}\n"));
+                    let sanitized = self.sanitize_ident(name);
+                    let load_sym = format!("{out_sym}_load");
+                    ir.push_str(&format!("  %gep_{load_sym} = getelementptr inbounds double, ptr %{sanitized}_alloc, i64 %idx\n"));
+                    ir.push_str(&format!("  %{load_sym} = load double, ptr %gep_{load_sym}, align 8\n"));
+                    ir.push_str(&format!("  {out_sym} = fadd double 0.0, %{load_sym}\n"));
                 }
             }
             Expr::AuditTrace(inner) => {
@@ -285,5 +304,24 @@ impl LlvmCodeGen {
                 "clang-22 Compilation Failed",
             ))
         }
+    }
+
+    fn sanitize_ident(&self, ident: &str) -> String {
+        let mut sanitized = String::new();
+        for ch in ident.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '%' {
+                sanitized.push(ch);
+            } else {
+                sanitized.push_str(&format!("_u{:04X}", ch as u32));
+            }
+        }
+        if !sanitized.starts_with('%') {
+            if let Some(first) = sanitized.chars().next() {
+                if !first.is_ascii_alphabetic() && first != '_' {
+                    sanitized.insert(0, 's');
+                }
+            }
+        }
+        sanitized
     }
 }

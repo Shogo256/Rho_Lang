@@ -1,0 +1,14 @@
+{
+    /* A 2x3 grid. ▷ walks along a row and stops at the first column,
+       so this is the horizontal spatial difference. */
+    INPUT:◯ □ 2 3
+
+    (▷INPUT - INPUT) → GX
+
+    /* Squaring makes the constraint below provable, and keeps the spec in
+       Integers so TLC can model check it. */
+    (GX × GX) → OUTPUT
+    ! (OUTPUT >= 0)
+
+    OUTPUT → =
+}

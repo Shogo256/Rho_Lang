@@ -4,6 +4,7 @@ pub mod dag;
 pub mod error;
 pub mod parser;
 pub mod solver;
+pub mod symbolic;
 pub mod tla;
 
 pub use error::{HarmonyDisruption, Result};

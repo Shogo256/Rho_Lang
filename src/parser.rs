@@ -145,16 +145,16 @@ fn parse_line(line: &str) -> Result<Option<Statement>> {
     }
 
     // 2. Constraint Solver: ! (OUTPUT >= 0)
-    if line.starts_with('!') {
-        let expr_str = line[1..].trim();
+    if let Some(rest) = line.strip_prefix('!') {
+        let expr_str = rest.trim();
         let expr_str = expr_str.trim_matches(|c| c == '(' || c == ')');
         let expr = parse_expr(expr_str)?;
         return Ok(Some(Statement::Constraint(expr)));
     }
 
     // 3. Audit Trace: $ Expr
-    if line.starts_with('$') {
-        let expr_str = line[1..].trim();
+    if let Some(rest) = line.strip_prefix('$') {
+        let expr_str = rest.trim();
         let expr = parse_expr(expr_str)?;
         return Ok(Some(Statement::AuditTrace(expr)));
     }
@@ -265,19 +265,28 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         }
     }
 
-    // Unary shift operators ▷, ▽
-    if expr_str.starts_with('▷') && expr_str.chars().count() > 1 {
-        let sub = parse_expr(expr_str['▷'.len_utf8()..].trim())?;
-        return Ok(Expr::ShiftRight(Box::new(sub)));
-    }
-    if expr_str.starts_with('▽') && expr_str.chars().count() > 1 {
-        let sub = parse_expr(expr_str['▽'.len_utf8()..].trim())?;
-        return Ok(Expr::ShiftLeft(Box::new(sub)));
+    // Unary shift operators ▷, ▽, optionally pinned to an axis: ▷0X, ▽1X.
+    // Bare ▷X shifts along the last (contiguous) axis.
+    for (glyph, dir) in [('▷', ShiftDir::Positive), ('▽', ShiftDir::Negative)] {
+        if !expr_str.starts_with(glyph) || expr_str.chars().count() <= 1 {
+            continue;
+        }
+        let rest = &expr_str[glyph.len_utf8()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        let operand_str = rest[digits.len()..].trim();
+        if operand_str.is_empty() {
+            break;
+        }
+        return Ok(Expr::Shift {
+            dir,
+            axis: if digits.is_empty() { None } else { digits.parse().ok() },
+            operand: Box::new(parse_expr(operand_str)?),
+        });
     }
 
     // Unary audit tracer $
     if expr_str.starts_with('$') {
-        let sub = parse_expr(&expr_str['$'.len_utf8()..].trim())?;
+        let sub = parse_expr(expr_str['$'.len_utf8()..].trim())?;
         return Ok(Expr::AuditTrace(Box::new(sub)));
     }
 
@@ -307,13 +316,11 @@ fn find_binary_op_position(s: &str, op: &str) -> Option<usize> {
             depth += 1;
         } else if c == '(' {
             depth -= 1;
-        } else if depth == 0 {
-            if s[i..].as_bytes().starts_with(op_bytes) {
-                let lhs = s[..i].trim();
-                let rhs = s[i + op_bytes.len()..].trim();
-                if !lhs.is_empty() && !rhs.is_empty() {
-                    return Some(i);
-                }
+        } else if depth == 0 && s.as_bytes()[i..].starts_with(op_bytes) {
+            let lhs = s[..i].trim();
+            let rhs = s[i + op_bytes.len()..].trim();
+            if !lhs.is_empty() && !rhs.is_empty() {
+                return Some(i);
             }
         }
     }
@@ -382,7 +389,7 @@ fn check_expr_spaces(expr: &Expr, declared: &HashSet<String>) -> Result<()> {
                 });
             }
         }
-        Expr::ShiftRight(inner) | Expr::ShiftLeft(inner) | Expr::AuditTrace(inner) => {
+        Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
             check_expr_spaces(inner, declared)?;
         }
         Expr::BinaryOp { lhs, rhs, .. } => {
@@ -430,7 +437,7 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
     fn get_expr_shape(expr: &Expr, shapes: &HashMap<String, Vec<usize>>) -> Option<Vec<usize>> {
         match expr {
             Expr::Var(name) => shapes.get(name).cloned(),
-            Expr::ShiftRight(inner) | Expr::ShiftLeft(inner) | Expr::AuditTrace(inner) => {
+            Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
                 get_expr_shape(inner, shapes)
             }
             Expr::BinaryOp { lhs, rhs, .. } => {

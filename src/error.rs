@@ -35,6 +35,12 @@ pub enum HarmonyDisruption {
     LogicErr {
         expr: String,
     },
+
+    /// Lowering Disruption: construct cannot be mapped to hardware
+    #[error("[Harmony Disruption: Lowering Failure] {detail}")]
+    LoweringErr {
+        detail: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, HarmonyDisruption>;

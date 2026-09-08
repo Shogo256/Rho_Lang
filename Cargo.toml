@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Compiler for ρ (RHO) Language: Time-eliminated topological dataflow language"
 
+[[bin]]
+name = "rhoc"
+path = "src/main.rs"
+
 [dependencies]
 nom = "7.1"
 thiserror = "2.0"

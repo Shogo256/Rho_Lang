@@ -93,11 +93,11 @@ impl RhoDag {
             out.push_str(&format!("{}  └─ Expr: {:?}\n", pad, expr));
         }
 
-        let mut neighbors = self
+        let neighbors = self
             .graph
             .neighbors_directed(node_idx, petgraph::Direction::Incoming);
 
-        while let Some(parent) = neighbors.next() {
+        for parent in neighbors {
             self.trace_recursive(parent, indent + 1, out);
         }
     }
@@ -134,7 +134,7 @@ fn extract_dependencies(expr: &Expr) -> Vec<String> {
                 deps.push(name.clone());
             }
         }
-        Expr::ShiftRight(inner) | Expr::ShiftLeft(inner) | Expr::AuditTrace(inner) => {
+        Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
             deps.extend(extract_dependencies(inner));
         }
         Expr::BinaryOp { lhs, rhs, .. } => {

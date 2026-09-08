@@ -1,62 +1,232 @@
-# $\rho$ (RHO) Language Specification v1.0
+# ρ (RHO) Language Specification
 
-## 1. Computational Philosophy: Hardware-Agnostic Parallelism
+Status marks throughout: ✅ implemented and tested · 🚧 partial · 📋 designed, not built.
 
-The $\rho$ (RHO) Language is a high-dimensional, mathematics-driven dataflow DSL. It eliminates the concept of temporal loop control (`for`, `while`, step-by-step clock cycles `CLK`) in favor of **spatial topological transformations**. 
+## 1. Computational Philosophy
 
-Inspired by **Wasan (和算)** — traditional 17th-century Japanese mathematics pioneered by Seki Takakazu (関孝和) — computations are perceived as simultaneous state transformations over a memory grid rather than sequential loops.
+ρ (RHO) is a mathematics-driven dataflow DSL. It drops temporal loop control
+(`for`, `while`, explicit clocking) in favour of **spatial transformations**: a
+program says what every cell of a grid becomes, not how to walk over it.
 
-RHO targets heterogeneous hardware (CPUs, GPUs, and accelerators) by mapping topological shifts directly onto physical hardware memory hierarchies (registers, caches, shared memory, and global memory) and execution threads.
+Inspired by **Wasan (和算)** — traditional Japanese mathematics pioneered by Seki
+Takakazu (関孝和) — computations are expressed as simultaneous state
+transformations over a memory grid rather than sequential loops.
 
----
-
-## 2. The 20-Symbol Mathematical Dictionary (Fixed)
-
-All RHO source code consists exclusively of the following 20 core mathematical symbols:
-
-| Symbol | Name | Wasan Concept | Operational Semantics |
-|---|---|---|---|
-| `◯` | Space Matrix | Enri (円理) | Allocates a multi-dimensional tensor container. |
-| `□` | Operator/Shape | Hojin (方陣) | Defines physical layout, dimensions, and strides. |
-| `▷` | Positive Shift | Soroban Shift (右) | Element shift along the primary dimension (0-padded). |
-| `▽` | Negative Shift | Soroban Shift (左) | Element shift opposite the primary dimension (0-padded). |
-| `+` | Addition | Superposition | Element-wise tensor addition / superposition. |
-| `-` | Subtraction | Difference | Element-wise tensor subtraction / spatial difference. |
-| `×` / `*` | Multiplication | Scaling | Element-wise scaling or matrix scaling. |
-| `/` | Division | Distortion | Element-wise division / distortion ratio. |
-| `^` | Exponentiation | Expansion | Element-wise power scaling / dimension expansion. |
-| `→` | Flow | Ruten (流転) | Asynchronous energy transfer to target space. |
-| `<` / `>` | Threshold Check | Boundary Condition | Logical thresholding; maps to conditional execution. |
-| `=` | Equilibrium Point | Tou (答 / 均衡) | Primary output convergence target. |
-| `:` | Bind Operator | Binding | Associates identifiers with memory spaces/shapes. |
-| `{` `}` | Topos Block | Universe Boundary | Encloses the computation grid/topological space. |
-| `$` | Audit Trace | Sangaku (算額鑑識) | Traces DAG data-dependencies backwards for audit. |
-| `&` | Zero-Copy Pointer | Direct Coupling | Binds external memory address pointers directly. |
-| `!` | Constraint Solver | Invariant Check | Enforces logical constraint verification using SMT/Z3. |
+The long-term target is heterogeneous hardware (CPUs, GPUs, accelerators),
+mapping topological shifts onto the physical memory hierarchy. Today the
+compiler emits explicit CPU vector IR; GPU backends are still future work.
 
 ---
 
-## 3. Parallel Execution & Memory Semantics
+## 2. The 20-Symbol Dictionary
 
-To execute without sequential CPU clock loops, the compiler parses the AST into a Directed Acyclic Graph (DAG) and applies the following hardware mapping:
+RHO source consists of these symbols plus identifiers, digits, and grouping
+punctuation.
 
-### 3.1 Space & Memory Partitioning
-* **Space (`◯ □`)**: Maps to a contiguous segment of hardware memory. Large matrices are automatically partitioned into blocks (sub-tiles).
-* **Zero-Copy Pointer (`&` or `@`)**: Directly maps an external memory pointer (e.g., PyTorch/NumPy buffer) to the space boundary, eliminating memory copy overhead.
+| Symbol | Name | Wasan Concept | Semantics | Status |
+|---|---|---|---|---|
+| `◯` | Space Matrix | Enri (円理) | Declares a tensor container | ✅ |
+| `□` | Shape | Hojin (方陣) | Gives its dimensions | ✅ |
+| `▷` | Positive Shift | Soroban Shift (右) | Reads the preceding cell along an axis, 0 at the edge | ✅ |
+| `▽` | Negative Shift | Soroban Shift (左) | Reads the following cell along an axis, 0 at the edge | ✅ |
+| `△` | Space Glyph | — | Usable as a space identifier | ✅ |
+| `+` | Addition | Superposition | Element-wise addition | ✅ |
+| `-` | Subtraction | Difference | Element-wise subtraction | ✅ |
+| `×` / `*` | Multiplication | Scaling | Element-wise product | ✅ |
+| `/` | Division | Distortion | Element-wise division | ✅ |
+| `^` | Exponentiation | Expansion | Element-wise power (`llvm.pow.f64`) | ✅ |
+| `→` | Flow | Ruten (流転) | One full sweep of the grid into the target | ✅ |
+| `<` `>` | Threshold | Boundary Condition | Masking compare, see §3.3 | ✅ |
+| `=` | Equilibrium | Tou (答 / 均衡) | Final output; ends the pipeline | ✅ |
+| `𝜏` / `τ` | Threshold Constant | — | Scalar bound by `--tau`, default `0.0` | ✅ |
+| `:` | Bind | Binding | Associates a name with a space and shape | ✅ |
+| `{` `}` | Topos Block | Universe Boundary | Encloses the computation grid | ✅ |
+| `$` | Audit Trace | Sangaku (算額鑑識) | Traces DAG dependencies (`--dump-dag`) | ✅ |
+| `&` / `@` | Zero-Copy Pointer | Direct Coupling | Binds an external address, see §3.4 | ✅ |
+| `!` | Constraint | Invariant Check | Statically verified, see §4 | ✅ |
+| `→ =` | Convergence | — | Writes the caller's output buffer | ✅ |
 
-### 3.2 Topological Shift Semantics (`▷`, `▽`)
-* Shifts represent neighborhood operations.
-* **Hardware Mapping**: Translated to registers, cache lines, or shared memory offsets within execution blocks, bypassing expensive memory round-trips.
-* **CPU Mapping**: Translated to SIMD vector shift/shuffle instructions (AVX-512, NEON).
+ASCII aliases: `->` or `=>` for `→`, `>>` for `▷`, `<<` for `▽`, `@` for `&`.
 
-### 3.3 Flow & Convergence (`→`, `=`)
-* **`→` (Flow)**: Establishes a producer-consumer boundary. Independent flows are executed in parallel across CPU cores or execution pipelines.
-* **`=` (Equilibrium)**: The final output barrier. Forces synchronization across threads and flushes values to the final destination buffer.
+A shift may name its axis with a digit: `▷0X` shifts along axis 0, `▽1X` along
+axis 1. A bare `▷X` uses the innermost axis that has more than one cell.
 
 ---
 
-## 4. Compile-Time Invariant Checking (`!`)
+## 3. Execution & Memory Semantics
 
-Logical constraints defined by `! (EXPR)` are statically evaluated before code generation. 
-* Prevents runtime faults (e.g. division by zero, dimension mismatch, negative values in strict fields).
-* Enables compiler optimization passes to drop unnecessary runtime bounds-checking.
+### 3.1 Space & Shape (`◯ □`) ✅
+
+A space maps to a contiguous run of doubles. Every space in a block shares one
+flat index range, whose length is the product of the primary space's dimensions
+(`INPUT` if declared, otherwise the first space). `rho_kernel_element_count()`
+reports it.
+
+Dimensions drive indexing. For a row-major shape `[d0, .., dk]`, axis `a` has
+extent `d_a` and stride `product(d_{a+1..k})`, so `◯ □ 1024 1024` and
+`◯ □ 1048576 1` traverse the same cells but give shifts different neighbours.
+
+📋 Tiling and cache blocking are future work; a sweep is still one linear pass.
+
+### 3.2 Shifts (`▷`, `▽`) ✅
+
+A shift reads the neighbouring cell along one axis and yields 0 at that axis's
+boundary. On a `3 4` grid, `▷X` stops at the start of each row rather than
+wrapping into the previous one; `▷0X` reads the row above instead.
+
+The operand must be a declared space — `▷(A + B)` is rejected, because a shift
+needs storage to read a neighbour from. Flow the sub-expression into its own
+space first.
+
+Both directions are exact at the edges: the out-of-range index is clamped before
+the address is formed, so no read ever leaves the buffer.
+
+### 3.2.1 Vector lowering ✅
+
+A sweep of known length is split into a scalar head, a `<4 x double>` vector
+body and a scalar tail. The head and tail cover exactly the cells whose
+neighbours would fall outside the buffer, so every vector load in the body is in
+bounds. Boundary tests are evaluated per lane; the neighbour window itself is one
+contiguous load at a shifted base.
+
+`--no-simd` forces the scalar path. The two are verified to agree bit for bit.
+
+What this buys, measured rather than assumed: on a shift kernel `clang -O3`
+vectorises **no** loops on its own (the boundary select defeats it), and explicit
+lowering roughly doubles the packed-double instructions in the object file. Wall
+clock improves only 1.0–1.1x on large grids, because streaming megabytes of
+doubles is bound by memory bandwidth, not arithmetic. The gain here is that
+vectorisation is guaranteed and visible in the IR, not that it is fast.
+
+📋 AVX-512 and NEON widths, and GPU warp shuffles, are still future work; the
+width is fixed at four lanes and clang widens further if the target allows.
+
+### 3.3 Flow & Convergence (`→`, `=`) ✅
+
+Each `→` is a complete, ordered sweep of the grid: every cell of the target is
+written before the next flow begins. This is what makes a shift well-defined —
+it always reads the previous flow's finished result, never a half-written buffer.
+
+`=` marks the final output and ends the pipeline; statements after it are not
+lowered.
+
+A comparison masks rather than yielding a boolean: `A > B` produces `A` where the
+predicate holds and `0.0` elsewhere. The same applies to `<`, `>=`, `<=`, `==`.
+
+📋 Flows are executed in source order on one thread. Extracting independent flows
+to run in parallel is future work.
+
+### 3.4 Zero-Copy Pointer (`&`) ✅
+
+`&[0xADDR]:NAME:◯ □ ...` binds a space to an address. `rhoc --bind NAME=0x...`
+overrides the literal, so a host can compile a kernel against the address of a
+buffer it already owns and then call `rho_kernel_exec()` with no arguments at
+all — no pointer marshalling, no copy:
+
+```python
+buf = (ctypes.c_double * 8)(...)
+engine.compile_rho_file("k.rho", bind={"INPUT": buf})
+engine.execute_kernel(buf)          # writes straight into buf
+```
+
+An unbound `OUTPUT` means the grid is transformed in place. A kernel whose
+`INPUT` is unbound refuses to run through this entrypoint rather than reading an
+address this process does not own.
+
+`rho_kernel_exec_with_args` and `rho_kernel_exec_bounded` take caller-supplied
+pointers instead, which suits buffers whose address is not known at compile time.
+
+---
+
+## 4. Compile-Time Checking (`!`) ✅
+
+Enforced by the parser before code generation:
+
+- undeclared spaces
+- shape mismatches between a flow's source and target
+- a missing equilibrium point (`=`)
+- forbidden control-flow keywords (`for`, `while`, `if`, …)
+- symbols outside the dictionary
+
+`! (EXPR)` is then verified statically. The program is expanded so that a
+constraint about one cell is inlined through every flow that produced it, leaving
+only two kinds of free term: cells of spaces nobody writes — the caller's input —
+and boundary flags. Both are genuinely free, so a counterexample over the
+expansion corresponds to a real input.
+
+Two backends answer the same question:
+
+| Backend | Build | Strength |
+|---|---|---|
+| Interval arithmetic | default | No dependencies; sound over-approximation |
+| Z3 | `--features z3-solver` | Exact; reports a concrete counterexample |
+
+Both only reject a program when a violation is certain; anything else is reported
+as unproven and the build continues. For example `! (OUTPUT >= 0)` where
+`OUTPUT = INPUT ^ 2` is **proved** by either backend, while
+`(INPUT × INPUT) - (INPUT × INPUT) >= 0` needs Z3 — intervals cannot see that the
+two products cancel.
+
+Every division in the program is checked the same way. A denominator that is
+always zero is a hard error; one that merely can be zero is reported:
+
+```
+[unproven] ((△ - ▽) / (△ + ▽)) — the denominator is zero when
+           INPUT@-1 = -1, INPUT@0 = -1/2, INPUT@1 = -1, edge5 = true
+```
+
+That is exactly why `examples/teichmuller.rho` returns infinities on smooth
+input: its denominator is the discrete Laplacian, which vanishes.
+
+### 4.1 What "proved" means
+
+The kernel computes in IEEE-754 binary64, not in ℝ, and the difference is not
+academic. Reasoning over the reals proves that `(x*x)/x > x` is impossible, so a
+mask on that test looks like a constant zero — but on the machine the quotient
+can exceed `x` by an ulp, the mask fires, and a constraint downstream breaks.
+A randomised search against real runs found exactly that case.
+
+Both backends therefore carry the standard model for round-to-nearest: every
+arithmetic result is the exact result times `(1 + δ)` with `|δ| ≤ 2⁻⁵³`. The
+interval backend widens each result outward by that factor; the SMT backend
+introduces a bounded `δ` per operation. This keeps the useful proofs — a squared
+value stays non-negative through rounding, and `x² + 1` stays clear of zero —
+while refusing the ones that only hold over ℝ.
+
+Still outside the model, and so still assumptions on any proof:
+
+- overflow to ±∞ and underflow to subnormals
+- NaN inputs and NaN propagation
+- the order in which `clang` contracts operations (e.g. into an FMA)
+
+---
+
+## 5. Formal Specification Export ✅
+
+`rhoc --dump-tla` writes `rho_harmony.tla` and a matching `rho_harmony.cfg`.
+Each `→` becomes one action guarded by a program counter, so the flows fire in
+source order; shifts are expanded with the same axis geometry the code generator
+uses, and each `!` becomes an invariant. `Termination` asserts the pipeline
+reaches its equilibrium point.
+
+The input domain is a `CONSTANT Values` so the module can be read abstractly and
+still instantiated finitely. Computed spaces are deliberately *not* constrained
+to that domain, since arithmetic leaves any finite set.
+
+`scripts/verify_tla.sh` runs SANY and then TLC. On `examples/gradient_2d.rho`
+TLC explores 2,916 distinct states and reports no error.
+
+The export has been cross-validated against the compiler, not just parsed. For a
+2x3 grid over `{-1, 0, 1}`, running the compiled kernel across all 729 inputs
+gives an output range of `[-3, 3]`; TLC accepts `! (OUTPUT >= -3)` and rejects
+`! (OUTPUT >= -2)`, and the counterexample it prints reproduces cell for cell on
+the kernel:
+
+```
+INPUT  = <<-1, -1, 1, -1, -1, -1>>
+OUTPUT = <<0, -1, -3, 1, 0, 0>>     \* identical from TLC and from the .so
+```
+
+📋 A program that divides or uses fractional literals produces a spec over
+`Reals`. SANY parses it, but TLC cannot evaluate real division, so those specs
+are for reading and for TLAPS.

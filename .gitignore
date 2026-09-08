@@ -2,6 +2,8 @@
 *.so
 *.ll
 rho_harmony.tla
+rho_harmony.cfg
+tla2tools.jar
 flake.nix
 flake.lock
 __pycache__/

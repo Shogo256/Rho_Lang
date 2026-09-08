@@ -1,75 +1,151 @@
-# $\rho$ (RHO) Language Compiler
+# ρ (RHO) Language Compiler
 
+[![CI](https://github.com/Escoffier1156/Rho_Lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Escoffier1156/Rho_Lang/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![LLVM Version](https://img.shields.io/badge/LLVM-22.1.8-dragon.svg)](https://llvm.org)
+[![LLVM](https://img.shields.io/badge/LLVM-15%2B-dragon.svg)](https://llvm.org)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 
-**The Time-Eliminated Topological Dataflow Language for High-Performance Scientific & Financial Computation.**
+**A clockless, topological dataflow language for numeric computation.**
 
-$\rho$ (RHO) is a mathematics-driven programming language and compiler prototype that explores a clockless, spatial dataflow model for numeric computation. The current implementation focuses on parsing a compact RHO syntax, validating basic flow constraints, generating LLVM IR, and emitting a native shared library.
+ρ (RHO) is a mathematics-driven programming language and compiler prototype that
+explores a spatial dataflow model: computation is written as transformations over
+a grid rather than as loops over time. The compiler parses a compact symbolic
+syntax, validates shape and flow constraints, emits LLVM IR, and links a native
+shared library callable from C or Python.
 
 ---
 
 ## Current Status
 
-The project is now in a working prototype state:
+Working prototype. What runs today:
 
-- Parses a compact RHO syntax with ASCII aliases
-- Generates LLVM IR from simple topological flow expressions
-- Emits a native shared library (`.so`)
-- Includes regression tests for parsing, constraint validation, and code generation
+- Parses the RHO symbol set, with ASCII aliases for every glyph
+- Static validation: undeclared spaces, shape mismatches, missing equilibrium point
+- Constraint solving for `!` — interval arithmetic by default, Z3 with a feature flag
+- Lowers flows to LLVM IR — one full grid sweep per `→`
+- Multi-dimensional shifts `▷` / `▽`, per axis, zero-padded at each axis's boundary
+- Explicit `<4 x double>` vector lowering, verified bit-identical to the scalar path
+- Zero-copy binding: compile a kernel against a buffer the host already owns
+- TLA+ export whose `Next` models the program, and invariants from each `!`
+- Emits a native shared library (`.so`) with a documented C ABI
+- Deterministic output: the same source always produces byte-identical IR
 
-The implementation is intentionally focused on a minimal, verifiable core rather than a full language runtime.
+See [Implementation Status](#implementation-status) for what is designed but not
+yet built. The implementation is deliberately a small verifiable core, not a
+full language runtime.
 
 ---
 
 ## Quick Start
 
-The easiest way to set up the ρ (RHO) compiler development environment with all toolchains (Rust, LLVM, Clang, Python) pre-configured is using the official Docker container.
+### 1. Build
 
-### 1. Build and Run via Docker
+Local toolchain (Rust 1.80+, and clang with LLVM 15 or newer):
+
 ```bash
-# Clone repository
 git clone https://github.com/Escoffier1156/Rho_Lang.git
 cd Rho_Lang
+cargo build --release
+cargo test
+```
 
-# Build the official Docker container
+Or use the container, which pins Rust, LLVM, Clang and Python:
+
+```bash
 docker build -t escoffier1156/rho-lang .
-
-# Run the interactive workspace container
 docker run -it escoffier1156/rho-lang
 ```
 
-### 2. Build and Test inside Container
-Once inside the container, you can compile and test the compiler directly:
+### 2. Compile a kernel
+
 ```bash
-cargo test
-cargo build --release
+cargo run --release --bin rhoc -- examples/matrix_add.rho
 ```
 
-### 4. Run the Example Compiler
+This writes `libkernel.so` and reports how many cells the kernel sweeps, along
+with what the constraint solver could prove.
+
+| Flag | Effect |
+|---|---|
+| `--dump-llvm` | Print the generated IR |
+| `--dump-dag` | Print the dataflow trace |
+| `--dump-tla` | Write `rho_harmony.tla` and a matching `rho_harmony.cfg` |
+| `--tau <v>` | Bind the threshold symbol `𝜏` (default `0.0`) |
+| `--bind NAME=0x…` | Point a space at an address the caller owns |
+| `--no-simd` | Emit only scalar loops |
+
+Build with `--features z3-solver` to discharge `!` constraints with SMT instead
+of interval arithmetic.
+
+To model check the exported specification:
 
 ```bash
-cargo run --release -- examples/teichmuller.rho
+TLA2TOOLS=/path/to/tla2tools.jar ./scripts/verify_tla.sh examples/gradient_2d.rho
 ```
 
-This produces a shared library named `libkernel.so`.
+### 3. Call it from Python
 
-### 5. Run the Example Kernel from Python
-
-```bash
-python3 - <<'PY'
+```python
 import ctypes
-lib = ctypes.CDLL('./libkernel.so')
-lib.rho_kernel_exec_with_args.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double)]
-lib.rho_kernel_exec_with_args.restype = None
 
-arr = (ctypes.c_double * 4)(1.0, 2.0, 3.0, 4.0)
-out = (ctypes.c_double * 4)(0.0, 0.0, 0.0, 0.0)
-lib.rho_kernel_exec_with_args(arr, out)
-print(list(out))
-PY
+lib = ctypes.CDLL('./libkernel.so')
+
+# A kernel's grid size comes from its ◯ □ declaration. Ask for it rather than
+# guessing — a buffer shorter than this is a memory error, not a short result.
+lib.rho_kernel_element_count.restype = ctypes.c_int64
+n = lib.rho_kernel_element_count()
+
+Buffer = ctypes.c_double * n
+src = Buffer(*[float(i + 1) for i in range(n)])
+dst = Buffer()
+
+lib.rho_kernel_exec_with_args.argtypes = [ctypes.POINTER(ctypes.c_double)] * 2
+lib.rho_kernel_exec_with_args.restype = None
+lib.rho_kernel_exec_with_args(src, dst)
+
+print(list(dst))          # [2.0, 4.0, 6.0, 8.0]
 ```
+
+Or through the wrapper, which checks buffer lengths for you:
+
+```python
+from rho import RhoEngine
+
+engine = RhoEngine()
+engine.compile_rho_file("examples/matrix_add.rho")
+print(engine.element_count(), engine.get_metadata())
+engine.execute_kernel_with_args(src, dst)
+```
+
+### 4. Or skip the pointers entirely
+
+Compile the kernel against the address of a buffer you already own, and the
+call takes no arguments at all:
+
+```python
+buf = (ctypes.c_double * 4)(1.0, 2.0, 3.0, 4.0)
+
+engine = RhoEngine()
+engine.compile_rho_file("examples/matrix_add.rho", bind={"INPUT": buf})
+engine.execute_kernel(buf)
+
+print(list(buf))          # [2.0, 4.0, 6.0, 8.0] — written in place
+```
+
+---
+
+## C ABI
+
+| Symbol | Signature | Purpose |
+|---|---|---|
+| `rho_kernel_element_count` | `int64_t (void)` | Cells the kernel sweeps; the minimum buffer length |
+| `rho_kernel_exec_with_args` | `void (const double *in, double *out)` | Run the kernel. Buffers **must** hold `element_count()` doubles |
+| `rho_kernel_exec_bounded` | `void (const double *in, double *out, int64_t n)` | Same, but clamps the sweep to `n` cells |
+| `rho_kernel_metadata` | `const char * (void)` | JSON: element count and every space's shape |
+| `rho_kernel_exec` | `void (void)` | Zero-copy: runs against the addresses compiled in via `&[0x…]` or `--bind`. Returns immediately if `INPUT` is unbound |
+
+Passing `NULL` as the output pointer makes the kernel write in place. Passing
+`NULL` as the input pointer makes it return without touching memory.
 
 ---
 
@@ -86,17 +162,73 @@ PY
 }
 ```
 
+`▷INPUT` reads the cell before the current one and `▽INPUT` the cell after, both
+zero at the boundary, so the first two flows are the forward and backward spatial
+differences. On this `1024 1024` grid those neighbours are along a row; write
+`▷0INPUT` to step between rows instead. `𝜏` is a threshold, 0.0 unless `--tau`
+says otherwise; a comparison passes the left value through where it holds and
+collapses the cell to 0 elsewhere.
+
+The compiler will tell you that this example can divide by zero:
+
+```
+[proved]   (OUTPUT >= 0)
+[unproven] ((△ - ▽) / (△ + ▽)) — the denominator ranges over [-inf, +inf], which includes zero
+```
+
+That is the formula, not a compiler fault: `△ + ▽` is the discrete Laplacian, so
+smooth input drives it to zero and the kernel returns infinities.
+
+---
+
+## Implementation Status
+
+| Area | Status |
+|---|---|
+| Parser, ASCII aliases, symbol validation | ✅ implemented |
+| Shape / flow / undeclared-space checks | ✅ implemented |
+| LLVM lowering, one sweep per `→` | ✅ implemented |
+| Multi-dimensional indexing and per-axis shifts | ✅ implemented |
+| Explicit `<4 x double>` vector lowering | ✅ implemented — see the note below |
+| Zero-copy binding (`&[0x…]`, `--bind`) | ✅ implemented |
+| `!` constraint solver | ✅ interval arithmetic; Z3 with `--features z3-solver`. Models binary64 rounding, not ℝ |
+| TLA+ export (`--dump-tla`) | ✅ real transition relation and invariants, model checked with TLC |
+| C ABI, JSON metadata, Python FFI | ✅ implemented |
+| AVX-512 / NEON width selection, GPU backends | 📋 planned — the vector width is fixed at four lanes |
+| Tiling and cache blocking | 📋 planned — a sweep is one linear pass |
+| Parallel execution of independent flows | 📋 planned — flows run in source order on one thread |
+
+Two honest caveats on the ✅ rows:
+
+- **Vector lowering is correct, not dramatically faster.** `clang -O3` vectorises
+  no loops on the scalar IR by itself — the boundary select defeats it — and the
+  explicit path roughly doubles the packed-double instructions emitted. Wall clock
+  still only improves 1.0–1.1x on large grids, because streaming megabytes of
+  doubles is bound by memory bandwidth. `--no-simd` is verified to produce
+  bit-identical results.
+- **A proof assumes no overflow, underflow or NaN.** The solver models
+  round-to-nearest — every result is the exact one times `(1 ± 2⁻⁵³)` — which is
+  what stops it proving things that only hold over the reals. It does not model
+  infinities, subnormals or NaN.
+- **TLC can only check the integer subset.** A program that divides or uses
+  fractional literals produces a spec over `Reals`, which SANY parses but TLC
+  cannot evaluate. `examples/teichmuller.rho` is in that category;
+  `examples/gradient_2d.rho` is not, and CI model checks it on every push.
+
 ---
 
 ## Design Direction
 
-The project is currently positioned as:
-
 - a compiler prototype for a clockless, spatial dataflow style
 - a research-oriented implementation of topological numeric computation
-- a foundation for future work in memory-aware execution, low-power scheduling, and domain-specific numeric kernels
+- a foundation for future work in memory-aware execution, low-power scheduling,
+  and domain-specific numeric kernels
 
-The long-term aim is not merely to add syntax, but to build a runtime model that can express and execute computation in a more memory-aware and flow-oriented way.
+The long-term aim is not merely to add syntax, but to build a runtime model that
+can express and execute computation in a more memory-aware and flow-oriented way.
+
+See [docs/SPECIFICATION.md](docs/SPECIFICATION.md) for the symbol dictionary and
+[docs/ROADMAP.md](docs/ROADMAP.md) for the staged plan.
 
 ---
 

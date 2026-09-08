@@ -19,11 +19,18 @@ jobs:
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy, rustfmt
 
-    - name: Install LLVM & Clang
+    - name: Install LLVM, Clang & Z3
       run: |
         sudo apt-get update
-        sudo apt-get install -y clang llvm
+        sudo apt-get install -y clang llvm libz3-dev
+
+    - name: Lint (clippy)
+      run: |
+        cargo clippy --all-targets -- -D warnings
+        cargo clippy --all-targets --features z3-solver -- -D warnings
 
     - name: Build Compiler (`rhoc`)
       run: cargo build --verbose
@@ -31,5 +38,35 @@ jobs:
     - name: Run Unit Tests
       run: cargo test --verbose
 
+    - name: Run Unit Tests (Z3 constraint backend)
+      run: cargo test --verbose --features z3-solver
+
+    - name: Check SIMD Matches The Scalar Reference
+      run: cargo test --release vector_and_scalar
+
     - name: Run Sample Compilation (`teichmuller.rho`)
-      run: cargo run -- examples/teichmuller.rho --dump-dag --dump-llvm
+      run: cargo run --bin rhoc -- examples/teichmuller.rho --dump-dag --dump-llvm
+
+    - name: Check Codegen Determinism
+      run: |
+        cargo run --quiet --bin rhoc -- examples/teichmuller.rho --dump-llvm > a.ll
+        cargo run --quiet --bin rhoc -- examples/teichmuller.rho --dump-llvm > b.ll
+        diff a.ll b.ll
+
+    - name: Set up Java for TLA+
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '21'
+
+    - name: Model Check The Generated TLA+ Spec
+      run: |
+        curl -sSL -o tla2tools.jar \
+          https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+        TLA2TOOLS="$PWD/tla2tools.jar" ./scripts/verify_tla.sh examples/gradient_2d.rho
+
+    - name: Run Python FFI Examples
+      run: |
+        python3 examples/run_matrix_add.py
+        python3 examples/test_inline_decorator.py
+        python3 examples/python_demo.py

@@ -7,7 +7,7 @@ pub fn validate_symbols(input: &str) -> Result<()> {
     let code_only = remove_comments(input);
 
     let allowed_unicode: HashSet<char> = [
-        '◯', '□', '▷', '▽', '△', '◇', '◈', '⍳', '+', '-', '×', '*', '/', '^', '⌈', '⌊', '|', '→', '⇒', '<', '>', '=', ':', '{', '}', '$', '&', '!',
+        '◯', '□', '▷', '▽', '△', '◇', '◈', '⍳', '⌽', '+', '-', '×', '*', '/', '^', '⌈', '⌊', '|', '→', '⇒', '<', '>', '=', ':', '{', '}', '$', '&', '!',
         '(', ')', '[', ']', ';', ',', '.', ' ', '\t', '\r', '\n', '_', '𝜏', 'τ'
     ].iter().cloned().collect();
 
@@ -71,6 +71,7 @@ pub fn normalize_ascii_aliases(input: &str) -> String {
         .replace(">>", "▷")
         .replace("<<", "▽")
         .replace("#", "⍳")
+        .replace("%", "⌽")
         .replace("@", "&")
 }
 
@@ -93,6 +94,10 @@ pub fn parse_rho_program(input: &str) -> Result<ToposBlock> {
 
         let parsed = parse_line(text).map_err(|e| match e {
             HarmonyDisruption::IterateErr { detail, line: 0 } => HarmonyDisruption::IterateErr {
+                detail,
+                line: index + 1,
+            },
+            HarmonyDisruption::LoweringErr { detail, line: 0 } => HarmonyDisruption::LoweringErr {
                 detail,
                 line: index + 1,
             },
@@ -320,6 +325,40 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         }
     }
 
+    // Rotate: `k ⌽ X`, `k ⌽0 X`. Binds tighter than every arithmetic operator,
+    // as the prefix glyphs do, so `A + 1 ⌽ X` is `A + (1 ⌽ X)`. The amount is
+    // a whole number written as a literal: a rotation is fixed at compile
+    // time, like a shift's direction.
+    if let Some(pos) = find_binary_op_position(expr_str, "⌽") {
+        let amount = parse_expr(expr_str[..pos].trim())?;
+        let by = match amount {
+            Expr::Number(v) if v == v.trunc() && v.abs() <= 1e9 => v as i64,
+            _ => {
+                return Err(HarmonyDisruption::LoweringErr {
+                    detail: format!(
+                        "`⌽` rotates by a whole number written as a literal, not by `{}`",
+                        expr_str[..pos].trim()
+                    ),
+                    line: 0,
+                })
+            }
+        };
+        let after = &expr_str[pos + '⌽'.len_utf8()..];
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        let operand_str = after[digits.len()..].trim();
+        if operand_str.is_empty() {
+            return Err(HarmonyDisruption::LoweringErr {
+                detail: "`⌽` needs a space to rotate".to_string(),
+                line: 0,
+            });
+        }
+        return Ok(Expr::Rotate {
+            by,
+            axis: if digits.is_empty() { None } else { digits.parse().ok() },
+            operand: Box::new(parse_expr(operand_str)?),
+        });
+    }
+
     // A named function: `exp X`, `ind (A > B)`. The name has to be followed by
     // whitespace or a bracket, so a space called `expansion` stays a space.
     for name in BuiltinOp::ALL {
@@ -411,6 +450,19 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         });
     }
 
+    // Reverse: ⌽X reads the cell at the other end of the axis; ⌽0X names it.
+    if expr_str.starts_with('⌽') && expr_str.chars().count() > 1 {
+        let rest = &expr_str['⌽'.len_utf8()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        let operand_str = rest[digits.len()..].trim();
+        if !operand_str.is_empty() {
+            return Ok(Expr::Reverse {
+                axis: if digits.is_empty() { None } else { digits.parse().ok() },
+                operand: Box::new(parse_expr(operand_str)?),
+            });
+        }
+    }
+
     // Index: ⍳X is the coordinate of each cell of X along an axis, from
     // zero; ⍳0X names the axis.
     if expr_str.starts_with('⍳') && expr_str.chars().count() > 1 {
@@ -466,7 +518,7 @@ fn find_binary_op_position(s: &str, op: &str) -> Option<usize> {
             // A + or - that follows another operator is a sign on the number to
             // its right, not a split point. Without this, `A × -3.0` breaks at
             // the minus and leaves `A ×` behind as if it were a name.
-            if matches!(op, "+" | "-") && is_sign_position(&s[..i]) {
+            if matches!(op, "+" | "-" | "⌽") && is_sign_position(&s[..i]) {
                 continue;
             }
             let lhs = s[..i].trim();
@@ -492,7 +544,7 @@ fn is_sign_position(before: &str) -> bool {
         let mut tail = stripped.chars();
         let last = tail.next_back();
         let before_last = tail.next_back();
-        if matches!(last, Some('▷' | '▽' | '□' | '⍳'))
+        if matches!(last, Some('▷' | '▽' | '□' | '⍳' | '⌽'))
             || (matches!(last, Some('+' | '-' | '×' | '*' | '>' | '<'))
                 && matches!(before_last, Some('◇' | '◈')))
         {
@@ -505,7 +557,7 @@ fn is_sign_position(before: &str) -> bool {
         Some(c) => matches!(
             c,
             '+' | '-' | '×' | '*' | '/' | '^' | '⌈' | '⌊' | '|' | '>' | '<' | '=' | '('
-                | ':' | '→' | '◇' | '◈' | '▷' | '▽' | '□' | '⍳' | '!' | '$'
+                | ':' | '→' | '◇' | '◈' | '▷' | '▽' | '□' | '⍳' | '⌽' | '!' | '$'
         ),
     }
 }
@@ -626,6 +678,8 @@ fn check_expr_spaces(expr: &Expr, declared: &HashSet<String>, line: usize) -> Re
         | Expr::Builtin { operand: inner, .. }
         | Expr::Lift { operand: inner, .. }
         | Expr::Index { operand: inner, .. }
+        | Expr::Rotate { operand: inner, .. }
+        | Expr::Reverse { operand: inner, .. }
         | Expr::AuditTrace(inner) => {
             check_expr_spaces(inner, declared, line)?;
         }
@@ -653,9 +707,9 @@ pub fn validate_flow_equilibrium(block: &ToposBlock) -> Result<()> {
 
 /// Static shape and dimension mismatch check
 pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
-    let mut space_shapes = HashMap::new();
+    let mut space_shapes = BTreeMap::new();
 
     // 1. Gather initial declared shapes
     for stmt in &block.statements {
@@ -670,39 +724,9 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
         }
     }
 
-    // Helper to extract shape of an expression recursively
-    fn get_expr_shape(expr: &Expr, shapes: &HashMap<String, Vec<usize>>) -> Option<Vec<usize>> {
-        match expr {
-            Expr::Var(name) => shapes.get(name).cloned(),
-            Expr::Reduce { axis, operand, .. } => {
-                let inner = get_expr_shape(operand, shapes)?;
-                let a = axis.unwrap_or_else(|| default_axis(&inner));
-                (a < inner.len()).then(|| shape_without_axis(&inner, a))
-            }
-            Expr::Lift { axis, operand } => {
-                let inner = get_expr_shape(operand, shapes)?;
-                shape_with_unit_axis(&inner, *axis)
-            }
-            Expr::Scan { operand, .. }
-            | Expr::Builtin { operand, .. }
-            | Expr::Index { operand, .. } => get_expr_shape(operand, shapes),
-            Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
-                get_expr_shape(inner, shapes)
-            }
-            Expr::BinaryOp { lhs, rhs, .. } => {
-                let l_shape = get_expr_shape(lhs, shapes);
-                let r_shape = get_expr_shape(rhs, shapes);
-                match (l_shape, r_shape) {
-                    // A length-1 axis stretches, so the operands need not match
-                    // exactly — only broadcast against one another.
-                    (Some(l), Some(r)) => broadcast_shapes(&l, &r),
-                    (Some(l), None) => Some(l),
-                    (None, Some(r)) => Some(r),
-                    (None, None) => None,
-                }
-            }
-            Expr::Number(_) => None,
-        }
+    // The one shape inference, shared with the compiler and the analysis.
+    fn get_expr_shape(expr: &Expr, shapes: &BTreeMap<String, Vec<usize>>) -> Option<Vec<usize>> {
+        expr_shape(expr, shapes)
     }
 
     // 2. Operands that cannot stretch against one another are an error, not an
@@ -710,7 +734,7 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
     // mismatch surface as a silently skipped check.
     fn check_broadcast(
         expr: &Expr,
-        shapes: &HashMap<String, Vec<usize>>,
+        shapes: &BTreeMap<String, Vec<usize>>,
         line: usize,
     ) -> Result<()> {
         match expr {
@@ -737,6 +761,8 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
             | Expr::Builtin { operand: inner, .. }
             | Expr::Lift { operand: inner, .. }
             | Expr::Index { operand: inner, .. }
+            | Expr::Rotate { operand: inner, .. }
+            | Expr::Reverse { operand: inner, .. }
             | Expr::AuditTrace(inner) => check_broadcast(inner, shapes, line)?,
             Expr::Var(_) | Expr::Number(_) => {}
         }

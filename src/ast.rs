@@ -190,6 +190,22 @@ pub enum Expr {
         op: BuiltinOp,
         operand: Box<Expr>,
     },
+    /// `k ⌽ X` — APL's rotate: the cell `k` further along the axis, wrapping
+    /// at the end, so `result[i] = X[(i + k) mod n]`. `k` is a whole number
+    /// written as a literal, negative to rotate the other way; a digit after
+    /// the glyph names the axis. Where `▷` pads with zero at the edge, `⌽`
+    /// wraps, which is what a periodic boundary is.
+    Rotate {
+        by: i64,
+        axis: Option<usize>,
+        operand: Box<Expr>,
+    },
+    /// `⌽X` — APL's reverse: the cell at the other end of the axis,
+    /// `result[i] = X[n - 1 - i]`.
+    Reverse {
+        axis: Option<usize>,
+        operand: Box<Expr>,
+    },
     /// `⍳X` — the coordinate of each cell of X's shape along one axis,
     /// counted from zero; `⍳0X` names the axis, a bare `⍳X` takes the
     /// innermost axis with more than one cell, as `▷` and `◇` do. X is read
@@ -315,7 +331,9 @@ pub fn expr_shape(
         }
         Expr::Scan { operand, .. }
         | Expr::Builtin { operand, .. }
-        | Expr::Index { operand, .. } => expr_shape(operand, shapes),
+        | Expr::Index { operand, .. }
+        | Expr::Rotate { operand, .. }
+        | Expr::Reverse { operand, .. } => expr_shape(operand, shapes),
         Expr::Reduce { axis, operand, .. } => {
             let inner = expr_shape(operand, shapes)?;
             let a = axis.unwrap_or_else(|| default_axis(&inner));

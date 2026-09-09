@@ -44,6 +44,7 @@ principle.
 | `◈` | Scan | Dasseki (垜積) | A running fold; keeps the shape, see §3.5 | ✅ |
 | `□` | Lift | Hojin (方陣) | In an expression, inserts a length-1 axis, see §3.6 | ✅ |
 | `⍳` / `#` | Index | — | The coordinate of each cell along an axis, from zero, see §3.7 | ✅ |
+| `⌽` / `%` | Rotate, Reverse | — | `k ⌽ X` reads `k` cells along, wrapping; `⌽X` reads from the other end, see §3.2.2 | ✅ |
 | `+` | Addition | Superposition | Element-wise addition | ✅ |
 | `-` | Subtraction | Difference | Element-wise subtraction | ✅ |
 | `×` / `*` | Multiplication | Scaling | Element-wise product | ✅ |
@@ -64,7 +65,7 @@ principle.
 | `!` | Constraint | Invariant Check | Statically verified, see §4 | ✅ |
 | `→ =` | Convergence | — | Writes the caller's output buffer | ✅ |
 
-ASCII aliases: `->` for `→`, `=>` for `⇒`, `>>` for `▷`, `<<` for `▽`, `>.` for `⌈`, `<.` for `⌊`, `@` for `&`,
+ASCII aliases: `->` for `→`, `=>` for `⇒`, `>>` for `▷`, `<<` for `▽`, `>.` for `⌈`, `<.` for `⌊`, `#` for `⍳`, `%` for `⌽`, `@` for `&`,
 `<>` for `◇`, `<.>` for `◈`, `[]` for `□`.
 
 ### The greater, the lesser and the residue
@@ -191,6 +192,31 @@ vectorisation is guaranteed and visible in the IR, not that it is fast.
 
 📋 AVX-512 and NEON widths, and GPU warp shuffles, are still future work; the
 width is fixed at four lanes and clang widens further if the target allows.
+
+### 3.2.2 Rotation and reversal (`⌽`) ✅
+
+`k ⌽ X` is APL's rotate: each cell reads the cell `k` further along the axis,
+wrapping at the end, so `result[i] = X[(i + k) mod n]`; a negative `k` turns
+the other way, and `k` beyond the axis's length goes round. Where `▷` and `▽`
+pad with zero at the edge, `⌽` wraps, which is what a periodic boundary is:
+
+```rho
+(((1 ⌽ U) + (-1 ⌽ U)) - (2.0 × U)) → LAPLACIAN      /* on a ring */
+```
+
+`⌽X` alone is APL's reverse, `result[i] = X[n - 1 - i]`. As with the shifts, a
+digit after the glyph names the axis — `1 ⌽0 X`, `⌽0X` — and a bare `⌽` takes
+the innermost axis with more than one cell. `%` spells it in ASCII.
+
+The amount is a whole number written as a literal: a rotation is fixed at
+compile time, like a shift's direction. `⌽` binds tighter than every arithmetic
+operator, as the prefix glyphs do, so `A + 1 ⌽ X` is `A + (1 ⌽ X)`; after an
+operator it is the prefix reverse. Like a shift, a turn reads a declared space,
+not a computed value: flow the value into a space first.
+
+A turn's reads are not contiguous — they wrap at the end of every row — so a
+sweep that contains one stays scalar. 📋 A gathered vector path would lift
+this.
 
 ### 3.3 Flow & Convergence (`→`, `=`) ✅
 

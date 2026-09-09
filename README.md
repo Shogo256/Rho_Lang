@@ -35,6 +35,8 @@ Working prototype. What runs today:
   ReLU is `X ⌈ 0.0`, a clamp is `(X ⌊ 1.0) ⌈ -1.0`, and `3.0 | X` is X mod 3
 - `⍳`, the coordinate of each cell along an axis from zero, so a window, a
   distance from the centre or a Vandermonde matrix is one line
+- `⌽`, APL's rotate and reverse: `1 ⌽ U` wraps where `▽U` pads with zero, which
+  is a periodic boundary in one glyph
 - `--f32` for single precision, with the interpreter and the `!` check
   following the width
 - `□` lifting and broadcasting, so an outer product — and a matrix product — is

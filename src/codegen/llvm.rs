@@ -534,6 +534,23 @@ impl LlvmCodeGen {
         sym
     }
 
+    /// Whether the expression rotates or reverses anything. Such a read wraps
+    /// at the end of the axis, so its lanes are not contiguous and the sweep
+    /// stays scalar. 📋 A gathered vector path would lift this.
+    fn turns(expr: &Expr) -> bool {
+        match expr {
+            Expr::Rotate { .. } | Expr::Reverse { .. } => true,
+            Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => false,
+            Expr::AuditTrace(inner)
+            | Expr::Shift { operand: inner, .. }
+            | Expr::Builtin { operand: inner, .. }
+            | Expr::Lift { operand: inner, .. }
+            | Expr::Scan { operand: inner, .. }
+            | Expr::Reduce { operand: inner, .. } => Self::turns(inner),
+            Expr::BinaryOp { lhs, rhs, .. } => Self::turns(lhs) || Self::turns(rhs),
+        }
+    }
+
     /// The pointer map an entrypoint with an input and an output starts from.
     fn in_out(in_sym: &str, out_sym: &str) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
@@ -770,8 +787,9 @@ impl LlvmCodeGen {
 
         let sweep = self.sweep_length(src, target, bufs);
         let result_shape = self.sweep_shape(src, target);
-        // A stretched read is not contiguous, so it cannot be vector loaded.
-        let plan = if self.needs_broadcast(src, &result_shape, &[]) {
+        // A stretched read is not contiguous, so it cannot be vector loaded;
+        // neither is a read that wraps at the end of an axis.
+        let plan = if self.needs_broadcast(src, &result_shape, &[]) || Self::turns(src) {
             Sweep::AllScalar
         } else {
             self.plan_sweep(src, &sweep)?
@@ -998,6 +1016,8 @@ impl LlvmCodeGen {
             Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => {}
             Expr::AuditTrace(inner)
             | Expr::Shift { operand: inner, .. }
+            | Expr::Rotate { operand: inner, .. }
+            | Expr::Reverse { operand: inner, .. }
             | Expr::Builtin { operand: inner, .. }
             | Expr::Lift { operand: inner, .. } => {
                 self.reserve_fold_buffers(inner, ir, bufs, counter)?;
@@ -1065,6 +1085,8 @@ impl LlvmCodeGen {
             Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => {}
             Expr::AuditTrace(inner)
             | Expr::Shift { operand: inner, .. }
+            | Expr::Rotate { operand: inner, .. }
+            | Expr::Reverse { operand: inner, .. }
             | Expr::Builtin { operand: inner, .. }
             | Expr::Lift { operand: inner, .. } => {
                 block = self.emit_fold_prepass(inner, ir, bufs, &block, counter)?;
@@ -1439,9 +1461,14 @@ impl LlvmCodeGen {
                 .max(self.max_shift_stride(rhs)?),
             // A fold is precomputed into its own buffer before the sweep, so
             // it contributes no reach to the sweep itself.
-            // Neither reads a neighbour: a fold has its own buffer, an index
-            // reads nothing at all.
-            Expr::Reduce { .. } | Expr::Scan { .. } | Expr::Index { .. } => 0,
+            // None of these reads a neighbour window: a fold has its own
+            // buffer, an index reads nothing, and a turn keeps the sweep
+            // scalar and addresses each cell itself.
+            Expr::Reduce { .. }
+            | Expr::Scan { .. }
+            | Expr::Index { .. }
+            | Expr::Rotate { .. }
+            | Expr::Reverse { .. } => 0,
             Expr::Lift { operand, .. } | Expr::Builtin { operand, .. } => {
                 self.max_shift_stride(operand)?
             }
@@ -1632,6 +1659,8 @@ impl LlvmCodeGen {
             Expr::Var(name) => Self::lifted_shape(&self.shape_for(name), lifts) != result_shape,
             Expr::AuditTrace(inner)
             | Expr::Shift { operand: inner, .. }
+            | Expr::Rotate { operand: inner, .. }
+            | Expr::Reverse { operand: inner, .. }
             | Expr::Builtin { operand: inner, .. } => {
                 self.needs_broadcast(inner, result_shape, lifts)
             }
@@ -1802,6 +1831,71 @@ impl LlvmCodeGen {
                 ir.push_str(&format!(
                     "  {gep} = getelementptr inbounds {}, ptr {ptr}, i64 {read_at}\n",
             self.precision.llvm_type()
+                ));
+                ir.push_str(&format!(
+                    "  {val} = load {ty}, ptr {gep}, align {}\n",
+                    self.precision.bytes()
+                ));
+                Ok(val)
+            }
+
+            // A rotation reads the cell `by` further along the axis, wrapping
+            // at its end; a reversal reads the cell at the other end. The
+            // sweep is scalar here (see `turns`), so the cell is addressed
+            // directly.
+            Expr::Rotate { axis, operand, .. } | Expr::Reverse { axis, operand } => {
+                let name = Self::place_name(operand).ok_or_else(|| {
+                    HarmonyDisruption::LoweringErr {
+                        line: self.current_line.get(),
+                        detail: "⌽ turns a declared space, so it cannot be applied to a computed value. Flow the sub-expression into its own space first.".to_string(),
+                    }
+                })?;
+                if matches!(mode, Mode::Vector(..)) {
+                    return Err(HarmonyDisruption::LoweringErr {
+                        line: self.current_line.get(),
+                        detail: "internal: a turn reached the vector path".to_string(),
+                    });
+                }
+                let ptr = self.lookup(bufs, &name)?;
+                let shape = self.shape_for(&name);
+                let (stride, extent) = self.axis_geometry(&shape, *axis)?;
+                let view = Self::lifted_shape(&shape, lifts);
+                let read_at = self.emit_index_map(ir, idx, &view, result_shape, counter)?;
+
+                // Position along the axis, then the position read instead.
+                let pos = Self::fresh(counter);
+                if stride == 1 {
+                    ir.push_str(&format!("  {pos} = urem i64 {read_at}, {extent}\n"));
+                } else {
+                    let q = Self::fresh(counter);
+                    ir.push_str(&format!("  {q} = udiv i64 {read_at}, {stride}\n"));
+                    ir.push_str(&format!("  {pos} = urem i64 {q}, {extent}\n"));
+                }
+                let target = Self::fresh(counter);
+                match expr {
+                    Expr::Rotate { by, .. } => {
+                        let k = by.rem_euclid(extent as i64);
+                        let ahead = Self::fresh(counter);
+                        ir.push_str(&format!("  {ahead} = add i64 {pos}, {k}\n"));
+                        ir.push_str(&format!("  {target} = urem i64 {ahead}, {extent}\n"));
+                    }
+                    _ => {
+                        ir.push_str(&format!("  {target} = sub i64 {}, {pos}\n", extent - 1));
+                    }
+                }
+                let back = Self::fresh(counter);
+                let forward = Self::fresh(counter);
+                let cell = Self::fresh(counter);
+                ir.push_str(&format!("  {back} = mul i64 {pos}, {stride}\n"));
+                ir.push_str(&format!("  {forward} = mul i64 {target}, {stride}\n"));
+                let line_start = Self::fresh(counter);
+                ir.push_str(&format!("  {line_start} = sub i64 {read_at}, {back}\n"));
+                ir.push_str(&format!("  {cell} = add i64 {line_start}, {forward}\n"));
+                let gep = Self::fresh(counter);
+                let val = Self::fresh(counter);
+                ir.push_str(&format!(
+                    "  {gep} = getelementptr inbounds {}, ptr {ptr}, i64 {cell}\n",
+                    self.precision.llvm_type()
                 ));
                 ir.push_str(&format!(
                     "  {val} = load {ty}, ptr {gep}, align {}\n",

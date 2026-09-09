@@ -237,20 +237,21 @@ fn expression(
     }
 
     match rng.below(10) {
-        // A shift keeps its shape, but needs a space to read a neighbour from;
-        // an index keeps it too, and one in three of these is one.
+        // A shift keeps its shape, but needs a space to read a neighbour from.
+        // So do an index, a rotation and a reversal, which take their turns.
         0 | 1 if !matching.is_empty() => {
-            let glyph = if rng.below(3) == 0 {
-                "⍳"
-            } else {
-                ["▷", "▽"][rng.below(2)]
-            };
+            let name = &matching[rng.below(matching.len())].0;
             let axis = if want.len() > 1 && rng.below(2) == 0 {
                 rng.below(want.len()).to_string()
             } else {
                 String::new()
             };
-            format!("({glyph}{axis}{})", matching[rng.below(matching.len())].0)
+            match rng.below(6) {
+                0 => format!("(⍳{axis}{name})"),
+                1 => format!("({} ⌽{axis} {name})", [-3i64, -2, -1, 1, 2, 3, 5][rng.below(7)]),
+                2 => format!("(⌽{axis}{name})"),
+                _ => format!("({}{axis}{name})", ["▷", "▽"][rng.below(2)]),
+            }
         }
 
         // A fold needs an operand whose shape collapses to the wanted one.

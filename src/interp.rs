@@ -206,9 +206,11 @@ fn shape_of<S: Numeric>(expr: &Expr, env: &Env<S>, line: usize) -> Result<Option
         Expr::AuditTrace(inner) | Expr::Shift { operand: inner, .. } => {
             shape_of(inner, env, line)?
         }
-        Expr::Scan { operand, .. } | Expr::Builtin { operand, .. } | Expr::Index { operand, .. } => {
-            shape_of(operand, env, line)?
-        }
+        Expr::Scan { operand, .. }
+        | Expr::Builtin { operand, .. }
+        | Expr::Index { operand, .. }
+        | Expr::Rotate { operand, .. }
+        | Expr::Reverse { operand, .. } => shape_of(operand, env, line)?,
         Expr::Lift { axis, operand } => match shape_of(operand, env, line)? {
             Some(inner) => Some(shape_with_unit_axis(&inner, *axis).ok_or_else(|| {
                 err(line, format!("axis {axis} is past the end of {inner:?}"))
@@ -316,6 +318,28 @@ fn eval_cell<S: Numeric>(
             let mut nested = lifts.to_vec();
             nested.push(*axis);
             eval_cell(operand, env, tau, line, at_shape, index, &nested)
+        }
+
+        // A rotation reads the cell `by` further along the axis, wrapping; a
+        // reversal reads the cell at the other end. Both are the operand at
+        // another cell of its own shape.
+        Expr::Rotate { axis, operand, .. } | Expr::Reverse { axis, operand } => {
+            let inner_shape = shape_of(operand, env, line)?
+                .ok_or_else(|| err(line, "⌽ needs an operand with a shape"))?;
+            let view = lifted(&inner_shape, lifts);
+            let mapped = map_index(&view, at_shape, index);
+            let a = axis.unwrap_or_else(|| default_axis(&inner_shape));
+            let (stride, extent) = axis_geometry(&inner_shape, Some(a))
+                .ok_or_else(|| err(line, format!("axis {a} is past the end of {inner_shape:?}")))?;
+            let position = (mapped / stride) % extent;
+            let target = match expr {
+                Expr::Rotate { by, .. } => {
+                    (position as i64 + by).rem_euclid(extent as i64) as usize
+                }
+                _ => extent - 1 - position,
+            };
+            let cell = mapped - position * stride + target * stride;
+            eval_at(operand, env, tau, line, &inner_shape, cell)
         }
 
         // The coordinate of this cell along one axis of the operand's shape,

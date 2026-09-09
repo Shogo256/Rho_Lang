@@ -2961,3 +2961,121 @@ fn test_the_intervals_bound_an_index_by_its_axis() {
     let report = analyze("{\n    INPUT:◯ □ 3 4\n    (⍳0INPUT) → OUTPUT\n    OUTPUT → =\n}");
     assert_eq!((report.output_range.lo, report.output_range.hi), (0.0, 2.0));
 }
+
+// --------------------------------------------------------------------------
+// ⌽: APL's rotate and reverse. Where a shift pads with zero at the end of an
+// axis, a rotation wraps — a periodic boundary — and a reversal reads from
+// the other end.
+// --------------------------------------------------------------------------
+
+#[test]
+fn test_rotate_and_reverse_parse_with_their_axis_and_alias() {
+    let block = parse_rho_program(
+        "{\n    INPUT:◯ □ 3 4\n    (1 ⌽ INPUT) → A\n    (-2 ⌽0 INPUT) → B\n    (⌽INPUT) → C\n    (A + ⌽0C) → D\n    (D + 1 % INPUT) → =\n}",
+    )
+    .unwrap();
+    let flows: Vec<&Expr> = block
+        .statements
+        .iter()
+        .filter_map(|s| match s {
+            rho_lang::ast::Statement::Flow { src, .. } => Some(src),
+            _ => None,
+        })
+        .collect();
+    assert!(matches!(flows[0], Expr::Rotate { by: 1, axis: None, .. }));
+    assert!(matches!(flows[1], Expr::Rotate { by: -2, axis: Some(0), .. }));
+    assert!(matches!(flows[2], Expr::Reverse { axis: None, .. }));
+    // After an operator, ⌽ is the prefix reverse, not a rotation by `A +`.
+    let Expr::BinaryOp { rhs, .. } = flows[3] else { panic!() };
+    assert!(matches!(**rhs, Expr::Reverse { axis: Some(0), .. }));
+    // And it binds tighter than the sum: D + (1 ⌽ INPUT). `%` spells it.
+    let Expr::BinaryOp { op: BinaryOpKind::Add, rhs, .. } = flows[4] else { panic!() };
+    assert!(matches!(**rhs, Expr::Rotate { by: 1, .. }));
+
+    // The amount has to be a whole number written down.
+    let err = parse_rho_program("{\n    INPUT:◯ □ 4 1\n    (INPUT ⌽ INPUT) → =\n}").unwrap_err();
+    assert!(matches!(err, HarmonyDisruption::LoweringErr { line: 3, .. }), "{err}");
+    let err = parse_rho_program("{\n    INPUT:◯ □ 4 1\n    (1.5 ⌽ INPUT) → =\n}").unwrap_err();
+    assert!(matches!(err, HarmonyDisruption::LoweringErr { line: 3, .. }), "{err}");
+}
+
+#[test]
+fn test_rotate_wraps_and_reverse_flips_in_kernel_and_interpreter() {
+    let row: Vec<f64> = (0..8).map(|i| i as f64).collect();
+    let cases: [(&str, &str, Vec<f64>); 5] = [
+        ("rot_one", "(1 ⌽ INPUT) → =", vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 0.0]),
+        ("rot_back", "(-1 ⌽ INPUT) → =", vec![7.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        // Ten around eight is two.
+        ("rot_far", "(10 ⌽ INPUT) → =", vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 0.0, 1.0]),
+        ("rev", "(⌽INPUT) → =", vec![7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0]),
+        // A periodic second difference: zero everywhere on a ramp but where
+        // the ring closes.
+        ("ring", "(((1 ⌽ INPUT) + (-1 ⌽ INPUT)) - (2.0 × INPUT)) → =", vec![8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -8.0]),
+    ];
+    for (name, body, expected) in cases {
+        let source = format!("{{\n    INPUT:◯ □ 8 1\n    {body}\n}}");
+        let block = parse_rho_program(&source).unwrap();
+        let mut env: Env<f64> = Env::new();
+        env.insert("INPUT".to_string(), Grid::from(vec![8, 1], row.clone()));
+        let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+        assert_eq!(meant, expected, "{name}: the interpreter");
+        let out = run_kernel(&format!("turn_{name}"), &source, &row);
+        assert_eq!(&out[..8], &expected[..], "{name}: the kernel");
+    }
+
+    // Along a named axis of a grid: rows move, and reverse flips the rows.
+    let grid: Vec<f64> = (0..12).map(|i| i as f64).collect();
+    let out = run_kernel("turn_rows", "{\n    INPUT:◯ □ 3 4\n    (1 ⌽0 INPUT) → =\n}", &grid);
+    assert_eq!(&out[..12], &[4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 0.0, 1.0, 2.0, 3.0]);
+    let out = run_kernel("turn_rev_rows", "{\n    INPUT:◯ □ 3 4\n    (⌽0INPUT) → =\n}", &grid);
+    assert_eq!(&out[..12], &[8.0, 9.0, 10.0, 11.0, 4.0, 5.0, 6.0, 7.0, 0.0, 1.0, 2.0, 3.0]);
+    // The default axis of a grid is the innermost: each row rotates on its own.
+    let out = run_kernel("turn_cols", "{\n    INPUT:◯ □ 3 4\n    (-1 ⌽ INPUT) → =\n}", &grid);
+    assert_eq!(&out[..12], &[3.0, 0.0, 1.0, 2.0, 7.0, 4.0, 5.0, 6.0, 11.0, 8.0, 9.0, 10.0]);
+
+    // Sixteen cells: the sweep would take the vector path, and a turn keeps
+    // it scalar; the answer must not depend on that.
+    let long: Vec<f64> = (0..16).map(|i| (i as f64 * 0.9).cos()).collect();
+    let source = "{\n    INPUT:◯ □ 16 1\n    ((3 ⌽ INPUT) - (⌽INPUT)) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![16, 1], long.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    let out = run_kernel("turn_long", source, &long);
+    assert_eq!(bits(&out[..16]), bits(&meant));
+    let ir = LlvmCodeGen::new("turn_plan").generate_llvm_ir(&block).unwrap();
+    assert!(ir.contains("sweep 16 cells (scalar)"), "{ir}");
+}
+
+#[test]
+fn test_a_turn_reads_a_declared_space_and_keeps_its_range() {
+    // Like a shift, a turn addresses a space's own buffer.
+    let block = parse_rho_program("{\n    INPUT:◯ □ 4 1\n    (1 ⌽ (INPUT + 1.0)) → =\n}").unwrap();
+    let err = LlvmCodeGen::new("turn_computed").generate_llvm_ir(&block).unwrap_err();
+    assert!(matches!(err, HarmonyDisruption::LoweringErr { line: 3, .. }), "{err}");
+
+    // Whatever cell a turn reads is a cell of the same space, so its range
+    // is the space's.
+    let report = analyze("{\n    INPUT:◯ □ 4 1\n    (ind (INPUT > 0.0)) → M\n    ((2 ⌽ M) + (⌽M)) → OUTPUT\n    ! (OUTPUT >= 0)\n    ! (OUTPUT <= 2.0)\n    OUTPUT → =\n}");
+    assert_eq!(report.constraints[0].verdict, rho_lang::solver::Verdict::Proved);
+    assert_eq!(report.constraints[1].verdict, rho_lang::solver::Verdict::Proved);
+}
+
+#[test]
+fn test_diffusion_on_a_ring_relaxes_to_the_mean() {
+    let source = std::fs::read_to_string("examples/periodic.rho").unwrap();
+    let block = parse_rho_program(&source).unwrap();
+    let input: Vec<f64> = (0..256).map(|i| if i % 64 == 0 { 64.0 } else { 0.0 }).collect();
+    let mean = input.iter().sum::<f64>() / 256.0;
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![256, 1], input.clone()));
+    let options = Options { tau: 1e-9, max_sweeps: 20_000 };
+    let meant = interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone();
+
+    let so = compile_iterating("ring_diffusion", &source, options.tau, options.max_sweeps, true);
+    let (out, sweeps, converged) = run_iterating(&so, &input, 256);
+    assert_eq!(bits(&out), bits(&meant));
+    assert!(converged, "sweeps {sweeps}");
+    // A ring has no edge to lose heat through: everything ends at the mean.
+    assert!(out.iter().all(|v| (v - mean).abs() < 1e-6), "{out:?}");
+}

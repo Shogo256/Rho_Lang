@@ -187,6 +187,24 @@ impl Builder<'_> {
             Expr::AuditTrace(inner) | Expr::Lift { operand: inner, .. } => {
                 self.build(inner, before, offset)
             }
+            // A rotation reads the same space `by` cells along; which cell
+            // that is after the wrap is not known for "any cell", but every
+            // cell's expansion has the same range, so the relative offset
+            // serves. A reversal's partner is likewise some cell of the same
+            // space, and is given this cell's own expansion for its range.
+            Expr::Rotate { by, axis, operand } => match place_name(operand) {
+                Some(name) => {
+                    let stride = axis_geometry(&self.shape_of(&name), *axis)
+                        .map(|(stride, _)| stride as i64)
+                        .unwrap_or(1);
+                    self.build(&Expr::Var(name), before, offset + by * stride)
+                }
+                None => Sym::Free(format!("rotate@{}", offset_tag(offset))),
+            },
+            Expr::Reverse { operand, .. } => match place_name(operand) {
+                Some(name) => self.build(&Expr::Var(name), before, offset),
+                None => Sym::Free(format!("reverse@{}", offset_tag(offset))),
+            },
             // A constraint speaks about any cell, so its coordinate is a free
             // value within the axis; the operand is only measured.
             Expr::Index { axis, operand } => {
@@ -424,6 +442,8 @@ fn collect_divisions(
         | Expr::Scan { operand: inner, .. }
         | Expr::Builtin { operand: inner, .. }
         | Expr::Lift { operand: inner, .. }
+        | Expr::Rotate { operand: inner, .. }
+        | Expr::Reverse { operand: inner, .. }
         | Expr::AuditTrace(inner) => {
             collect_divisions(inner, at, line, builder, out)
         }
@@ -470,6 +490,8 @@ fn collect_domains(
         | Expr::Reduce { operand: inner, .. }
         | Expr::Scan { operand: inner, .. }
         | Expr::Lift { operand: inner, .. }
+        | Expr::Rotate { operand: inner, .. }
+        | Expr::Reverse { operand: inner, .. }
         | Expr::AuditTrace(inner) => collect_domains(inner, at, line, builder, out),
         Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => {}
     }
@@ -500,6 +522,14 @@ impl fmt::Display for ExprGlyphs<'_> {
             Expr::Index { axis, operand } => match axis {
                 Some(a) => write!(f, "⍳{a}{}", ExprGlyphs(operand)),
                 None => write!(f, "⍳{}", ExprGlyphs(operand)),
+            },
+            Expr::Rotate { by, axis, operand } => match axis {
+                Some(a) => write!(f, "({by} ⌽{a} {})", ExprGlyphs(operand)),
+                None => write!(f, "({by} ⌽ {})", ExprGlyphs(operand)),
+            },
+            Expr::Reverse { axis, operand } => match axis {
+                Some(a) => write!(f, "⌽{a}{}", ExprGlyphs(operand)),
+                None => write!(f, "⌽{}", ExprGlyphs(operand)),
             },
             Expr::Shift { dir, axis, operand } => match axis {
                 Some(a) => write!(f, "{dir}{a}{}", ExprGlyphs(operand)),

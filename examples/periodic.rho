@@ -1,0 +1,18 @@
+{
+    /* Diffusion on a ring: a heat step with a periodic boundary, repeated to
+       a fixed point. `1 ⌽ U` is the next cell along the axis and `-1 ⌽ U`
+       the previous one, wrapping at the ends where `▷` and `▽` would pad
+       with zero. The ring relaxes to its mean — slowly: the slowest mode of
+       a ring of 256 loses a quarter of a percent a sweep, so a tolerance of
+       1e-9 takes a few thousand sweeps, and the kernel says whether it got
+       there (rho_kernel_converged) or ran into the cap.
+
+         rhoc examples/periodic.rho --tau 1e-9 --max-iter 20000
+    */
+    INPUT:◯ □ 256 1
+    INPUT → U
+
+    (U + (0.25 × (((1 ⌽ U) + (-1 ⌽ U)) - (2.0 × U)))) ⇒ U
+
+    U → =
+}

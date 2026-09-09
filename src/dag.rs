@@ -137,6 +137,8 @@ fn extract_dependencies(expr: &Expr) -> Vec<String> {
         | Expr::Builtin { operand: inner, .. }
         | Expr::Lift { operand: inner, .. }
         | Expr::Index { operand: inner, .. }
+        | Expr::Rotate { operand: inner, .. }
+        | Expr::Reverse { operand: inner, .. }
         | Expr::AuditTrace(inner) => {
             deps.extend(extract_dependencies(inner));
         }

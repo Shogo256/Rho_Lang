@@ -623,7 +623,11 @@ impl<S: Numeric> Machine<S> {
                         "oge" => Compare::Gte,
                         "ole" => Compare::Lte,
                         "oeq" => Compare::Eq,
-                        "one" | "une" => Compare::Ne,
+                        // Unordered not-equal, true for NaN as `!=` is. The
+                        // ordered `one` is refused rather than read as this:
+                        // reading it as `!=` once hid a NaN disagreement
+                        // between the kernel and the interpreter.
+                        "une" => Compare::Ne,
                         other => return Err(format!("unsupported fcmp {other}")),
                     };
                     Ok(if vector_width(&ty).is_some() {

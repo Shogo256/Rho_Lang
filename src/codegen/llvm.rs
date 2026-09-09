@@ -1262,8 +1262,12 @@ impl LlvmCodeGen {
     ) -> Result<String> {
         let value = self.emit_expr(operand, ir, bufs, idx, counter, mode, result_shape, lifts)?;
         let flag = Self::fresh(counter);
+        // Unordered: NaN is not zero, so `ind` of NaN is 1 — what `!=` says
+        // in C and in the reference interpreter. The ordered `one` is false
+        // for NaN, and differential testing caught that 0 against the
+        // interpreter's 1.
         ir.push_str(&format!(
-            "  {flag} = fcmp one {} {value}, {}\n",
+            "  {flag} = fcmp une {} {value}, {}\n",
             mode.ty(),
             mode.zero()
         ));

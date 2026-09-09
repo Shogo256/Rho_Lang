@@ -81,6 +81,12 @@ truth; applied to anything else it asks whether the value is not zero. A mask
 cannot do this: one that passes a value which happens to be zero is
 indistinguishable from one that blocked it.
 
+NaN is not zero, so `ind` of NaN is 1 — what `!=` says in C and in the
+reference interpreter. The compiler once emitted an *ordered* comparison here,
+which is false for NaN; differential testing found the kernel's 0 against the
+interpreter's 1, and the comparison is now unordered (`fcmp une`). The masks
+are unaffected: NaN fails `>`, `<`, `>=`, `<=` and `==` everywhere.
+
 ```rho
 (ind (INPUT > 5.0)) → ABOVE
 ◇+ ABOVE → =                 /* how many cells exceed five */

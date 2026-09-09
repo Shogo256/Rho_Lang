@@ -1927,6 +1927,42 @@ fn test_named_functions_compute_what_they_say() {
 }
 
 #[test]
+fn test_the_indicator_of_nan_is_one_in_every_representation() {
+    // 0/0 is NaN, and NaN is not zero: C's `!=`, Python and the reference
+    // interpreter all say 1. The compiler emitted an ordered comparison,
+    // which is false for NaN, and differential testing caught the 0.
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        (ind (INPUT / INPUT)) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let input = vec![0.0, 2.0, -3.0, 0.0];
+    let block = parse_rho_program(source).unwrap();
+
+    let mut env = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![4, 1], input.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    assert_eq!(meant, vec![1.0, 1.0, 1.0, 1.0]);
+
+    // The IR, read back without clang.
+    let emitted = run_emitted_ir("ind_nan_ir", source, &input, 4);
+    assert_eq!(emitted, meant);
+
+    // The shared object.
+    let mut codegen = LlvmCodeGen::new("ind_nan");
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    assert!(ir.contains("fcmp une"), "the indicator needs an unordered comparison:\n{ir}");
+    let so_path = "target/ind_nan.so";
+    assert!(codegen.compile_to_so(&ir, so_path).is_ok());
+    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
+    let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
+        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let mut output = vec![0.0f64; 4];
+    unsafe { func(input.as_ptr(), output.as_mut_ptr()) };
+    assert_eq!(output, meant);
+}
+
+#[test]
 fn test_the_indicator_makes_counting_possible() {
     // A mask cannot count: one that passes a value which happens to be zero is
     // indistinguishable from one that blocked it. `ind` answers the predicate.

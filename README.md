@@ -252,6 +252,23 @@ as the space's shape multiplies out to.
 }
 ```
 
+That is APL's `+.×`, and the shape is the general inner product: any fold over
+any operation. Fold with `<` over `+` and the same two lines are the min-plus
+product — one step of a shortest-path relaxation:
+
+```rho
+{
+    /* shortest paths of at most two edges: C[i][j] = min over k of D[i][k] + D[k][j] */
+    D:◯ □ 4 4 1
+    E:◯ □ 1 4 4
+    ◇<1 (D + E) → =
+}
+```
+
+Likewise `□1A f □0B` is the outer product under any operation `f`, and
+`◈+ ((X × 0.0) + 1.0)` counts `1, 2, …` along an axis — an index by scan, which
+costs a sweep an index generator would not.
+
 ```rho
 {
     /* the mean and the L2 norm of a vector */

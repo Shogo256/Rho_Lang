@@ -289,6 +289,21 @@ rather than vectorised.
 📋 Ranks are not promoted implicitly, and there is no reshape that moves cells
 between axes — `□` only inserts axes of length 1.
 
+### 3.6.1 Inner and outer products in general
+
+Lifting, broadcasting, folds and scans compose, and three things follow that
+need no new glyph:
+
+- **Inner products.** `◇+1 (A × B)` over `A:◯ □ m k 1` and `B:◯ □ 1 k n` is
+  the matrix product, APL's `+.×`. The fold and the operation are independent:
+  `◇<1 (A + B)` is the min-plus product, whose square is a shortest-path
+  relaxation step; `◇>1 (A × B)` is max-times. Any fold over any operation.
+- **Outer products.** `□1A f □0B` applies `f` to every pair of a cell of A and
+  a cell of B, APL's `∘.f`, for any `f` in the language.
+- **An index by scan.** `◈+ ((X × 0.0) + 1.0)` is `1, 2, …` along the axis it
+  walks, and `◈+0` counts rows instead. It costs a sweep an index generator
+  would not, and reads worse; it is what the language has today.
+
 ### 3.4 Zero-Copy Pointer (`&`) ✅
 
 Any space may be bound, not just `INPUT` and `OUTPUT`, which is what lets a

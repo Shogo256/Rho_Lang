@@ -1,0 +1,16 @@
+{
+    /* A shortest-path step: the min-plus product of a distance matrix with
+       itself. D is n x n; viewing it as [n,n,1] and [1,n,n] lines the shared
+       axis up, `+` stretches both to [n,n,n], and folding that axis with `<`
+       (the least) contracts it: C[i][j] = min over k of D[i][k] + D[k][j].
+
+       The same shape with `◇+1 (A × B)` is the matrix product; with `◇>1` and
+       `×` it is max-times. Any fold over any operation is an inner product.
+    */
+    D:◯ □ 4 4 1
+    E:◯ □ 1 4 4
+
+    ◇<1 (D + E) → OUTPUT
+
+    OUTPUT → =
+}

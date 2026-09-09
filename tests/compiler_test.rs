@@ -2033,3 +2033,120 @@ fn test_a_function_name_cannot_also_be_a_space() {
     }"#;
     assert!(parse_rho_program(source).is_ok());
 }
+
+// --------------------------------------------------------------------------
+// Single precision. Narrower numbers halve the memory traffic these kernels
+// are bound by, and widen the doubt every proof has to carry.
+// --------------------------------------------------------------------------
+
+use rho_lang::numeric::Precision;
+
+/// Compile at the given width and run it, returning the cells widened to f64.
+fn run_at(name: &str, source: &str, input: &[f64], precision: Precision) -> Vec<f64> {
+    let block = parse_rho_program(source).unwrap();
+    let mut codegen = LlvmCodeGen::new(name).with_precision(precision);
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    let so_path = format!("target/{name}.so");
+    assert!(codegen.compile_to_so(&ir, &so_path).is_ok(), "{name} should link");
+
+    let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
+    match precision {
+        Precision::F64 => {
+            let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
+                unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+            let mut out = vec![0.0f64; input.len()];
+            unsafe { func(input.as_ptr(), out.as_mut_ptr()) };
+            out
+        }
+        Precision::F32 => {
+            let narrow: Vec<f32> = input.iter().map(|v| *v as f32).collect();
+            let func: libloading::Symbol<unsafe extern "C" fn(*const f32, *mut f32)> =
+                unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+            let mut out = vec![0.0f32; narrow.len()];
+            unsafe { func(narrow.as_ptr(), out.as_mut_ptr()) };
+            out.iter().map(|v| *v as f64).collect()
+        }
+    }
+}
+
+#[test]
+fn test_a_narrow_kernel_computes_in_narrow_arithmetic() {
+    let source = r#"{
+        INPUT:◯ □ 8 1
+        (▷INPUT - INPUT) → D
+        ((D × D) + 1.0) → OUTPUT
+        OUTPUT → =
+    }"#;
+    // Values single precision holds exactly, so both widths must agree.
+    let exact = [1.5, 2.25, 3.125, 4.0, 5.5, 6.75, 7.0, 8.5];
+    assert_eq!(
+        run_at("prec_exact_64", source, &exact, Precision::F64),
+        run_at("prec_exact_32", source, &exact, Precision::F32),
+    );
+
+    // And the emitted IR really is single precision, not a double one rounded.
+    let block = parse_rho_program(source).unwrap();
+    let ir = LlvmCodeGen::new("prec_ir")
+        .with_precision(Precision::F32)
+        .generate_llvm_ir(&block)
+        .unwrap();
+    assert!(ir.contains("load float"), "{ir}");
+    assert!(ir.contains("<4 x float>"), "{ir}");
+    assert!(!ir.contains("double"), "no double should survive:\n{ir}");
+    assert!(
+        ir.contains("precision\\22:\\22f32"),
+        "the metadata should record the width"
+    );
+}
+
+#[test]
+fn test_the_interpreter_follows_the_kernel_into_single_precision() {
+    // A value f32 cannot hold exactly: the two widths must now differ, and the
+    // compiled kernel must match the narrow interpreter rather than the wide one.
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        ((INPUT × INPUT) + INPUT) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let awkward = [0.1, 1.0 / 3.0, 1e-8, 12345.678];
+
+    let compiled = run_at("prec_narrow", source, &awkward, Precision::F32);
+
+    let block = parse_rho_program(source).unwrap();
+    let narrow: Vec<f32> = awkward.iter().map(|v| *v as f32).collect();
+    let mut env: rho_lang::interp::Env<f32> = rho_lang::interp::Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![4, 1], narrow));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+
+    assert_eq!(
+        compiled.iter().map(|v| *v as f32).collect::<Vec<_>>(),
+        meant,
+        "a narrow kernel is checked against narrow arithmetic"
+    );
+}
+
+#[test]
+fn test_a_proof_carries_the_width_it_was_made_at() {
+    // The rounding model follows the precision: 2^-24 instead of 2^-53. A
+    // bound proved at f64 is not the same bound at f32, and the contract says
+    // which one it is.
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        ((INPUT ^ 2) + 1.0) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+
+    let wide = ConstraintSolver::analyze_at(&block, 0.0, Precision::F64).contract;
+    let narrow = ConstraintSolver::analyze_at(&block, 0.0, Precision::F32).contract;
+
+    assert_eq!(wide.precision, Precision::F64);
+    assert_eq!(narrow.precision, Precision::F32);
+    assert!(
+        narrow.output_range.lo < wide.output_range.lo,
+        "narrower numbers admit a wider range: {} vs {}",
+        narrow.output_range.lo,
+        wide.output_range.lo
+    );
+    assert!(narrow.to_json().contains("\"precision\":\"f32\""));
+}

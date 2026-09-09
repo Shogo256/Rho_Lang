@@ -66,6 +66,7 @@ pub fn analyze(expansion: &Expansion) -> Report {
         // Filled in by ConstraintSolver::analyze once the findings are known.
         contract: Contract {
             backend: "z3",
+            precision: crate::numeric::Precision::F64,
             output_range: Interval::UNBOUNDED,
             divisions_proven_safe: false,
             output_proven_finite: false,

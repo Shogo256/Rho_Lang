@@ -459,3 +459,45 @@ into a single rounding, which is more accurate but is not what the solver models
 — it assumes every operation rounds once. The kernels are compiled with
 `-ffp-contract=off` so the machine agrees with the model, and one assumption
 drops off every contract.
+
+---
+
+## 7. Precision ✅
+
+`rhoc --f32` compiles the kernel at single precision. There is no syntax for it:
+the width is a property of the artifact, not of the program, and the same source
+compiles either way.
+
+The gain is larger than halving the arithmetic suggests, because these kernels
+are bound by memory rather than by the ALU. On a 1024x1024 gradient magnitude:
+
+```
+f64   12.36 ms    2.7 GB/s    8.4 MB buffers
+f32    2.23 ms    7.5 GB/s    4.2 MB buffers   5.5x
+```
+
+Half the traffic is only part of it; at 4.2 MB the working set starts fitting in
+cache, which is where the rest comes from.
+
+### What it costs a proof
+
+The solver's rounding model follows the width: `|δ| ≤ 2⁻²⁴` instead of `2⁻⁵³`.
+A bound is therefore looser at f32, and the contract records which width it was
+made at, because a proof does not carry across:
+
+```
+f64   output ∈ [0.9999999999999999, +inf]
+f32   output ∈ [0.9999999403953552, +inf]
+```
+
+That is not a defect. Single precision genuinely has less room, and a compiler
+that reported the same bound for both would be hiding it.
+
+The reference interpreter is generic over the width too, so a narrow kernel is
+checked against narrow arithmetic rather than against a wide answer rounded
+down — the differential testing runs both widths.
+
+📋 The width is per kernel, not per space: there is no mixed precision, and no
+integer type. Integers were considered and left out. ρ has no indexing and no
+bit operations, counting is exact in floating point to 2⁵³, and adding a type
+with no use in the language would have been a feature looking for a problem.

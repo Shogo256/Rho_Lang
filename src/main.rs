@@ -36,6 +36,11 @@ struct Args {
     #[arg(long)]
     require_contract: bool,
 
+    /// Compute at single precision. Halves the memory traffic these kernels
+    /// are bound by, and widens the doubt every proof carries.
+    #[arg(long)]
+    f32: bool,
+
     /// Emit only scalar loops, skipping vector lowering
     #[arg(long)]
     no_simd: bool,
@@ -97,8 +102,13 @@ fn run(args: &Args) -> anyhow::Result<()> {
 
     // 3. Static Constraint Solver !
     println!("[Phase 3] Static Constraint Solver (!) Validation...");
-    let report = ConstraintSolver::verify(&block, args.tau)?;
-    println!("  └─ Backend: {}", report.backend);
+    let precision = if args.f32 {
+        rho_lang::numeric::Precision::F32
+    } else {
+        rho_lang::numeric::Precision::F64
+    };
+    let report = ConstraintSolver::verify_at(&block, args.tau, precision)?;
+    println!("  └─ Backend: {} at {precision}", report.backend);
     let mut open_questions = 0;
     for finding in report
         .constraints
@@ -146,6 +156,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
     println!("[Phase 4] LLVM Hardware Mapping...");
     let mut codegen = LlvmCodeGen::new("rho_kernel")
         .with_tau(args.tau)
+        .with_precision(precision)
         .with_contract(report.contract.to_json());
     if args.no_simd {
         codegen = codegen.without_simd();
@@ -175,8 +186,9 @@ fn run(args: &Args) -> anyhow::Result<()> {
     println!("=====================================================");
     println!("  [SUCCESS] Harmony Achieved: Zero Errors");
     println!(
-        "  Callers must supply buffers of {} doubles",
-        codegen.element_count()
+        "  Callers must supply buffers of {} {} values",
+        codegen.element_count(),
+        precision
     );
     println!("=====================================================");
 

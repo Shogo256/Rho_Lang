@@ -115,6 +115,131 @@ impl Numeric for f64 {
     }
 }
 
+/// How wide the numbers a kernel computes with are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Precision {
+    #[default]
+    F64,
+    F32,
+}
+
+impl Precision {
+    pub fn name(self) -> &'static str {
+        match self {
+            Precision::F64 => "f64",
+            Precision::F32 => "f32",
+        }
+    }
+
+    /// The LLVM type a value of this precision has.
+    pub fn llvm_type(self) -> &'static str {
+        match self {
+            Precision::F64 => "double",
+            Precision::F32 => "float",
+        }
+    }
+
+    /// The suffix LLVM's intrinsics carry.
+    pub fn intrinsic_suffix(self) -> &'static str {
+        match self {
+            Precision::F64 => "f64",
+            Precision::F32 => "f32",
+        }
+    }
+
+    pub fn bytes(self) -> usize {
+        match self {
+            Precision::F64 => 8,
+            Precision::F32 => 4,
+        }
+    }
+
+    /// Unit roundoff: every arithmetic result is the exact one times (1 + δ)
+    /// with |δ| no larger than this. Narrowing the numbers widens the doubt,
+    /// which is exactly why a proof is worth more at f32 than at f64.
+    pub fn unit_roundoff(self) -> f64 {
+        match self {
+            Precision::F64 => 1.0 / 9_007_199_254_740_992.0, // 2^-53
+            Precision::F32 => 1.0 / 16_777_216.0,            // 2^-24
+        }
+    }
+}
+
+impl std::fmt::Display for Precision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+/// The same arithmetic at single precision. The interpreter runs on this
+/// directly, so a narrow kernel is checked against narrow arithmetic rather
+/// than against a rounded-down wide one.
+impl Numeric for f32 {
+    type Bool = bool;
+
+    fn constant(value: f64) -> Self {
+        value as f32
+    }
+    fn as_constant(&self) -> Option<f64> {
+        Some(*self as f64)
+    }
+    fn add(&self, other: &Self) -> Self {
+        self + other
+    }
+    fn sub(&self, other: &Self) -> Self {
+        self - other
+    }
+    fn mul(&self, other: &Self) -> Self {
+        self * other
+    }
+    fn div(&self, other: &Self) -> Self {
+        self / other
+    }
+    fn power(&self, other: &Self) -> Self {
+        f32::powf(*self, *other)
+    }
+    fn unary(&self, op: BuiltinOp) -> Self {
+        match op {
+            BuiltinOp::Exp => self.exp(),
+            BuiltinOp::Log => self.ln(),
+            BuiltinOp::Sqrt => self.sqrt(),
+            BuiltinOp::Sin => self.sin(),
+            BuiltinOp::Cos => self.cos(),
+            BuiltinOp::Abs => self.abs(),
+            BuiltinOp::Indicator => {
+                if *self != 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+    fn compare(&self, other: &Self, how: Compare) -> bool {
+        match how {
+            Compare::Gt => self > other,
+            Compare::Lt => self < other,
+            Compare::Gte => self >= other,
+            Compare::Lte => self <= other,
+            Compare::Eq => self == other,
+            Compare::Ne => self != other,
+        }
+    }
+    fn select(condition: &bool, when_true: &Self, when_false: &Self) -> Self {
+        if *condition {
+            *when_true
+        } else {
+            *when_false
+        }
+    }
+    fn boolean(value: bool) -> bool {
+        value
+    }
+    fn or(a: &bool, b: &bool) -> bool {
+        *a || *b
+    }
+}
+
 // ------------------------------------------------------------------ symbols
 
 /// A value built from the inputs rather than computed from them.

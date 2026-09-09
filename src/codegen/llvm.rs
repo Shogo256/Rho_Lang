@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::error::{HarmonyDisruption, Result};
+use crate::numeric::Precision;
 use std::collections::BTreeMap;
 use std::fs;
 use std::process::Command;
@@ -15,53 +16,61 @@ const VECTOR_WIDTH: usize = 4;
 /// Whether a chunk of a flow is lowered one cell at a time or a vector at a time.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    Scalar,
-    Vector(usize),
+    Scalar(Precision),
+    Vector(usize, Precision),
 }
 
 impl Mode {
     fn lanes(self) -> usize {
         match self {
-            Mode::Scalar => 1,
-            Mode::Vector(w) => w,
+            Mode::Scalar(_) => 1,
+            Mode::Vector(w, _) => w,
+        }
+    }
+
+    fn precision(self) -> Precision {
+        match self {
+            Mode::Scalar(p) | Mode::Vector(_, p) => p,
         }
     }
 
     fn ty(self) -> String {
+        let element = self.precision().llvm_type();
         match self {
-            Mode::Scalar => "double".to_string(),
-            Mode::Vector(w) => format!("<{w} x double>"),
+            Mode::Scalar(_) => element.to_string(),
+            Mode::Vector(w, _) => format!("<{w} x {element}>"),
         }
     }
 
     fn int_ty(self) -> String {
         match self {
-            Mode::Scalar => "i64".to_string(),
-            Mode::Vector(w) => format!("<{w} x i64>"),
+            Mode::Scalar(_) => "i64".to_string(),
+            Mode::Vector(w, _) => format!("<{w} x i64>"),
         }
     }
 
     fn bool_ty(self) -> String {
         match self {
-            Mode::Scalar => "i1".to_string(),
-            Mode::Vector(w) => format!("<{w} x i1>"),
+            Mode::Scalar(_) => "i1".to_string(),
+            Mode::Vector(w, _) => format!("<{w} x i1>"),
         }
     }
 
     fn zero(self) -> String {
         match self {
-            Mode::Scalar => "0.0".to_string(),
-            Mode::Vector(_) => "zeroinitializer".to_string(),
+            Mode::Scalar(_) => "0.0".to_string(),
+            Mode::Vector(..) => "zeroinitializer".to_string(),
         }
     }
 
     /// A floating constant broadcast across every lane.
     fn splat(self, value: f64) -> String {
-        let lit = LlvmCodeGen::f64_literal(value);
+        let lit = LlvmCodeGen::float_literal(value, self.precision());
+        let element = self.precision().llvm_type();
         match self {
-            Mode::Scalar => lit,
-            Mode::Vector(w) => {
-                let lanes: Vec<String> = (0..w).map(|_| format!("double {lit}")).collect();
+            Mode::Scalar(_) => lit,
+            Mode::Vector(w, _) => {
+                let lanes: Vec<String> = (0..w).map(|_| format!("{element} {lit}")).collect();
                 format!("<{}>", lanes.join(", "))
             }
         }
@@ -69,8 +78,8 @@ impl Mode {
 
     fn int_splat(self, value: u64) -> String {
         match self {
-            Mode::Scalar => value.to_string(),
-            Mode::Vector(w) => {
+            Mode::Scalar(_) => value.to_string(),
+            Mode::Vector(w, _) => {
                 let lanes: Vec<String> = (0..w).map(|_| format!("i64 {value}")).collect();
                 format!("<{}>", lanes.join(", "))
             }
@@ -78,17 +87,15 @@ impl Mode {
     }
 
     fn unary_intrinsic(self, name: &str) -> String {
+        let suffix = self.precision().intrinsic_suffix();
         match self {
-            Mode::Scalar => format!("@llvm.{name}.f64"),
-            Mode::Vector(w) => format!("@llvm.{name}.v{w}f64"),
+            Mode::Scalar(_) => format!("@llvm.{name}.{suffix}"),
+            Mode::Vector(w, _) => format!("@llvm.{name}.v{w}{suffix}"),
         }
     }
 
     fn pow_intrinsic(self) -> String {
-        match self {
-            Mode::Scalar => "@llvm.pow.f64".to_string(),
-            Mode::Vector(w) => format!("@llvm.pow.v{w}f64"),
-        }
+        self.unary_intrinsic("pow")
     }
 }
 
@@ -146,6 +153,9 @@ pub struct LlvmCodeGen {
     pub binding_overrides: BTreeMap<String, u64>,
     /// Emit vector loops for the constant-length entrypoints.
     pub simd: bool,
+    /// How wide the numbers are. Narrower numbers halve the memory traffic
+    /// these kernels are bound by, and widen the doubt a proof has to carry.
+    pub precision: Precision,
     /// Source line of each statement, copied from the block being lowered.
     statement_lines: Vec<usize>,
     /// What the solver proved, embedded in the artifact so a caller can check
@@ -167,6 +177,7 @@ impl LlvmCodeGen {
             tau: 0.0,
             binding_overrides: BTreeMap::new(),
             simd: true,
+            precision: Precision::F64,
             statement_lines: Vec::new(),
             contract_json: None,
             elements: 0,
@@ -183,6 +194,12 @@ impl LlvmCodeGen {
     /// Record what the solver proved, so it ships with the kernel.
     pub fn with_contract(mut self, contract_json: String) -> Self {
         self.contract_json = Some(contract_json);
+        self
+    }
+
+    /// Compute at the given width.
+    pub fn with_precision(mut self, precision: Precision) -> Self {
+        self.precision = precision;
         self
     }
 
@@ -224,18 +241,24 @@ impl LlvmCodeGen {
         // triple and made the compiler unusable off x86-64 Linux.
         ir.push('\n');
 
-        ir.push_str("declare double @llvm.pow.f64(double, double)\n");
+        let elem = self.precision.llvm_type();
+        let suffix = self.precision.intrinsic_suffix();
+        ir.push_str(&format!(
+            "declare {elem} @llvm.pow.{suffix}({elem}, {elem})\n"
+        ));
         if self.simd {
             ir.push_str(&format!(
-                "declare <{w} x double> @llvm.pow.v{w}f64(<{w} x double>, <{w} x double>)\n",
+                "declare <{w} x {elem}> @llvm.pow.v{w}{suffix}(<{w} x {elem}>, <{w} x {elem}>)\n",
                 w = VECTOR_WIDTH
             ));
         }
         for name in ["exp", "log", "sqrt", "sin", "cos", "fabs"] {
-            ir.push_str(&format!("declare double @llvm.{name}.f64(double)\n"));
+            ir.push_str(&format!(
+                "declare {elem} @llvm.{name}.{suffix}({elem})\n"
+            ));
             if self.simd {
                 ir.push_str(&format!(
-                    "declare <{w} x double> @llvm.{name}.v{w}f64(<{w} x double>)\n",
+                    "declare <{w} x {elem}> @llvm.{name}.v{w}{suffix}(<{w} x {elem}>)\n",
                     w = VECTOR_WIDTH
                 ));
             }
@@ -462,12 +485,18 @@ impl LlvmCodeGen {
         let count = count.max(1);
         let sym = format!("%{label}");
         if count * 8 > STACK_LIMIT_BYTES {
-            ir.push_str(&format!("  ; [{label}] {count} doubles -> heap\n"));
-            ir.push_str(&format!("  {sym} = call ptr @malloc(i64 {})\n", count * 8));
+            ir.push_str(&format!("  ; [{label}] {count} cells -> heap\n"));
+            ir.push_str(&format!(
+                "  {sym} = call ptr @malloc(i64 {})\n",
+                count * self.precision.bytes()
+            ));
             heap.push(sym.clone());
         } else {
-            ir.push_str(&format!("  ; [{label}] {count} doubles -> stack\n"));
-            ir.push_str(&format!("  {sym} = alloca [{count} x double], align 64\n"));
+            ir.push_str(&format!("  ; [{label}] {count} cells -> stack\n"));
+            ir.push_str(&format!(
+                "  {sym} = alloca [{count} x {}], align 64\n",
+                self.precision.llvm_type()
+            ));
         }
         sym
     }
@@ -598,7 +627,7 @@ impl LlvmCodeGen {
                         &pred,
                         "0",
                         &sweep,
-                        Mode::Scalar,
+                        Mode::Scalar(self.precision),
                         src,
                         &target_ptr,
                         bufs,
@@ -618,7 +647,7 @@ impl LlvmCodeGen {
                         &pred,
                         "0",
                         &vector_start.to_string(),
-                        Mode::Scalar,
+                        Mode::Scalar(self.precision),
                         src,
                         &target_ptr,
                         bufs,
@@ -631,7 +660,7 @@ impl LlvmCodeGen {
                         &pred,
                         &vector_start.to_string(),
                         &vector_end.to_string(),
-                        Mode::Vector(width),
+                        Mode::Vector(width, self.precision),
                         src,
                         &target_ptr,
                         bufs,
@@ -644,7 +673,7 @@ impl LlvmCodeGen {
                         &pred,
                         &vector_end.to_string(),
                         &total.to_string(),
-                        Mode::Scalar,
+                        Mode::Scalar(self.precision),
                         src,
                         &target_ptr,
                         bufs,
@@ -747,6 +776,8 @@ impl LlvmCodeGen {
         let label = format!("fold{id}");
         let buffer = self.emit_scratch(ir, &format!("{label}_buf"), out_cells, &mut bufs.heap);
 
+        let elem = self.precision.llvm_type();
+        let align = self.precision.bytes();
         let kind = if running { "running" } else { "total" };
         ir.push_str(&format!(
             "  ; {op} ({kind}) over axis {a} of {shape:?} -> {out_cells} cells\n"
@@ -785,8 +816,8 @@ impl LlvmCodeGen {
             "  %{label}.m = phi i64 [ 0, %{label}.body ], [ %{label}.m.next, %{label}.step ]\n"
         ));
         ir.push_str(&format!(
-            "  %{label}.acc = phi double [ {}, %{label}.body ], [ %{label}.acc.next, %{label}.step ]\n",
-            Self::f64_literal(op.identity())
+            "  %{label}.acc = phi {elem} [ {}, %{label}.body ], [ %{label}.acc.next, %{label}.step ]\n",
+            self.f64_literal(op.identity())
         ));
         ir.push_str(&format!(
             "  %{label}.more = icmp ult i64 %{label}.m, {extent}\n"
@@ -808,34 +839,34 @@ impl LlvmCodeGen {
             bufs,
             &format!("%{label}.at"),
             counter,
-            Mode::Scalar,
+            Mode::Scalar(self.precision),
             &shape,
             &[],
         )?;
         match op {
             FoldOp::Sum => ir.push_str(&format!(
-                "  %{label}.acc.next = fadd double %{label}.acc, {element}\n"
+                "  %{label}.acc.next = fadd {elem} %{label}.acc, {element}\n"
             )),
             FoldOp::Product => ir.push_str(&format!(
-                "  %{label}.acc.next = fmul double %{label}.acc, {element}\n"
+                "  %{label}.acc.next = fmul {elem} %{label}.acc, {element}\n"
             )),
             FoldOp::Max | FoldOp::Min => {
                 let pred_op = if matches!(op, FoldOp::Max) { "ogt" } else { "olt" };
                 ir.push_str(&format!(
-                    "  %{label}.win = fcmp {pred_op} double {element}, %{label}.acc\n"
+                    "  %{label}.win = fcmp {pred_op} {elem} {element}, %{label}.acc\n"
                 ));
                 ir.push_str(&format!(
-                    "  %{label}.acc.next = select i1 %{label}.win, double {element}, double %{label}.acc\n"
+                    "  %{label}.acc.next = select i1 %{label}.win, {elem} {element}, {elem} %{label}.acc\n"
                 ));
             }
         }
         if running {
             // Every step of a scan is an answer, so it is stored as it goes.
             ir.push_str(&format!(
-                "  %{label}.here = getelementptr inbounds double, ptr {buffer}, i64 %{label}.at\n"
+                "  %{label}.here = getelementptr inbounds {elem}, ptr {buffer}, i64 %{label}.at\n"
             ));
             ir.push_str(&format!(
-                "  store double %{label}.acc.next, ptr %{label}.here, align 8\n"
+                "  store {elem} %{label}.acc.next, ptr %{label}.here, align {align}\n"
             ));
         }
         ir.push_str(&format!("  %{label}.m.next = add i64 %{label}.m, 1\n"));
@@ -844,10 +875,10 @@ impl LlvmCodeGen {
         ir.push_str(&format!("{label}.tail:\n"));
         if !running {
             ir.push_str(&format!(
-                "  %{label}.slot = getelementptr inbounds double, ptr {buffer}, i64 %{label}.j\n"
+                "  %{label}.slot = getelementptr inbounds {elem}, ptr {buffer}, i64 %{label}.j\n"
             ));
             ir.push_str(&format!(
-                "  store double %{label}.acc, ptr %{label}.slot, align 8\n"
+                "  store {elem} %{label}.acc, ptr %{label}.slot, align {align}\n"
             ));
         }
         ir.push_str(&format!("  %{label}.j.next = add i64 %{label}.j, 1\n"));
@@ -903,11 +934,13 @@ impl LlvmCodeGen {
         let value = self.emit_expr(src, ir, bufs, &idx, counter, mode, result_shape, &[])?;
         let gep = Self::fresh(counter);
         ir.push_str(&format!(
-            "  {gep} = getelementptr inbounds double, ptr {target_ptr}, i64 {idx}\n"
+            "  {gep} = getelementptr inbounds {}, ptr {target_ptr}, i64 {idx}\n",
+            self.precision.llvm_type()
         ));
         ir.push_str(&format!(
-            "  store {} {value}, ptr {gep}, align 8\n",
-            mode.ty()
+            "  store {} {value}, ptr {gep}, align {}\n",
+            mode.ty(),
+            self.precision.bytes()
         ));
         ir.push_str(&format!("  {next} = add i64 {idx}, {step}\n"));
         ir.push_str(&format!("  br label %{header}\n\n"));
@@ -1265,9 +1298,13 @@ impl LlvmCodeGen {
                 let gep = Self::fresh(counter);
                 let val = Self::fresh(counter);
                 ir.push_str(&format!(
-                    "  {gep} = getelementptr inbounds double, ptr {ptr}, i64 {read_at}\n"
+                    "  {gep} = getelementptr inbounds {}, ptr {ptr}, i64 {read_at}\n",
+            self.precision.llvm_type()
                 ));
-                ir.push_str(&format!("  {val} = load {ty}, ptr {gep}, align 8\n"));
+                ir.push_str(&format!(
+                    "  {val} = load {ty}, ptr {gep}, align {}\n",
+                    self.precision.bytes()
+                ));
                 Ok(val)
             }
 
@@ -1365,9 +1402,13 @@ impl LlvmCodeGen {
                 let gep = Self::fresh(counter);
                 let val = Self::fresh(counter);
                 ir.push_str(&format!(
-                    "  {gep} = getelementptr inbounds double, ptr {ptr}, i64 {read_at}\n"
+                    "  {gep} = getelementptr inbounds {}, ptr {ptr}, i64 {read_at}\n",
+            self.precision.llvm_type()
                 ));
-                ir.push_str(&format!("  {val} = load {ty}, ptr {gep}, align 8\n"));
+                ir.push_str(&format!(
+                    "  {val} = load {ty}, ptr {gep}, align {}\n",
+                    self.precision.bytes()
+                ));
                 Ok(val)
             }
 
@@ -1481,8 +1522,8 @@ impl LlvmCodeGen {
 
         // Lane indices: idx for scalar, idx + <0,1,..,W-1> for vector.
         let lane_idx = match mode {
-            Mode::Scalar => idx.to_string(),
-            Mode::Vector(w) => {
+            Mode::Scalar(_) => idx.to_string(),
+            Mode::Vector(w, _) => {
                 let seed = Self::fresh(counter);
                 let splat = Self::fresh(counter);
                 let lanes = Self::fresh(counter);
@@ -1546,10 +1587,10 @@ impl LlvmCodeGen {
 
         let safe = match mode {
             // The planner keeps every vector window inside the buffer.
-            Mode::Vector(_) => base.clone(),
+            Mode::Vector(..) => base.clone(),
             // A scalar step can sit on the very edge, and a bounded call may stop
             // short of the declared grid, so clamp before touching memory.
-            Mode::Scalar => {
+            Mode::Scalar(_) => {
                 let past_end = Self::fresh(counter);
                 let skip = Self::fresh(counter);
                 let clamped = Self::fresh(counter);
@@ -1568,9 +1609,13 @@ impl LlvmCodeGen {
                     let val = Self::fresh(counter);
                     let out = Self::fresh(counter);
                     ir.push_str(&format!(
-                        "  {gep} = getelementptr inbounds double, ptr {ptr}, i64 {clamped}\n"
+                        "  {gep} = getelementptr inbounds {}, ptr {ptr}, i64 {clamped}\n",
+            self.precision.llvm_type()
                     ));
-                    ir.push_str(&format!("  {val} = load {ty}, ptr {gep}, align 8\n"));
+                    ir.push_str(&format!(
+                    "  {val} = load {ty}, ptr {gep}, align {}\n",
+                    self.precision.bytes()
+                ));
                     ir.push_str(&format!(
                         "  {out} = select i1 {skip}, {ty} {}, {ty} {val}\n",
                         mode.zero()
@@ -1584,9 +1629,13 @@ impl LlvmCodeGen {
         let val = Self::fresh(counter);
         let out = Self::fresh(counter);
         ir.push_str(&format!(
-            "  {gep} = getelementptr inbounds double, ptr {ptr}, i64 {safe}\n"
+            "  {gep} = getelementptr inbounds {}, ptr {ptr}, i64 {safe}\n",
+            self.precision.llvm_type()
         ));
-        ir.push_str(&format!("  {val} = load {ty}, ptr {gep}, align 8\n"));
+        ir.push_str(&format!(
+                    "  {val} = load {ty}, ptr {gep}, align {}\n",
+                    self.precision.bytes()
+                ));
         ir.push_str(&format!(
             "  {out} = select {} {at_edge}, {ty} {}, {ty} {val}\n",
             mode.bool_ty(),
@@ -1623,9 +1672,19 @@ impl LlvmCodeGen {
         format!("%v{counter}")
     }
 
-    /// Exact bit pattern, so literals survive round-tripping and NaN/inf stay legal.
-    pub(crate) fn f64_literal(value: f64) -> String {
-        format!("0x{:016X}", value.to_bits())
+    /// Exact bit pattern, so literals survive round-tripping and NaN/inf stay
+    /// legal. A float literal is still written as a double in LLVM, but of a
+    /// value that single precision can hold exactly.
+    pub(crate) fn float_literal(value: f64, precision: Precision) -> String {
+        let exact = match precision {
+            Precision::F64 => value,
+            Precision::F32 => value as f32 as f64,
+        };
+        format!("0x{:016X}", exact.to_bits())
+    }
+
+    fn f64_literal(&self, value: f64) -> String {
+        Self::float_literal(value, self.precision)
     }
 
     // -------------------------------------------------------------- metadata
@@ -1646,7 +1705,8 @@ impl LlvmCodeGen {
             None => String::new(),
         };
         format!(
-            "{{\"elements\":{},\"spaces\":[{}],\"bindings\":[{}]{}}}",
+            "{{\"precision\":\"{}\",\"elements\":{},\"spaces\":[{}],\"bindings\":[{}]{}}}",
+            self.precision,
             self.elements,
             spaces.join(","),
             bindings.join(","),

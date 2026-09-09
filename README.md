@@ -29,6 +29,8 @@ Working prototype. What runs today:
 - Scans `◈+` `◈×` `◈>` `◈<` for running totals, which keep the shape they walk
 - Named functions `exp` `log` `sqrt` `sin` `cos` `abs`, with their domains
   checked, and `ind` so a program can count
+- `--f32` for single precision, with the rounding model and the contract
+  following the width
 - `□` lifting and broadcasting, so an outer product — and a matrix product — is
   one flow
 - Explicit `<4 x double>` vector lowering, verified bit-identical to the scalar path
@@ -85,6 +87,7 @@ with what the constraint solver could prove.
 | `--dump-dag` | Print the dataflow trace |
 | `--tau <v>` | Bind the threshold symbol `𝜏` (default `0.0`) |
 | `--bind NAME=0x…` | Point a space at an address the caller owns |
+| `--f32` | Compute at single precision |
 | `--no-simd` | Emit only scalar loops |
 | `--require-contract` | Refuse to emit a kernel with unproven obligations |
 
@@ -255,6 +258,8 @@ smooth input drives it to zero and the kernel returns infinities.
 | Scans (`◈`) keeping the shape | ✅ implemented — scalar, no parallel scan |
 | Lifting (`□`) and broadcasting | ✅ implemented — no implicit rank promotion |
 | Named functions and their domain checks | ✅ implemented |
+| Single precision (`--f32`) | ✅ implemented — 5.5x on a bandwidth-bound kernel |
+| Mixed precision, integer types | 📋 not planned — see the specification |
 | Explicit `<4 x double>` vector lowering | ✅ implemented — see the note below |
 | Zero-copy binding (`&[0x…]`, `--bind`) | ✅ implemented |
 | `!` constraint solver | ✅ interval arithmetic; Z3 with `--features z3-solver`. Models binary64 rounding, not ℝ |

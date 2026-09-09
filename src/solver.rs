@@ -13,6 +13,7 @@
 
 use crate::ast::*;
 use crate::error::{HarmonyDisruption, Result};
+use crate::numeric::Precision;
 use crate::symbolic::{expand, Cmp, Domain, Sym};
 
 #[cfg(feature = "z3-solver")]
@@ -41,6 +42,8 @@ pub struct Finding {
 #[derive(Debug, Clone)]
 pub struct Contract {
     pub backend: &'static str,
+    /// The width the kernel computes at, which every claim below assumes.
+    pub precision: Precision,
     /// Bounds on every cell the kernel writes. Infinite ends mean "not bounded".
     pub output_range: Interval,
     /// True when no division in the program can vanish.
@@ -76,8 +79,9 @@ impl Contract {
         };
         let assumes: Vec<String> = self.assumes.iter().map(|a| format!("\"{a}\"")).collect();
         format!(
-            "{{\"backend\":\"{}\",\"output_range\":[{},{}],\"divisions_proven_safe\":{},\"output_proven_finite\":{},\"open_obligations\":{},\"assumes\":[{}]}}",
+            "{{\"backend\":\"{}\",\"precision\":\"{}\",\"output_range\":[{},{}],\"divisions_proven_safe\":{},\"output_proven_finite\":{},\"open_obligations\":{},\"assumes\":[{}]}}",
             self.backend,
+            self.precision,
             bound(self.output_range.lo),
             bound(self.output_range.hi),
             self.divisions_proven_safe,
@@ -111,8 +115,15 @@ impl Report {
 pub struct ConstraintSolver;
 
 impl ConstraintSolver {
-    /// Analyse every constraint and every division in the program.
+    /// Analyse a program at the default width.
     pub fn analyze(block: &ToposBlock, tau: f64) -> Report {
+        Self::analyze_at(block, tau, Precision::F64)
+    }
+
+    /// Analyse every constraint and every division in the program.
+    pub fn analyze_at(block: &ToposBlock, tau: f64, precision: Precision) -> Report {
+        ROUNDOFF.with(|r| r.set(precision.unit_roundoff()));
+        PRECISION.with(|p| p.set(precision));
         let expansion = expand(block, tau);
 
         #[cfg(feature = "z3-solver")]
@@ -161,6 +172,7 @@ impl ConstraintSolver {
                 domains,
                 contract: Contract {
                     backend: "interval",
+                    precision,
                     output_range: Interval::UNBOUNDED,
                     divisions_proven_safe: false,
                     output_proven_finite: false,
@@ -179,7 +191,11 @@ impl ConstraintSolver {
     }
 
     pub fn verify(block: &ToposBlock, tau: f64) -> Result<Report> {
-        let report = Self::analyze(block, tau);
+        Self::verify_at(block, tau, Precision::F64)
+    }
+
+    pub fn verify_at(block: &ToposBlock, tau: f64, precision: Precision) -> Result<Report> {
+        let report = Self::analyze_at(block, tau, precision);
         if let Some(bad) = report.violations().next() {
             let detail = match &bad.verdict {
                 Verdict::Violated(why) => why.clone(),
@@ -223,6 +239,7 @@ fn build_contract(
 
     Contract {
         backend,
+        precision: PRECISION.with(|p| p.get()),
         output_range,
         divisions_proven_safe,
         output_proven_finite: output_range.lo.is_finite() && output_range.hi.is_finite(),
@@ -339,9 +356,21 @@ fn div(a: Interval, b: Interval) -> Interval {
     Interval { lo, hi }
 }
 
-/// Unit roundoff for binary64 under round-to-nearest: every arithmetic result
-/// the kernel computes is the exact result times (1 + δ) with |δ| ≤ this.
-const UNIT_ROUNDOFF: f64 = 1.0 / 9_007_199_254_740_992.0; // 2^-53
+use std::cell::Cell;
+
+thread_local! {
+    /// The width the analysis is running at. Narrow numbers round harder, and a
+    /// proof made at f64 does not carry over to f32.
+    static ROUNDOFF: Cell<f64> = const { Cell::new(1.0 / 9_007_199_254_740_992.0) };
+}
+
+thread_local! {
+    static PRECISION: Cell<Precision> = const { Cell::new(Precision::F64) };
+}
+
+fn unit_roundoff() -> f64 {
+    ROUNDOFF.with(|r| r.get())
+}
 
 /// Widen a range to cover the rounding the hardware will apply to it.
 ///
@@ -353,11 +382,8 @@ fn rounded(iv: Interval) -> Interval {
         return Interval::UNBOUNDED;
     }
     let out = |v: f64, up: bool| {
-        let factor = if (v >= 0.0) == up {
-            1.0 + UNIT_ROUNDOFF
-        } else {
-            1.0 - UNIT_ROUNDOFF
-        };
+        let u = unit_roundoff();
+        let factor = if (v >= 0.0) == up { 1.0 + u } else { 1.0 - u };
         v * factor
     };
     Interval {

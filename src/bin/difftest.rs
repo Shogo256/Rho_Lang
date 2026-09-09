@@ -9,25 +9,32 @@
 use rho_lang::codegen::LlvmCodeGen;
 use rho_lang::interp::{interpret, Env, Grid};
 use rho_lang::irvm::{parse_module, Machine, Value};
+use rho_lang::numeric::{Numeric, Precision};
 use rho_lang::parser::parse_rho_program;
+
 
 /// Run the emitted IR directly, without going through clang.
 ///
 /// This is the middle link of the chain: the interpreter says what the source
 /// means, the IR says what the generator decided, and the .so says what clang
 /// built. Checking the IR separately tells the two kinds of mistake apart.
-fn run_ir(ir: &str, input: &[f64], cells: usize) -> Result<Vec<f64>, String> {
+fn run_ir<S: Numeric>(
+    ir: &str,
+    input: &[S],
+    cells: usize,
+    widen: impl Fn(&S) -> f64,
+) -> Result<Vec<f64>, String> {
     let functions = parse_module(ir);
     let entry = functions
         .iter()
         .find(|f| f.name == "rho_kernel_exec_with_args")
         .ok_or("no rho_kernel_exec_with_args in the module")?;
 
-    let mut machine = Machine::new();
+    let mut machine: Machine<S> = Machine::new();
     let source = machine.add_buffer(input.to_vec());
-    let target = machine.add_buffer(vec![0.0; cells]);
+    let target = machine.add_buffer(vec![S::constant(0.0); cells]);
     machine.run(entry, &[Value::P(source, 0), Value::P(target, 0)])?;
-    Ok(machine.buffer(target).to_vec())
+    Ok(machine.buffer(target).iter().map(&widen).collect())
 }
 
 /// Deterministic xorshift, so any failure is reproducible from its seed.
@@ -255,7 +262,7 @@ fn main() {
         }
 
         // The IR, read back and run without clang.
-        match run_ir(&ir, &input, cells.max(expected.len())) {
+        match run_ir(&ir, &input, cells.max(expected.len()), |v: &f64| *v) {
             Ok(from_ir) => {
                 let gap = expected
                     .cells
@@ -287,6 +294,44 @@ fn main() {
             run(input.as_ptr(), output.as_mut_ptr());
         }
         let _ = std::fs::remove_file(&so);
+
+        // Every other round is repeated at single precision, where the same
+        // three representations must still agree with one another.
+        if round % 2 == 0 {
+            let narrow: Vec<f32> = input.iter().map(|v| *v as f32).collect();
+            let mut narrow_env: rho_lang::interp::Env<f32> = rho_lang::interp::Env::new();
+            narrow_env.insert(
+                "INPUT".to_string(),
+                Grid::from(shape.clone(), narrow.clone()),
+            );
+            if let Ok(narrow_out) = interpret(&block, &narrow_env, 0.0) {
+                if let Some(meant) = narrow_out.get("OUTPUT") {
+                    let mut narrow_codegen = LlvmCodeGen::new(&format!("diff{round}f32"))
+                        .with_precision(Precision::F32);
+                    if let Ok(narrow_ir) = narrow_codegen.generate_llvm_ir(&block) {
+                        match run_ir(&narrow_ir, &narrow, meant.len(), |v: &f32| *v as f64) {
+                            Ok(from_ir) => {
+                                let gap = meant.cells.iter().zip(&from_ir).position(|(a, b)| {
+                                    let a = *a as f64;
+                                    !(a.is_nan() && b.is_nan()) && a.to_bits() != b.to_bits()
+                                });
+                                if let Some(cell) = gap {
+                                    ir_mismatches += 1;
+                                    println!("F32 IR MISMATCH at cell {cell} (round {round})");
+                                    println!("{source}");
+                                }
+                            }
+                            Err(why) => {
+                                ir_unsupported += 1;
+                                if ir_unsupported <= 2 {
+                                    println!("F32 IR NOT READ (round {round}): {why}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         compared += 1;
         // NaN compares unequal to itself, so agreement is judged on the bits —

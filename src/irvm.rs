@@ -790,7 +790,11 @@ fn parse_literal<S: Numeric>(token: &str) -> Option<Value<S>> {
     // A vector literal: `<double 0x..., double 0x...>`
     if let Some(inner) = token.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
         let parts = split_fields(inner);
-        if parts.first().is_some_and(|p| p.starts_with("double")) {
+        // A vector of numbers is spelled `double` at f64 and `float` at f32.
+        if parts
+            .first()
+            .is_some_and(|p| p.starts_with("double") || p.starts_with("float"))
+        {
             return Some(Value::VF(
                 parts
                     .iter()

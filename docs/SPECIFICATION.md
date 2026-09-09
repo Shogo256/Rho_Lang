@@ -44,6 +44,7 @@ principle.
 | `/` | Division | Distortion | Element-wise division | ✅ |
 | `^` | Exponentiation | Expansion | Element-wise power; a whole exponent is repeated multiplication | ✅ |
 | `→` | Flow | Ruten (流転) | One full sweep of the grid into the target | ✅ |
+| `⇒` | Fixed Point | Iteration | Repeats a flow until no cell moves by more than 𝜏, or the cap is reached, see §3.3 | ✅ |
 | `<` `>` | Threshold | Boundary Condition | Masking compare, see §3.3 | ✅ |
 | `=` | Equilibrium | Tou (答 / 均衡) | Final output; ends the pipeline | ✅ |
 | `𝜏` / `τ` | Threshold Constant | — | Scalar bound by `--tau`, default `0.0` | ✅ |
@@ -54,7 +55,7 @@ principle.
 | `!` | Constraint | Invariant Check | Statically verified, see §4 | ✅ |
 | `→ =` | Convergence | — | Writes the caller's output buffer | ✅ |
 
-ASCII aliases: `->` or `=>` for `→`, `>>` for `▷`, `<<` for `▽`, `@` for `&`,
+ASCII aliases: `->` for `→`, `=>` for `⇒`, `>>` for `▷`, `<<` for `▽`, `@` for `&`,
 `<>` for `◇`, `<.>` for `◈`, `[]` for `□`.
 
 ### Named functions
@@ -174,6 +175,37 @@ predicate holds and `0.0` elsewhere. The same applies to `<`, `>=`, `<=`, `==`.
 
 📋 Flows are executed in source order on one thread. Extracting independent flows
 to run in parallel is future work.
+
+### 3.3.1 Fixed points (`⇒`) ✅
+
+`expr ⇒ U` is `expr → U` repeated: every sweep reads the whole of the previous
+one — a Jacobi step, never a Gauss–Seidel one, so the rule that a shift sees a
+finished grid holds inside the loop and the vector lowering stays safe — and
+the loop stops when the largest move of any cell is at most `𝜏`, or when
+`--max-iter` sweeps have run. `U` must have been written by a flow before: the
+starting point is part of what an iteration computes, so the program spells it
+out. The body must produce `U`'s shape. `=` is unchanged — the end of the
+program — and an iteration is read from afterwards:
+
+```rho
+INPUT → X
+((INPUT - (▷X + ▽X)) / 4.0) ⇒ X        /* Jacobi for 4x[i] + x[i-1] + x[i+1] = b[i] */
+X → =
+```
+
+The cap is required, not defaulted, because it is what makes every kernel
+terminate and it changes what the kernel computes when the loop has not
+settled. A NaN move never compares greater than the largest so far, so a grid
+with a NaN never settles and runs to the cap. What happened is readable
+afterwards: `rho_kernel_sweeps()` is the total number of sweeps the loops of
+the most recent call took, and `rho_kernel_converged()` is 1 when every loop
+left on the tolerance. A loop that reaches the cap counts as not converged
+even if its last sweep happened to settle — the kernel did not check. Both are
+per kernel, not per thread; the language has no concurrency and neither has
+this record.
+
+Two things are proved about a loop, see §4.2. Not expressible: a Gauss–Seidel
+sweep (in-place, order-dependent), and a loop whose body is several flows.
 
 ### 3.5 Folds and scans (`◇`, `◈`) ✅
 
@@ -368,6 +400,43 @@ Still outside the model, and so still assumptions on any proof:
 
 ---
 
+### 4.2 What is proved about an iteration
+
+Two facts, both by interval arguments and so the same under either backend.
+
+**An invariant.** The body is evaluated over a candidate range with the
+iterate bound to it, starting from the range the target held before the loop.
+If the body maps the range into itself, every iterate lies in it, and so does
+whatever the loop leaves behind; everything after the loop — a constraint, a
+division, the contract's output range — is judged on that range. If not, the
+range grows to cover the body's result and the check repeats, and after a few
+rounds of growth a still-moving end is given up as unbounded. For a binary64
+kernel whose body uses only correctly rounded operations, the rounding model
+is dropped for this check: rounding is monotone, so an exact result inside a
+range of binary64 bounds rounds to a value inside it. Without that an
+averaging like Laplace's would have no finite invariant, since the model would
+push the top of the range a rounding above itself on every round.
+
+**Convergence.** If one sweep is a Lipschitz map of the iterate whose
+constants sum to less than 1 in the ∞-norm, the sweep contracts, and Banach's
+theorem gives convergence from any start to a unique fixed point. The
+constants are read off the body: a cell of the iterate contributes 1, a sum
+adds, a product with a bounded factor scales, a division by a value kept away
+from zero scales, a boundary contributes at most the interior does, and `abs`,
+`sin` and `cos` pass the bound through. A product of the iterate with itself,
+a division by it, a mask on it, a fold of it, or any other function of it
+gives no bound, and the checker says so. Jacobi on a strictly diagonally
+dominant system is proved this way, with its factor; Laplace's averaging sums
+to exactly 1, which is not a contraction in this norm, and is reported as not
+shown — its convergence needs a spectral argument the checker does not make.
+The bound is for exact arithmetic; each sweep also adds a rounding error of
+the order of the unit roundoff, which the invariant covers and the contraction
+factor does not.
+
+Convergence is not a safety obligation: a loop that is not shown to converge
+still ends, at its cap. So it is reported on its own line and does not count
+against `--require-contract`; the contract says which it is.
+
 ## 5. The Kernel's Contract ✅
 
 A proof that only appears in a build log cannot be relied on by whoever loads the
@@ -381,10 +450,17 @@ and returned by `rho_kernel_metadata()`:
   "divisions_proven_safe": true,
   "output_proven_finite": false,
   "open_obligations": 0,
+  "iterations": [{"target": "X", "converges": true, "factor": 0.5,
+                  "invariant": [null, null]}],
   "assumes": ["no overflow to infinity", "no underflow to subnormals",
               "no NaN input", "no operation contraction, e.g. into an FMA"]
 }
 ```
+
+`iterations` has one entry per `⇒`: whether it was proved to converge, the
+contraction factor per sweep when one was bounded, and the range every
+iterate stays in. The metadata alongside the contract records the cap and
+tolerance the kernel was built with.
 
 `output_range` bounds every cell the kernel writes; a `null` end means that side
 is not bounded. It is always computed by interval arithmetic, which is cheap and
@@ -477,13 +553,25 @@ own: the two-pointer form and the table form share the lowered body but not
 the plumbing that hands it its buffers, so a proof of one says nothing about
 the other.
 
+A `⇒` is proved by induction rather than unrolled, since its length depends on
+the data. Both sides are run with the loop's exit forced the same way: once
+round from the start, once more from a grid of fresh symbols, then out. The
+exit test each side made at each decision is recorded. Agreement on the second
+round's output says one sweep agrees for *any* iterate; agreement on the
+recorded tests says both sides leave at the same moment; with the first round
+that covers every run of any length, whatever the tolerance decides. The
+decisions enter the comparison as cells of their own — how many, then each
+test as 1 or 0 — so a kernel that leaves its loop at a different moment
+differs at one of those cells.
+
 `--bin negcontrol` is the other half of trusting this. A checker that never
 fails proves nothing about the thing it checks, so it damages the emitted IR in
-five small ways a careless generator might plausibly produce — an add that
-became a subtract, a sweep that stops a cell early, a flipped boundary test —
-inside each entrypoint in turn, and insists the validator notices every one of
-the ten. It does, and the undamaged kernel still comes out equivalent both
-ways in.
+small ways a careless generator might plausibly produce — an add that became a
+subtract, a sweep that stops a cell early, a flipped boundary test, and inside
+a `⇒`: a loosened exit test, a largest move that became the smallest, a cap of
+one sweep, a copy back that stops a cell early — inside each entrypoint in
+turn, and insists the validator notices every one of the twenty. It does, and
+the undamaged kernels still come out equivalent both ways in.
 
 📋 The proof is per program and per shape, not for all shapes at once. Terms
 that no solver reasons about exactly — a power with a fractional exponent —

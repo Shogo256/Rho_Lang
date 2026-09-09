@@ -33,6 +33,10 @@ Working prototype. What runs today:
   following the width
 - `□` lifting and broadcasting, so an outer product — and a matrix product — is
   one flow
+- `⇒`, a flow repeated to a fixed point: Jacobi iteration, relaxation and
+  diffusion in one line, capped by `--max-iter`, with the kernel reporting
+  whether it settled — and the compiler proving convergence when one sweep
+  contracts in the ∞-norm
 - Explicit `<4 x double>` vector lowering, verified bit-identical to the scalar path
 - Zero-copy binding: compile a kernel against a buffer the host already owns
 - One pointer per space at call time, so a kernel with several inputs — a
@@ -107,6 +111,7 @@ with what the constraint solver could prove.
 | `--tau <v>` | Bind the threshold symbol `𝜏` (default `0.0`) |
 | `--bind NAME=0x…` | Point a space at an address the caller owns |
 | `--f32` | Compute at single precision |
+| `--max-iter <N>` | Cap every `⇒` at `N` sweeps; required by a program that iterates |
 | `--no-simd` | Emit only scalar loops |
 | `--require-contract` | Refuse to emit a kernel with unproven obligations |
 
@@ -164,7 +169,36 @@ engine.execute_kernel(buf)
 print(list(buf))          # [2.0, 4.0, 6.0, 8.0] — written in place
 ```
 
-### 5. Several inputs
+### 5. Iterate to a fixed point
+
+`expr ⇒ U` sweeps `expr` into `U` again and again until no cell moves by more
+than `𝜏` or `--max-iter` sweeps have run. Jacobi for a tridiagonal system:
+
+```rho
+{
+    INPUT:◯ □ 64 1
+    INPUT → X
+    ((INPUT - (▷X + ▽X)) / 4.0) ⇒ X
+    X → =
+}
+```
+
+```
+$ rhoc examples/jacobi.rho --tau 1e-12 --max-iter 200
+  └─ [proved]   ⇒ X converges: each sweep contracts by 0.5 (∞-norm), iterates stay in [-inf, +inf]
+```
+
+```python
+engine.compile_rho_file("examples/jacobi.rho", tau=1e-12, max_iter=200)
+engine.execute_kernel_with_args(b, x)
+engine.sweeps(), engine.converged()     # (40, True)
+```
+
+The proof is Banach's: the update's coefficients on `X` sum to ½, so every
+sweep halves the distance between any two grids. Laplace's averaging sums to
+exactly 1 and is reported as *not shown*, with the reason, rather than claimed.
+
+### 6. Several inputs
 
 A kernel is not limited to one input. `rho_kernel_exec_spaces` takes one
 pointer per space, in the order the metadata lists them; the wrapper builds the
@@ -218,7 +252,9 @@ so an unproven kernel cannot reach production by accident.
 | `rho_kernel_exec_with_args` | `void (const double *in, double *out)` | Run the kernel. Buffers **must** hold `element_count()` doubles |
 | `rho_kernel_exec_bounded` | `void (const double *in, double *out, int64_t n)` | Same, but clamps the sweep to `n` cells |
 | `rho_kernel_exec_spaces` | `void (void **spaces)` | One pointer per space, in the order `rho_kernel_metadata()` lists them. The way to call a kernel with several inputs |
-| `rho_kernel_metadata` | `const char * (void)` | JSON: element count, every space's shape and role, and the proven contract |
+| `rho_kernel_metadata` | `const char * (void)` | JSON: element count, every space's shape and role, the proven contract, and the iteration cap and tolerance when the kernel iterates |
+| `rho_kernel_sweeps` | `int64_t (void)` | Sweeps the `⇒` loops of the most recent call took, in all |
+| `rho_kernel_converged` | `int64_t (void)` | 1 if every `⇒` of the most recent call stopped on the tolerance rather than on the cap |
 | `rho_kernel_exec` | `void (void)` | Zero-copy: runs against the addresses compiled in via `&[0x…]` or `--bind`. Returns immediately if `INPUT` is unbound |
 
 Passing `NULL` as the output pointer makes the kernel write in place. Passing
@@ -304,6 +340,7 @@ smooth input drives it to zero and the kernel returns infinities.
 | Folds (`◇`) collapsing an axis | ✅ implemented — scalar inner loop, no scan yet |
 | Scans (`◈`) keeping the shape | ✅ implemented — scalar, no parallel scan |
 | Lifting (`□`) and broadcasting | ✅ implemented — no implicit rank promotion |
+| Fixed points (`⇒`) | ✅ implemented — Jacobi sweeps to a tolerance under a cap; convergence proved by ∞-norm contraction, so Jacobi on a diagonally dominant system is proved and Laplace's averaging is honestly not; a Gauss–Seidel sweep and a multi-flow loop body are not expressible |
 | Named functions and their domain checks | ✅ implemented |
 | Single precision (`--f32`) | ✅ implemented — 5.5x on a bandwidth-bound kernel |
 | Mixed precision, integer types | 📋 not planned — see the specification |

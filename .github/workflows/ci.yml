@@ -69,6 +69,11 @@ jobs:
     - name: Run Sample Compilation (`teichmuller.rho`)
       run: cargo run --bin rhoc -- examples/teichmuller.rho --dump-dag --dump-llvm
 
+    - name: Compile The Iterating Examples
+      run: |
+        cargo run --bin rhoc -- examples/jacobi.rho --tau 1e-12 --max-iter 200
+        cargo run --bin rhoc -- examples/laplace.rho --tau 1e-6 --max-iter 2000
+
     - name: Check Codegen Determinism
       run: |
         cargo run --quiet --bin rhoc -- examples/teichmuller.rho --dump-llvm > a.ll
@@ -82,6 +87,7 @@ jobs:
         python3 examples/test_inline_decorator.py
         python3 examples/python_demo.py
         python3 examples/run_matmul.py
+        python3 examples/run_jacobi.py
 
   wheels:
     name: Wheel (${{ matrix.os }})

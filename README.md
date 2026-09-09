@@ -5,13 +5,14 @@
 [![LLVM](https://img.shields.io/badge/LLVM-15%2B-dragon.svg)](https://llvm.org)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 
-**A clockless, topological dataflow language for numeric computation.**
+**An array language in the line of APL, compiled to native kernels.**
 
-ρ (RHO) is a mathematics-driven programming language and compiler prototype that
-explores a spatial dataflow model: computation is written as transformations over
-a grid rather than as loops over time. The compiler parses a compact symbolic
-syntax, validates shape and flow constraints, emits LLVM IR, and links a native
-shared library callable from C or Python.
+ρ (RHO) writes computation over whole arrays — no indices, no loops. Each glyph
+is an array operation: a shift reads a neighbour, a fold collapses an axis, a
+scan runs along one, a lift stretches one array against another, and `⇒`
+repeats a flow to a fixed point. Shapes are declared, so every program compiles
+to a straight native kernel: the compiler emits LLVM IR and links a shared
+library callable from C or Python.
 
 ---
 
@@ -21,7 +22,8 @@ Working prototype. What runs today:
 
 - Parses the RHO symbol set, with ASCII aliases for every glyph
 - Static validation: undeclared spaces, shape mismatches, missing equilibrium point
-- Constraint solving for `!` — interval arithmetic by default, Z3 with a feature flag
+- `!` constraints checked at compile time by interval arithmetic, which models
+  binary64 rounding rather than ℝ
 - Lowers flows to LLVM IR — one full grid sweep per `→`
 - Multi-dimensional shifts `▷` / `▽`, per axis, zero-padded at each axis's boundary
 - Folds `◇+` `◇×` `◇>` `◇<` that collapse an axis, so sums, means, dot products
@@ -29,32 +31,27 @@ Working prototype. What runs today:
 - Scans `◈+` `◈×` `◈>` `◈<` for running totals, which keep the shape they walk
 - Named functions `exp` `log` `sqrt` `sin` `cos` `abs`, with their domains
   checked, and `ind` so a program can count
-- `--f32` for single precision, with the rounding model and the contract
+- `--f32` for single precision, with the interpreter and the `!` check
   following the width
 - `□` lifting and broadcasting, so an outer product — and a matrix product — is
   one flow
-- `⇒`, a flow repeated to a fixed point: Jacobi iteration, relaxation and
-  diffusion in one line, capped by `--max-iter`, with the kernel reporting
-  whether it settled — and the compiler proving convergence when one sweep
-  contracts in the ∞-norm
+- `⇒`, a flow repeated to a fixed point — APL's `f⍣≡`: Jacobi iteration,
+  relaxation and diffusion in one line, capped by `--max-iter`, with the kernel
+  reporting how many sweeps it took and whether it settled
 - Explicit `<4 x double>` vector lowering, verified bit-identical to the scalar path
 - Zero-copy binding: compile a kernel against a buffer the host already owns
 - One pointer per space at call time, so a kernel with several inputs — a
   matrix product — runs with nothing baked in
 - Emits a native shared library (`.so`) with a documented C ABI
 - Deterministic output: the same source always produces byte-identical IR
-- A machine-readable contract compiled into the `.so`, so a caller can check what
-  was proved at load time
-- A reference interpreter written from the specification, and a reader that runs
-  the emitted IR without clang, so the source, the IR and the `.so` are compared
-  against each other on every push
-- Translation validation: the emitted IR is *proved* to compute what the source
-  means, for every input at a given shape, with a negative control that damages
-  the IR to show the check has teeth
+- A reference interpreter written from the specification; on every push random
+  programs are compiled at both widths, run through both C entrypoints, and
+  compared with it bit for bit — and whatever the `!` check claimed about them
+  is compared with what the kernel actually produced
 
 See [Implementation Status](#implementation-status) for what is designed but not
-yet built. The implementation is deliberately a small verifiable core, not a
-full language runtime.
+yet built. The implementation is deliberately a small core, not a full language
+runtime.
 
 ---
 
@@ -102,7 +99,7 @@ cargo run --release --bin rhoc -- examples/matrix_add.rho
 ```
 
 This writes `libkernel.so` and reports how many cells the kernel sweeps, along
-with what the constraint solver could prove.
+with what the `!` check could and could not settle.
 
 | Flag | Effect |
 |---|---|
@@ -113,10 +110,6 @@ with what the constraint solver could prove.
 | `--f32` | Compute at single precision |
 | `--max-iter <N>` | Cap every `⇒` at `N` sweeps; required by a program that iterates |
 | `--no-simd` | Emit only scalar loops |
-| `--require-contract` | Refuse to emit a kernel with unproven obligations |
-
-Build with `--features z3-solver` to discharge `!` constraints with SMT instead
-of interval arithmetic.
 
 ### 3. Call it from Python
 
@@ -183,20 +176,16 @@ than `𝜏` or `--max-iter` sweeps have run. Jacobi for a tridiagonal system:
 }
 ```
 
-```
-$ rhoc examples/jacobi.rho --tau 1e-12 --max-iter 200
-  └─ [proved]   ⇒ X converges: each sweep contracts by 0.5 (∞-norm), iterates stay in [-inf, +inf]
-```
-
 ```python
 engine.compile_rho_file("examples/jacobi.rho", tau=1e-12, max_iter=200)
 engine.execute_kernel_with_args(b, x)
 engine.sweeps(), engine.converged()     # (40, True)
 ```
 
-The proof is Banach's: the update's coefficients on `X` sum to ½, so every
-sweep halves the distance between any two grids. Laplace's averaging sums to
-exactly 1 and is reported as *not shown*, with the reason, rather than claimed.
+Every sweep reads the whole previous grid — a Jacobi step — so a shift inside
+the loop sees a finished grid, as it does everywhere else. The cap is required:
+it is what makes the kernel terminate, and it changes the answer when the loop
+has not settled, so the kernel says which happened.
 
 ### 6. Several inputs
 
@@ -218,32 +207,6 @@ engine.execute_spaces({"A": a, "B": b, "OUTPUT": c})
 
 ---
 
-## The kernel carries its contract
-
-What the solver proves is compiled into the artifact, not just printed during the
-build. A host can check it before it runs anything:
-
-```python
-engine.compile_rho_file("kernel.rho")
-engine.require_contract()          # raises if anything is unproven
-```
-
-```json
-{
-  "backend": "interval",
-  "output_range": [0, null],
-  "divisions_proven_safe": true,
-  "output_proven_finite": false,
-  "open_obligations": 0,
-  "assumes": ["no overflow to infinity", "no NaN input", ...]
-}
-```
-
-`rhoc --require-contract` refuses to emit a kernel whose contract is incomplete,
-so an unproven kernel cannot reach production by accident.
-
----
-
 ## C ABI
 
 | Symbol | Signature | Purpose |
@@ -252,7 +215,7 @@ so an unproven kernel cannot reach production by accident.
 | `rho_kernel_exec_with_args` | `void (const double *in, double *out)` | Run the kernel. Buffers **must** hold `element_count()` doubles |
 | `rho_kernel_exec_bounded` | `void (const double *in, double *out, int64_t n)` | Same, but clamps the sweep to `n` cells |
 | `rho_kernel_exec_spaces` | `void (void **spaces)` | One pointer per space, in the order `rho_kernel_metadata()` lists them. The way to call a kernel with several inputs |
-| `rho_kernel_metadata` | `const char * (void)` | JSON: element count, every space's shape and role, the proven contract, and the iteration cap and tolerance when the kernel iterates |
+| `rho_kernel_metadata` | `const char * (void)` | JSON: element count, every space's shape and role, and the iteration cap and tolerance when the kernel iterates |
 | `rho_kernel_sweeps` | `int64_t (void)` | Sweeps the `⇒` loops of the most recent call took, in all |
 | `rho_kernel_converged` | `int64_t (void)` | 1 if every `⇒` of the most recent call stopped on the tolerance rather than on the cap |
 | `rho_kernel_exec` | `void (void)` | Zero-copy: runs against the addresses compiled in via `&[0x…]` or `--bind`. Returns immediately if `INPUT` is unbound |
@@ -340,17 +303,15 @@ smooth input drives it to zero and the kernel returns infinities.
 | Folds (`◇`) collapsing an axis | ✅ implemented — scalar inner loop, no scan yet |
 | Scans (`◈`) keeping the shape | ✅ implemented — scalar, no parallel scan |
 | Lifting (`□`) and broadcasting | ✅ implemented — no implicit rank promotion |
-| Fixed points (`⇒`) | ✅ implemented — Jacobi sweeps to a tolerance under a cap; convergence proved by ∞-norm contraction, so Jacobi on a diagonally dominant system is proved and Laplace's averaging is honestly not; a Gauss–Seidel sweep and a multi-flow loop body are not expressible |
+| Fixed points (`⇒`) | ✅ implemented — Jacobi sweeps to a tolerance under a cap; a Gauss–Seidel sweep and a multi-flow loop body are not expressible |
 | Named functions and their domain checks | ✅ implemented |
 | Single precision (`--f32`) | ✅ implemented — 5.5x on a bandwidth-bound kernel |
 | Mixed precision, integer types | 📋 not planned — see the specification |
 | Explicit `<4 x double>` vector lowering | ✅ implemented — see the note below |
 | Zero-copy binding (`&[0x…]`, `--bind`) | ✅ implemented |
-| `!` constraint solver | ✅ interval arithmetic; Z3 with `--features z3-solver`. Models binary64 rounding, not ℝ |
-| Proven contract embedded in the artifact | ✅ implemented |
+| `!` constraint check | ✅ interval arithmetic that models binary64 rounding, not ℝ; its claims are held to real runs by the differential test |
 | Diagnostics with source lines | ✅ implemented |
-| Reference interpreter + differential testing | ✅ implemented |
-| IR proved equivalent to the source, per shape | ✅ implemented — `--features z3-solver` |
+| Reference interpreter + differential testing | ✅ implemented — both widths, both entrypoints, on every push |
 | C ABI, JSON metadata, Python FFI | ✅ implemented |
 | `pip install rho-lang` | ✅ wheel built in CI for Linux, macOS, Windows; publishing to PyPI waits on a tagged release |
 | AVX-512 / NEON width selection, GPU backends | 📋 planned — the vector width is fixed at four lanes |
@@ -365,22 +326,21 @@ Two honest caveats on the ✅ rows:
   still only improves 1.0–1.1x on large grids, because streaming megabytes of
   doubles is bound by memory bandwidth. `--no-simd` is verified to produce
   bit-identical results.
-- **A proof assumes no overflow, underflow or NaN.** The solver models
+- **The `!` check assumes no overflow, underflow or NaN.** It models
   round-to-nearest — every result is the exact one times `(1 ± 2⁻⁵³)` — which is
-  what stops it proving things that only hold over the reals. It does not model
+  what stops it accepting things that only hold over the reals. It does not model
   infinities, subnormals or NaN.
 
 ---
 
 ## Design Direction
 
-- a compiler prototype for a clockless, spatial dataflow style
-- a research-oriented implementation of topological numeric computation
-- a foundation for future work in memory-aware execution, low-power scheduling,
-  and domain-specific numeric kernels
-
-The long-term aim is not merely to add syntax, but to build a runtime model that
-can express and execute computation in a more memory-aware and flow-oriented way.
+ρ is an array language in the line of APL: matrix and parallel computation
+written over whole arrays, with the shapes known at compile time so that every
+program becomes a native kernel. What gets added next is judged by one
+question — does it make array code shorter and clearer in that sense? The
+checks the compiler runs on itself are how it stays correct while that happens;
+they are not the product.
 
 See [docs/SPECIFICATION.md](docs/SPECIFICATION.md) for the symbol dictionary and
 [docs/ROADMAP.md](docs/ROADMAP.md) for the staged plan.

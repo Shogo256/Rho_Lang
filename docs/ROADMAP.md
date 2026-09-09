@@ -81,7 +81,7 @@ Marks reflect what the compiler does today, not what a step describes.
 * Express the movement of values analogously to Wasan counting board beads.
 
 ### 📋 Step 5.5: Wasan-Themed Error Harmonizer
-* Translate mathematical constraint failure messages (e.g., Z3 SAT/UNSAT or array bounds issues) into natural Wasan terminology (e.g., "Hojin boundary exceeds Enri tensor space").
+* Translate mathematical constraint failure messages (e.g., a denominator whose range includes zero, or array bounds issues) into natural Wasan terminology (e.g., "Hojin boundary exceeds Enri tensor space").
 * Guide users to debug complex shape mismatches using traditional geometric concepts.
 
 ### 📋 Step 5.6: PyPI Binary Wheel Distribution (`pip install rho-lang`)

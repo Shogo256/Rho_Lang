@@ -4,9 +4,14 @@ Status marks throughout: ✅ implemented and tested · 🚧 partial · 📋 desi
 
 ## 1. Computational Philosophy
 
-ρ (RHO) is a mathematics-driven dataflow DSL. It drops temporal loop control
-(`for`, `while`, explicit clocking) in favour of **spatial transformations**: a
-program says what every cell of a grid becomes, not how to walk over it.
+ρ (RHO) is an array language in the line of APL. A program is written over
+whole arrays — no indices, no loops — and each glyph is an array operation.
+It drops temporal loop control (`for`, `while`, explicit clocking) in favour of
+**spatial transformations**: a program says what every cell of a grid becomes,
+not how to walk over it. Shapes are declared, which is what lets every program
+compile to a native kernel; it also makes a program one expression per cell,
+which is what the compile-time checks rest on. The checks are a property of the
+design, not its purpose.
 
 Inspired by **Wasan (和算)** — traditional Japanese mathematics pioneered by Seki
 Takakazu (関孝和) — computations are expressed as simultaneous state
@@ -94,7 +99,7 @@ are unaffected: NaN fails `>`, `<`, `>=`, `<=` and `==` everywhere.
 ```
 
 The domains are checked the way divisions are. `log` of something the solver
-cannot show is positive becomes an open obligation on the kernel's contract:
+cannot show is positive is reported as open:
 
 ```
 [proved]   log ((INPUT ^ 2) + 1)
@@ -204,8 +209,8 @@ even if its last sweep happened to settle — the kernel did not check. Both are
 per kernel, not per thread; the language has no concurrency and neither has
 this record.
 
-Two things are proved about a loop, see §4.2. Not expressible: a Gauss–Seidel
-sweep (in-place, order-dependent), and a loop whose body is several flows.
+Not expressible: a Gauss–Seidel sweep (in-place, order-dependent), and a loop
+whose body is several flows.
 
 ### 3.5 Folds and scans (`◇`, `◈`) ✅
 
@@ -341,24 +346,19 @@ Enforced by the parser before code generation:
 - forbidden control-flow keywords (`for`, `while`, `if`, …)
 - symbols outside the dictionary
 
-`! (EXPR)` is then verified statically. The program is expanded so that a
+`! (EXPR)` is then checked statically. The program is expanded so that a
 constraint about one cell is inlined through every flow that produced it, leaving
 only two kinds of free term: cells of spaces nobody writes — the caller's input —
 and boundary flags. Both are genuinely free, so a counterexample over the
-expansion corresponds to a real input.
+expansion corresponds to a real input. The iterate of a `⇒` is a free term too:
+nothing is assumed about what a loop leaves behind.
 
-Two backends answer the same question:
-
-| Backend | Build | Strength |
-|---|---|---|
-| Interval arithmetic | default | No dependencies; sound over-approximation |
-| Z3 | `--features z3-solver` | Exact; reports a concrete counterexample |
-
-Both only reject a program when a violation is certain; anything else is reported
-as unproven and the build continues. For example `! (OUTPUT >= 0)` where
-`OUTPUT = INPUT ^ 2` is **proved** by either backend, while
-`(INPUT × INPUT) - (INPUT × INPUT) >= 0` needs Z3 — intervals cannot see that the
-two products cancel.
+The expansion is evaluated in interval arithmetic, which needs no dependencies
+and soundly over-approximates every value. A program is rejected only when a
+violation is certain; anything else is reported as unproven and the build
+continues. `! (OUTPUT >= 0)` where `OUTPUT = INPUT ^ 2` is settled; a constraint
+that needs two products to cancel is not, since intervals treat the two as
+independent, and it is reported as open rather than refused.
 
 Every division in the program is checked the same way. A denominator that is
 always zero is a hard error; one that merely can be zero is reported:
@@ -371,7 +371,7 @@ always zero is a hard error; one that merely can be zero is reported:
 That is exactly why `examples/teichmuller.rho` returns infinities on smooth
 input: its denominator is the discrete Laplacian, which vanishes.
 
-### 4.1 What "proved" means
+### 4.1 What "proved" means here
 
 The kernel computes in IEEE-754 binary64, not in ℝ, and the difference is not
 academic. Reasoning over the reals proves that `(x*x)/x > x` is impossible, so a
@@ -379,111 +379,41 @@ mask on that test looks like a constant zero — but on the machine the quotient
 can exceed `x` by an ulp, the mask fires, and a constraint downstream breaks.
 A randomised search against real runs found exactly that case.
 
-Both backends therefore carry the standard model for round-to-nearest: every
-arithmetic result is the exact result times `(1 + δ)` with `|δ| ≤ 2⁻⁵³`. The
-interval backend widens each result outward by that factor; the SMT backend
-introduces a bounded `δ` per operation. This keeps the useful proofs — a squared
-value stays non-negative through rounding, and `x² + 1` stays clear of zero —
-while refusing the ones that only hold over ℝ.
+The intervals therefore carry the standard model for round-to-nearest: every
+arithmetic result is the exact result times `(1 + δ)` with `|δ| ≤ 2⁻⁵³`, and
+each result is widened outward by that factor. This keeps the useful claims — a
+squared value stays non-negative through rounding, and `x² + 1` stays clear of
+zero — while refusing the ones that only hold over ℝ.
+
+The claims are held to real runs. The differential test (§5) compiles random
+programs, half of them carrying a `!` on their output, and compares the range
+the intervals stated and any constraint they called proved with what the kernel
+produced, at both widths. That is refutation rather than proof, but the failure
+it catches is the one that once happened: a range narrower than the machine's
+truth.
 
 A fold is not expanded term by term — the number of terms is a property of the
 grid, not of the cell a constraint speaks about — so it enters the analysis as an
 unconstrained value. Proofs about a folded value stay sound; counterexamples
 involving one are reported as unproven rather than as violations.
 
-Still outside the model, and so still assumptions on any proof:
+Still outside the model, and so still assumptions on any claim:
 
 - overflow to ±∞ and underflow to subnormals
 - NaN inputs and NaN propagation
-- the order in which `clang` contracts operations (e.g. into an FMA)
-
 
 ---
 
-### 4.2 What is proved about an iteration
-
-Two facts, both by interval arguments and so the same under either backend.
-
-**An invariant.** The body is evaluated over a candidate range with the
-iterate bound to it, starting from the range the target held before the loop.
-If the body maps the range into itself, every iterate lies in it, and so does
-whatever the loop leaves behind; everything after the loop — a constraint, a
-division, the contract's output range — is judged on that range. If not, the
-range grows to cover the body's result and the check repeats, and after a few
-rounds of growth a still-moving end is given up as unbounded. For a binary64
-kernel whose body uses only correctly rounded operations, the rounding model
-is dropped for this check: rounding is monotone, so an exact result inside a
-range of binary64 bounds rounds to a value inside it. Without that an
-averaging like Laplace's would have no finite invariant, since the model would
-push the top of the range a rounding above itself on every round.
-
-**Convergence.** If one sweep is a Lipschitz map of the iterate whose
-constants sum to less than 1 in the ∞-norm, the sweep contracts, and Banach's
-theorem gives convergence from any start to a unique fixed point. The
-constants are read off the body: a cell of the iterate contributes 1, a sum
-adds, a product with a bounded factor scales, a division by a value kept away
-from zero scales, a boundary contributes at most the interior does, and `abs`,
-`sin` and `cos` pass the bound through. A product of the iterate with itself,
-a division by it, a mask on it, a fold of it, or any other function of it
-gives no bound, and the checker says so. Jacobi on a strictly diagonally
-dominant system is proved this way, with its factor; Laplace's averaging sums
-to exactly 1, which is not a contraction in this norm, and is reported as not
-shown — its convergence needs a spectral argument the checker does not make.
-The bound is for exact arithmetic; each sweep also adds a rounding error of
-the order of the unit roundoff, which the invariant covers and the contraction
-factor does not.
-
-Convergence is not a safety obligation: a loop that is not shown to converge
-still ends, at its cap. So it is reported on its own line and does not count
-against `--require-contract`; the contract says which it is.
-
-## 5. The Kernel's Contract ✅
-
-A proof that only appears in a build log cannot be relied on by whoever loads the
-kernel. Everything the solver establishes is therefore compiled into the artifact
-and returned by `rho_kernel_metadata()`:
-
-```json
-"contract": {
-  "backend": "z3",
-  "output_range": [0, null],
-  "divisions_proven_safe": true,
-  "output_proven_finite": false,
-  "open_obligations": 0,
-  "iterations": [{"target": "X", "converges": true, "factor": 0.5,
-                  "invariant": [null, null]}],
-  "assumes": ["no overflow to infinity", "no underflow to subnormals",
-              "no NaN input", "no operation contraction, e.g. into an FMA"]
-}
-```
-
-`iterations` has one entry per `⇒`: whether it was proved to converge, the
-contraction factor per sweep when one was bounded, and the range every
-iterate stays in. The metadata alongside the contract records the cap and
-tolerance the kernel was built with.
-
-`output_range` bounds every cell the kernel writes; a `null` end means that side
-is not bounded. It is always computed by interval arithmetic, which is cheap and
-sound — asking an SMT solver for a range needs an optimiser rather than a
-decision procedure.
-
-`assumes` is not decoration. It states what the claims rest on, so a reader can
-tell a proof from a proof-under-conditions.
-
-`rhoc --require-contract` refuses to emit a kernel with an incomplete contract,
-and `RhoEngine.require_contract()` refuses to load one. Together they let a
-system draw a line that unproven kernels cannot cross.
-
----
-
-## 6. The Reference Interpreter ✅
+## 5. The Reference Interpreter ✅
 
 `src/interp.rs` evaluates a program directly, written from this specification
 rather than from the code generator. It exists to be an independent second
 opinion: `cargo run --bin difftest` generates random programs, shapes and
 inputs — one program in three reads a second input, of `INPUT`'s shape, of one
-that stretches against it, or of one an axis shorter — runs both, and reports
-any cell where they disagree.
+that stretches against it, or of one an axis shorter; one intermediate in four
+is iterated with `⇒`; one program in two carries a `!` — compiles each at both
+widths, runs it through both C entrypoints, and reports any cell where the
+kernel and the interpreter disagree on the bits.
 
 That is a stronger check than a test suite, because neither implementation was
 written to match the other. It has already found five defects:
@@ -496,87 +426,9 @@ written to match the other. It has already found five defects:
 - `^` had no pinned meaning, so the compiler and the interpreter rounded a
   square differently;
 - and `ind` of NaN was 0 from the kernel and 1 from the interpreter, because
-  the compiler emitted an ordered comparison. The IR reader had hidden it by
-  reading `one` and `une` alike; it now refuses the one the compiler no longer
-  emits.
-
-### The chain
-
-Three representations of the same program are compared, which separates the two
-kinds of mistake a compiler can make:
-
-```
-what the source means      src/interp.rs, written from this specification
-        ≡
-what the generator decided src/irvm.rs reads the emitted IR back and runs it
-        ≡
-what clang built           the .so, loaded and called
-```
-
-A break in the first link is a code generation bug. A break in the second is a
-backend or a flag. Without the middle term the two are indistinguishable.
-
-`src/irvm.rs` accepts only the subset `rhoc` emits and reports anything else as
-unreadable rather than skipping it — a validator that quietly ignored an
-instruction would be worse than none. One property of the subset makes this
-work: control flow never depends on data. Loop bounds are literals, `br` only
-tests an integer comparison, and every floating-point decision goes through
-`select`. So the program unrolls with concrete indices and only the values are
-in question.
-
-### Proving it, not only testing it
-
-Both evaluators are written against a `Numeric` trait rather than against `f64`.
-Running them on symbols instead of numbers therefore costs nothing but a type
-parameter — and it is the same code the differential testing exercises on
-numbers, so a bug in one instantiation is a bug in both.
-
-`cargo run --release --features z3-solver --bin validate` builds an expression
-graph per output cell from each side and asks the solver the negation: *is there
-an input for which some cell differs?* `unsat` is the proof.
-
-```
-proved   [3 4] (▷INPUT - INPUT) → OUTPUT   (36 / 44 nodes, 2 entrypoints)
-proved   [3 4] ◈+ INPUT → OUTPUT           (72 / 72 nodes, 2 entrypoints)
-proved   [3 4] A:◯ □ 2 3 1                 (104 / 104 nodes, 1 entrypoint)
-checked 68: proved 68, unsettled 0, differing 0
-```
-
-The node counts differ where the vector path takes a longer route to the same
-answer — which is the point: the SIMD lowering is *proved* equal to the source,
-not merely observed to agree.
-
-Every space the kernel reads gets one symbol per cell, so a program with two
-inputs — the matrix product on the third line — is as provable as one with
-`INPUT` alone. And each entrypoint that can carry the program is proved on its
-own: the two-pointer form and the table form share the lowered body but not
-the plumbing that hands it its buffers, so a proof of one says nothing about
-the other.
-
-A `⇒` is proved by induction rather than unrolled, since its length depends on
-the data. Both sides are run with the loop's exit forced the same way: once
-round from the start, once more from a grid of fresh symbols, then out. The
-exit test each side made at each decision is recorded. Agreement on the second
-round's output says one sweep agrees for *any* iterate; agreement on the
-recorded tests says both sides leave at the same moment; with the first round
-that covers every run of any length, whatever the tolerance decides. The
-decisions enter the comparison as cells of their own — how many, then each
-test as 1 or 0 — so a kernel that leaves its loop at a different moment
-differs at one of those cells.
-
-`--bin negcontrol` is the other half of trusting this. A checker that never
-fails proves nothing about the thing it checks, so it damages the emitted IR in
-small ways a careless generator might plausibly produce — an add that became a
-subtract, a sweep that stops a cell early, a flipped boundary test, and inside
-a `⇒`: a loosened exit test, a largest move that became the smallest, a cap of
-one sweep, a copy back that stops a cell early — inside each entrypoint in
-turn, and insists the validator notices every one of the twenty. It does, and
-the undamaged kernels still come out equivalent both ways in.
-
-📋 The proof is per program and per shape, not for all shapes at once. Terms
-that no solver reasons about exactly — a power with a fractional exponent —
-enter as an uninterpreted function, which is sound for equivalence because both
-sides apply the same one, but says nothing about the function itself.
+  the compiler emitted an ordered comparison. A reader that ran the emitted IR
+  without clang had hidden it by reading `one` and `une` alike — which is one
+  reason that reader is gone.
 
 ### Two decisions the differential testing forced
 
@@ -585,14 +437,13 @@ to a maths library. Libraries do not agree with each other on the last bit of a
 square, and a language that promises byte-identical output cannot inherit that.
 
 **Floating-point contraction is off.** `clang` may fuse a multiply and an add
-into a single rounding, which is more accurate but is not what the solver models
-— it assumes every operation rounds once. The kernels are compiled with
-`-ffp-contract=off` so the machine agrees with the model, and one assumption
-drops off every contract.
+into a single rounding, which is more accurate but is not what the interpreter
+or the `!` check model — both assume every operation rounds once. The kernels
+are compiled with `-ffp-contract=off` so the machine agrees with them.
 
 ---
 
-## 7. Precision ✅
+## 6. Precision ✅
 
 `rhoc --f32` compiles the kernel at single precision. There is no syntax for it:
 the width is a property of the artifact, not of the program, and the same source
@@ -609,11 +460,11 @@ f32    2.23 ms    7.5 GB/s    4.2 MB buffers   5.5x
 Half the traffic is only part of it; at 4.2 MB the working set starts fitting in
 cache, which is where the rest comes from.
 
-### What it costs a proof
+### What it costs the check
 
-The solver's rounding model follows the width: `|δ| ≤ 2⁻²⁴` instead of `2⁻⁵³`.
-A bound is therefore looser at f32, and the contract records which width it was
-made at, because a proof does not carry across:
+The rounding model follows the width: `|δ| ≤ 2⁻²⁴` instead of `2⁻⁵³`. A bound
+is therefore looser at f32, and the report says which width it was made at,
+because a bound does not carry across:
 
 ```
 f64   output ∈ [0.9999999999999999, +inf]

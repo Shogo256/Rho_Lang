@@ -19,7 +19,7 @@ fn main() {
         ("3 4", vec![3, 4]),
     ];
 
-    let programs: [&str; 10] = [
+    let programs: [&str; 14] = [
         "(INPUT + 1.0) → OUTPUT\n    OUTPUT → =",
         "(▷INPUT - INPUT) → OUTPUT\n    OUTPUT → =",
         "(▽INPUT) → OUTPUT\n    OUTPUT → =",
@@ -30,6 +30,10 @@ fn main() {
         "◇> INPUT → OUTPUT\n    OUTPUT → =",
         "◈+ INPUT → OUTPUT\n    OUTPUT → =",
         "(▷INPUT - INPUT) → D\n    ((D × D) + 1.0) → OUTPUT\n    OUTPUT → =",
+        "exp INPUT → OUTPUT\n    OUTPUT → =",
+        "(abs INPUT) → OUTPUT\n    OUTPUT → =",
+        "(ind (INPUT > 1.0)) → OUTPUT\n    OUTPUT → =",
+        "(ind (INPUT > 0.0)) → M\n    ◇+ M → OUTPUT\n    OUTPUT → =",
     ];
 
     let mut proved = 0usize;

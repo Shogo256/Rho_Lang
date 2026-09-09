@@ -13,7 +13,7 @@
 
 use crate::ast::*;
 use crate::error::{HarmonyDisruption, Result};
-use crate::symbolic::{expand, Cmp, Sym};
+use crate::symbolic::{expand, Cmp, Domain, Sym};
 
 #[cfg(feature = "z3-solver")]
 mod smt;
@@ -93,6 +93,8 @@ pub struct Report {
     pub backend: &'static str,
     pub constraints: Vec<Finding>,
     pub divisions: Vec<Finding>,
+    /// Arguments that have to stay inside a named function's domain.
+    pub domains: Vec<Finding>,
     pub contract: Contract,
 }
 
@@ -101,6 +103,7 @@ impl Report {
         self.constraints
             .iter()
             .chain(self.divisions.iter())
+            .chain(self.domains.iter())
             .filter(|f| matches!(f.verdict, Verdict::Violated(_)))
     }
 }
@@ -141,10 +144,21 @@ impl ConstraintSolver {
                 })
                 .collect();
 
+            let domains = expansion
+                .domains
+                .iter()
+                .map(|(text, argument, domain, line)| Finding {
+                    subject: text.clone(),
+                    verdict: check_domain(argument, *domain),
+                    line: *line,
+                })
+                .collect();
+
             let mut report = Report {
                 backend: "interval",
                 constraints,
                 divisions,
+                domains,
                 contract: Contract {
                     backend: "interval",
                     output_range: Interval::UNBOUNDED,
@@ -203,6 +217,7 @@ fn build_contract(
         .constraints
         .iter()
         .chain(report.divisions.iter())
+        .chain(report.domains.iter())
         .filter(|f| !matches!(f.verdict, Verdict::Proved))
         .count();
 
@@ -441,6 +456,53 @@ pub fn eval_interval(sym: &Sym) -> Interval {
         Sym::Boundary { interior, .. } => {
             Interval::hull(Interval::point(0.0), eval_interval(interior))
         }
+        // A named function's range is often much tighter than its argument's,
+        // which is where interval arithmetic earns its keep: a sine is bounded
+        // whatever it was given, and an exponential is always positive.
+        Sym::Named { op, operand } => {
+            let inner = eval_interval(operand);
+            match op {
+                BuiltinOp::Exp => Interval {
+                    lo: if inner.lo.is_finite() { inner.lo.exp() } else { 0.0 },
+                    hi: if inner.hi.is_finite() {
+                        inner.hi.exp()
+                    } else {
+                        f64::INFINITY
+                    },
+                },
+                BuiltinOp::Log => Interval {
+                    lo: if inner.lo > 0.0 {
+                        inner.lo.ln()
+                    } else {
+                        f64::NEG_INFINITY
+                    },
+                    hi: if inner.hi > 0.0 && inner.hi.is_finite() {
+                        inner.hi.ln()
+                    } else {
+                        f64::INFINITY
+                    },
+                },
+                BuiltinOp::Sqrt => Interval {
+                    lo: if inner.lo >= 0.0 { inner.lo.sqrt() } else { 0.0 },
+                    hi: if inner.hi >= 0.0 && inner.hi.is_finite() {
+                        inner.hi.sqrt()
+                    } else {
+                        f64::INFINITY
+                    },
+                },
+                // A sine or cosine is bounded however wild its argument.
+                BuiltinOp::Sin | BuiltinOp::Cos => Interval { lo: -1.0, hi: 1.0 },
+                BuiltinOp::Abs => Interval {
+                    lo: if inner.contains_zero() {
+                        0.0
+                    } else {
+                        inner.lo.abs().min(inner.hi.abs())
+                    },
+                    hi: inner.lo.abs().max(inner.hi.abs()),
+                },
+                BuiltinOp::Indicator => Interval { lo: 0.0, hi: 1.0 },
+            }
+        }
         // A fold is not expanded term by term: the number of terms is a
         // property of the grid, not of the cell the constraint speaks about.
         // What is known is what the operator can produce.
@@ -505,6 +567,30 @@ pub fn check_interval(cmp: Cmp, lhs: &Sym, rhs: &Sym) -> Verdict {
         _ => Verdict::Unproven(format!(
             "intervals leave it open; {range}. Build with --features z3-solver for an exact answer"
         )),
+    }
+}
+
+/// Decide whether an argument stays inside a named function's domain.
+pub fn check_domain(argument: &Sym, domain: Domain) -> Verdict {
+    let range = eval_interval(argument);
+    let (inside, outside) = match domain {
+        Domain::Positive => (range.lo > 0.0, range.hi <= 0.0),
+        Domain::NonNegative => (range.lo >= 0.0, range.hi < 0.0),
+    };
+    if inside {
+        Verdict::Proved
+    } else if outside {
+        Verdict::Violated(format!(
+            "the argument {domain} but ranges over [{}, {}]",
+            fmt_bound(range.lo),
+            fmt_bound(range.hi)
+        ))
+    } else {
+        Verdict::Unproven(format!(
+            "the argument {domain}; it ranges over [{}, {}]",
+            fmt_bound(range.lo),
+            fmt_bound(range.hi)
+        ))
     }
 }
 

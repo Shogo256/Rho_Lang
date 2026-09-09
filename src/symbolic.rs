@@ -72,6 +72,11 @@ pub enum Sym {
         flag: String,
         interior: Box<Sym>,
     },
+    /// A named function applied to a value.
+    Named {
+        op: BuiltinOp,
+        operand: Box<Sym>,
+    },
     /// The result of folding an axis away. A constraint speaks about one cell,
     /// and a fold's cell is a function of many, so it is modelled by what the
     /// fold's operator can produce rather than expanded term by term.
@@ -79,6 +84,24 @@ pub enum Sym {
         op: FoldOp,
         id: usize,
     },
+}
+
+/// What a named function needs of its argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Domain {
+    /// `log` is undefined at zero and below.
+    Positive,
+    /// `sqrt` of a negative is not a real number.
+    NonNegative,
+}
+
+impl fmt::Display for Domain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Domain::Positive => write!(f, "must be positive"),
+            Domain::NonNegative => write!(f, "must not be negative"),
+        }
+    }
 }
 
 /// A constraint lifted to `lhs cmp rhs` over expanded values.
@@ -94,6 +117,9 @@ pub struct Expansion {
     pub obligations: Vec<Obligation>,
     /// Every division that appears in a lowered flow: text, denominator, line.
     pub divisions: Vec<(String, Sym, usize)>,
+    /// Every argument that has to stay inside a function's domain: the call as
+    /// written, the argument, the bound it must respect, and the line.
+    pub domains: Vec<(String, Sym, Domain, usize)>,
     /// The value written at the equilibrium point, expanded through every flow
     /// that produced it. This is what a caller of the kernel actually receives.
     pub output: Option<Sym>,
@@ -129,6 +155,16 @@ impl Builder<'_> {
             },
             Expr::AuditTrace(inner) | Expr::Lift { operand: inner, .. } => {
                 self.build(inner, before, offset)
+            }
+
+            // A named function keeps the cell it was applied to, so it can be
+            // reasoned about pointwise. `ind` is bounded on both ends.
+            Expr::Builtin { op, operand } => {
+                let inner = self.build(operand, before, offset);
+                Sym::Named {
+                    op: *op,
+                    operand: Box::new(inner),
+                }
             }
             Expr::Shift { dir, axis, operand } => {
                 let Some(name) = place_name(operand) else {
@@ -263,9 +299,11 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
     // One entry per division written in the source, with its denominator
     // expanded in the context of the flow that performs it.
     let mut divisions = Vec::new();
+    let mut domains = Vec::new();
     for (idx, (_, expr)) in defs_snapshot.iter().enumerate() {
         let line = def_lines.get(idx).copied().unwrap_or(0);
         collect_divisions(expr, idx, line, &mut builder, &mut divisions);
+        collect_domains(expr, idx, line, &mut builder, &mut domains);
     }
 
     let mut obligations = Vec::new();
@@ -298,6 +336,7 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
     Expansion {
         obligations,
         divisions,
+        domains,
         output,
     }
 }
@@ -323,6 +362,7 @@ fn collect_divisions(
         Expr::Shift { operand: inner, .. }
         | Expr::Reduce { operand: inner, .. }
         | Expr::Scan { operand: inner, .. }
+        | Expr::Builtin { operand: inner, .. }
         | Expr::Lift { operand: inner, .. }
         | Expr::AuditTrace(inner) => {
             collect_divisions(inner, at, line, builder, out)
@@ -337,6 +377,40 @@ fn offset_tag(offset: i64) -> String {
         format!("m{}", offset.unsigned_abs())
     } else {
         offset.to_string()
+    }
+}
+
+/// Record every argument a named function constrains.
+fn collect_domains(
+    expr: &Expr,
+    at: usize,
+    line: usize,
+    builder: &mut Builder,
+    out: &mut Vec<(String, Sym, Domain, usize)>,
+) {
+    match expr {
+        Expr::Builtin { op, operand } => {
+            let needs = match op {
+                BuiltinOp::Log => Some(Domain::Positive),
+                BuiltinOp::Sqrt => Some(Domain::NonNegative),
+                _ => None,
+            };
+            if let Some(domain) = needs {
+                let argument = builder.build(operand, at, 0);
+                out.push((format!("{}", ExprGlyphs(expr)), argument, domain, line));
+            }
+            collect_domains(operand, at, line, builder, out);
+        }
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            collect_domains(lhs, at, line, builder, out);
+            collect_domains(rhs, at, line, builder, out);
+        }
+        Expr::Shift { operand: inner, .. }
+        | Expr::Reduce { operand: inner, .. }
+        | Expr::Scan { operand: inner, .. }
+        | Expr::Lift { operand: inner, .. }
+        | Expr::AuditTrace(inner) => collect_domains(inner, at, line, builder, out),
+        Expr::Var(_) | Expr::Number(_) => {}
     }
 }
 
@@ -366,6 +440,7 @@ impl fmt::Display for ExprGlyphs<'_> {
                 Some(a) => write!(f, "{dir}{a}{}", ExprGlyphs(operand)),
                 None => write!(f, "{dir}{}", ExprGlyphs(operand)),
             },
+            Expr::Builtin { op, operand } => write!(f, "{op} {}", ExprGlyphs(operand)),
             Expr::Reduce { op, axis, operand } => match axis {
                 Some(a) => write!(f, "{op}{a}{}", ExprGlyphs(operand)),
                 None => write!(f, "{op}{}", ExprGlyphs(operand)),

@@ -100,6 +100,64 @@ impl fmt::Display for FoldOp {
     }
 }
 
+/// A named function applied to every cell.
+///
+/// The board operations are glyphs because they describe a shape; these are
+/// named because they describe a *quantity*. Wasan drew the same line: enri
+/// (円理), Seki and Takebe's theory of series, was how the analytic functions
+/// were reached, and it was a named technique rather than a bead movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinOp {
+    Exp,
+    Log,
+    Sqrt,
+    Sin,
+    Cos,
+    Abs,
+    /// 1 where the operand holds, 0 elsewhere. Applied to a comparison it is
+    /// that comparison's truth; applied to anything else it asks whether the
+    /// value is not zero. This is how a program counts, which masking alone
+    /// cannot do: a mask that passes a value which happens to be zero is
+    /// indistinguishable from one that blocked it.
+    Indicator,
+}
+
+impl BuiltinOp {
+    pub fn from_name(name: &str) -> Option<BuiltinOp> {
+        Some(match name {
+            "exp" => BuiltinOp::Exp,
+            "log" => BuiltinOp::Log,
+            "sqrt" => BuiltinOp::Sqrt,
+            "sin" => BuiltinOp::Sin,
+            "cos" => BuiltinOp::Cos,
+            "abs" => BuiltinOp::Abs,
+            "ind" => BuiltinOp::Indicator,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BuiltinOp::Exp => "exp",
+            BuiltinOp::Log => "log",
+            BuiltinOp::Sqrt => "sqrt",
+            BuiltinOp::Sin => "sin",
+            BuiltinOp::Cos => "cos",
+            BuiltinOp::Abs => "abs",
+            BuiltinOp::Indicator => "ind",
+        }
+    }
+
+    /// Every name that cannot also be a space.
+    pub const ALL: [&'static str; 7] = ["exp", "log", "sqrt", "sin", "cos", "abs", "ind"];
+}
+
+impl fmt::Display for BuiltinOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
 /// Topological Expression
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -116,6 +174,11 @@ pub enum Expr {
         op: BinaryOpKind,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
+    },
+    /// `exp X`, `log X`, `ind (A > B)` — a named function over every cell.
+    Builtin {
+        op: BuiltinOp,
+        operand: Box<Expr>,
     },
     /// `□2X` — view X with a length-1 axis inserted at that position.
     ///

@@ -359,6 +359,27 @@ impl<S: Numeric> Machine<S> {
                     let cells = (bytes / 8).max(0) as usize;
                     return Ok(Value::P(self.add_buffer(vec![S::constant(0.0); cells]), 0));
                 }
+                // The unary intrinsics: exp, log, sqrt, sin, cos, fabs.
+                for (marker, op) in [
+                    ("@llvm.exp", crate::ast::BuiltinOp::Exp),
+                    ("@llvm.log", crate::ast::BuiltinOp::Log),
+                    ("@llvm.sqrt", crate::ast::BuiltinOp::Sqrt),
+                    ("@llvm.sin", crate::ast::BuiltinOp::Sin),
+                    ("@llvm.cos", crate::ast::BuiltinOp::Cos),
+                    ("@llvm.fabs", crate::ast::BuiltinOp::Abs),
+                ] {
+                    if !body.contains(marker) {
+                        continue;
+                    }
+                    let args = call_arguments(body);
+                    let value = self.value(&args[0]);
+                    return Ok(match value {
+                        Value::VF(lanes) => {
+                            Value::VF(lanes.iter().map(|v| v.unary(op)).collect())
+                        }
+                        other => Value::F(other.f().unary(op)),
+                    });
+                }
                 if body.contains("@llvm.pow") {
                     let args = call_arguments(body);
                     let base = self.value(&args[0]);
@@ -602,6 +623,7 @@ impl<S: Numeric> Machine<S> {
                         "oge" => Compare::Gte,
                         "ole" => Compare::Lte,
                         "oeq" => Compare::Eq,
+                        "one" | "une" => Compare::Ne,
                         other => return Err(format!("unsupported fcmp {other}")),
                     };
                     Ok(if vector_width(&ty).is_some() {

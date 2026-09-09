@@ -8,6 +8,7 @@
 //! Only the data is abstracted. Indices, addresses and control flow stay
 //! concrete, because nothing `rhoc` emits ever branches on a value.
 
+use crate::ast::BuiltinOp;
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
@@ -20,6 +21,8 @@ pub enum Compare {
     Gte,
     Lte,
     Eq,
+    /// What a non-zero test lowers to: `fcmp one`.
+    Ne,
 }
 
 pub trait Numeric: Clone + fmt::Debug {
@@ -36,6 +39,8 @@ pub trait Numeric: Clone + fmt::Debug {
     fn div(&self, other: &Self) -> Self;
     /// Exponentiation with an exponent that is not a whole number.
     fn power(&self, other: &Self) -> Self;
+    /// A named function over one value.
+    fn unary(&self, op: BuiltinOp) -> Self;
 
     fn compare(&self, other: &Self, how: Compare) -> Self::Bool;
     fn select(condition: &Self::Bool, when_true: &Self, when_false: &Self) -> Self;
@@ -68,6 +73,23 @@ impl Numeric for f64 {
     fn power(&self, other: &Self) -> Self {
         f64::powf(*self, *other)
     }
+    fn unary(&self, op: BuiltinOp) -> Self {
+        match op {
+            BuiltinOp::Exp => self.exp(),
+            BuiltinOp::Log => self.ln(),
+            BuiltinOp::Sqrt => self.sqrt(),
+            BuiltinOp::Sin => self.sin(),
+            BuiltinOp::Cos => self.cos(),
+            BuiltinOp::Abs => self.abs(),
+            BuiltinOp::Indicator => {
+                if *self != 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
     fn compare(&self, other: &Self, how: Compare) -> bool {
         match how {
             Compare::Gt => self > other,
@@ -75,6 +97,7 @@ impl Numeric for f64 {
             Compare::Gte => self >= other,
             Compare::Lte => self <= other,
             Compare::Eq => self == other,
+            Compare::Ne => self != other,
         }
     }
     fn select(condition: &bool, when_true: &Self, when_false: &Self) -> Self {
@@ -109,6 +132,10 @@ pub enum Node {
     /// still follows, and no solver has to reason about real exponentiation.
     Power(Term, Term),
     Select(Predicate, Term, Term),
+    /// A named function. Left uninterpreted for the solver: both sides apply
+    /// the same one to the same argument, so equivalence follows without
+    /// anyone having to axiomatise a transcendental.
+    Unary(BuiltinOp, Term),
 }
 
 #[derive(Debug)]
@@ -163,6 +190,7 @@ impl Term {
                     stack.push(b.clone());
                     collect_predicate(p, &mut stack);
                 }
+                Node::Unary(_, a) => stack.push(a.clone()),
             }
         }
         seen.len()
@@ -224,6 +252,9 @@ impl Numeric for Term {
     }
     fn power(&self, other: &Term) -> Term {
         Term::of(Node::Power(self.clone(), other.clone()))
+    }
+    fn unary(&self, op: BuiltinOp) -> Term {
+        Term::of(Node::Unary(op, self.clone()))
     }
 
     fn compare(&self, other: &Term, how: Compare) -> Predicate {

@@ -112,6 +112,12 @@ fn expression(
 
         4 => format!("({} ^ 2.0)", expression(rng, depth - 1, spaces, want)),
 
+        // Named functions keep their shape, so they compose anywhere.
+        5 => {
+            let name = ["exp", "sqrt", "sin", "cos", "abs", "ind"][rng.below(6)];
+            format!("({name} {})", expression(rng, depth - 1, spaces, want))
+        }
+
         _ => {
             let op = ["+", "-", "×", "/", ">", "<"][rng.below(6)];
             let lhs = expression(rng, depth - 1, spaces, want);

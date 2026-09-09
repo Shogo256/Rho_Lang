@@ -100,7 +100,12 @@ fn run(args: &Args) -> anyhow::Result<()> {
     let report = ConstraintSolver::verify(&block, args.tau)?;
     println!("  └─ Backend: {}", report.backend);
     let mut open_questions = 0;
-    for finding in report.constraints.iter().chain(report.divisions.iter()) {
+    for finding in report
+        .constraints
+        .iter()
+        .chain(report.divisions.iter())
+        .chain(report.domains.iter())
+    {
         match &finding.verdict {
             Verdict::Proved => println!("  └─ [proved]   {}", finding.subject),
             Verdict::Unproven(why) => {

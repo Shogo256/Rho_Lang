@@ -8,6 +8,7 @@
 //! as unproven rather than as a violation.
 
 use super::{Contract, Finding, Interval, Report, Verdict, CONTRACT_ASSUMPTIONS};
+use crate::ast::BuiltinOp;
 use crate::symbolic::{Cmp, Expansion, Sym};
 use std::collections::BTreeMap;
 use z3::ast::{Ast, Bool, Int, Real};
@@ -44,10 +45,24 @@ pub fn analyze(expansion: &Expansion) -> Report {
         })
         .collect();
 
+    let domains = expansion
+        .domains
+        .iter()
+        .map(|(text, argument, domain, line)| Finding {
+            subject: text.clone(),
+            // Reasoning about a transcendental's argument is what intervals do
+            // well and an SMT solver does not, so the range decides this one
+            // whichever backend is running.
+            verdict: super::check_domain(argument, *domain),
+            line: *line,
+        })
+        .collect();
+
     Report {
         backend: "z3",
         constraints,
         divisions,
+        domains,
         // Filled in by ConstraintSolver::analyze once the findings are known.
         contract: Contract {
             backend: "z3",
@@ -177,6 +192,36 @@ impl<'ctx> Translator<'ctx> {
             // Widening like this keeps proofs sound and counterexamples
             // suspect, which is why they are reported as unproven.
             Sym::Fold { .. } => self.unknown(),
+
+            // A named function is opaque too, but not featureless: a sine is
+            // bounded whatever it was given, and a magnitude is never negative.
+            // Saying so costs nothing and is what lets the solver settle
+            // `sin x + 2 > 0` rather than shrug at it.
+            Sym::Named { op, operand } => {
+                let _ = self.build(operand);
+                let value = self.unknown();
+                let bound = |v: f64| {
+                    let n = v as i64;
+                    Real::from_int(&Int::from_i64(self.ctx, n))
+                };
+                match op {
+                    BuiltinOp::Sin | BuiltinOp::Cos => {
+                        self.rounding_bounds.push(value.le(&bound(1.0)));
+                        self.rounding_bounds.push(value.ge(&bound(-1.0)));
+                    }
+                    BuiltinOp::Indicator => {
+                        self.rounding_bounds.push(value.le(&bound(1.0)));
+                        self.rounding_bounds.push(value.ge(&bound(0.0)));
+                    }
+                    // exp can underflow to exactly zero, so the bound is not
+                    // strict; sqrt and abs are non-negative outright.
+                    BuiltinOp::Exp | BuiltinOp::Sqrt | BuiltinOp::Abs => {
+                        self.rounding_bounds.push(value.ge(&bound(0.0)));
+                    }
+                    BuiltinOp::Log => {}
+                }
+                value
+            }
             Sym::Mask { cmp, lhs, rhs } => {
                 let l = self.build(lhs);
                 let r = self.build(rhs);

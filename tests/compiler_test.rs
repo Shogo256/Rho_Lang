@@ -1892,3 +1892,144 @@ fn test_the_validator_catches_a_damaged_kernel() {
         "the untouched kernel should validate"
     );
 }
+
+// --------------------------------------------------------------------------
+// Named functions. The board operations are glyphs because they describe a
+// shape; these are named because they describe a quantity.
+// --------------------------------------------------------------------------
+
+#[test]
+fn test_named_functions_compute_what_they_say() {
+    for (name, body, input, expected) in [
+        (
+            "fn_exp",
+            "exp INPUT",
+            vec![0.0, 1.0, 2.0, -1.0],
+            vec![1.0, std::f64::consts::E, std::f64::consts::E.powi(2), 1.0 / std::f64::consts::E],
+        ),
+        (
+            "fn_log",
+            "log INPUT",
+            vec![1.0, std::f64::consts::E, 10.0, 0.5],
+            vec![0.0, 1.0, 10f64.ln(), 0.5f64.ln()],
+        ),
+        ("fn_sqrt", "sqrt INPUT", vec![0.0, 1.0, 4.0, 9.0], vec![0.0, 1.0, 2.0, 3.0]),
+        ("fn_abs", "abs INPUT", vec![-3.0, 2.0, -1.0, 0.0], vec![3.0, 2.0, 1.0, 0.0]),
+    ] {
+        let source = format!(
+            "{{\n        INPUT:◯ □ 4 1\n        {body} → OUTPUT\n        OUTPUT → =\n    }}"
+        );
+        let out = run_kernel(name, &source, &input);
+        for (got, want) in out.iter().zip(&expected) {
+            assert!((got - want).abs() < 1e-12, "{name}: {got} vs {want}");
+        }
+    }
+}
+
+#[test]
+fn test_the_indicator_makes_counting_possible() {
+    // A mask cannot count: one that passes a value which happens to be zero is
+    // indistinguishable from one that blocked it. `ind` answers the predicate.
+    let source = r#"{
+        INPUT:◯ □ 8 1
+        (ind (INPUT > 5.0)) → M
+        ◇+ M → OUTPUT
+        OUTPUT → =
+    }"#;
+    let out = run_kernel("count_above", source, &[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
+    assert_eq!(out[0], 2.0, "two cells are above five");
+
+    // The case a mask gets wrong: a value of zero that passes the test.
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        (ind (INPUT > -1.0)) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let out = run_kernel("count_zero_passes", source, &[0.0, -2.0, 0.0, 3.0]);
+    assert_eq!(out, vec![1.0, 0.0, 1.0, 1.0], "zero is greater than minus one");
+}
+
+#[test]
+fn test_softmax_is_expressible() {
+    // Needs exp, a fold, and a lift to line the total up with the vector.
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        exp INPUT → E
+        (E / (□0 (◇+ E))) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let out = run_kernel("softmax", source, &[1.0, 2.0, 3.0, 4.0]);
+    let total: f64 = out.iter().sum();
+    assert!((total - 1.0).abs() < 1e-12, "a softmax sums to one, got {total}");
+    assert!(out.windows(2).all(|w| w[0] < w[1]), "and preserves the order");
+}
+
+#[test]
+fn test_the_solver_learned_what_these_functions_do() {
+    // A sine is bounded whatever it was given, which is exactly the kind of
+    // fact interval arithmetic can carry and an SMT solver cannot.
+    let bounded = analyze(
+        r#"{
+        INPUT:◯ □ 4 1
+        ((sin INPUT) + 2.0) → OUTPUT
+        ! (OUTPUT > 0.0)
+        OUTPUT → =
+    }"#,
+    );
+    assert_eq!(bounded.constraints[0].verdict, Verdict::Proved);
+
+    // An indicator is zero or one.
+    let indicator = analyze(
+        r#"{
+        INPUT:◯ □ 4 1
+        (ind (INPUT > 0.0)) → OUTPUT
+        ! (OUTPUT >= 0.0)
+        OUTPUT → =
+    }"#,
+    );
+    assert_eq!(indicator.constraints[0].verdict, Verdict::Proved);
+    assert_eq!(indicator.contract.output_range.hi, 1.0);
+}
+
+#[test]
+fn test_a_functions_domain_is_an_obligation() {
+    // log of an unknown value is an open question...
+    let open = analyze(
+        r#"{
+        INPUT:◯ □ 4 1
+        (log INPUT) → OUTPUT
+        OUTPUT → =
+    }"#,
+    );
+    assert_eq!(open.domains.len(), 1);
+    assert!(matches!(open.domains[0].verdict, Verdict::Unproven(_)));
+
+    // ...and log of something provably positive is not.
+    let settled = analyze(
+        r#"{
+        INPUT:◯ □ 4 1
+        (log ((INPUT ^ 2) + 1.0)) → OUTPUT
+        OUTPUT → =
+    }"#,
+    );
+    assert_eq!(settled.domains[0].verdict, Verdict::Proved);
+}
+
+#[test]
+fn test_a_function_name_cannot_also_be_a_space() {
+    // `exp X` would be ambiguous if a space could be called `exp`.
+    for name in ["exp", "log", "ind"] {
+        let source = format!(
+            "{{\n        {name}:◯ □ 4 1\n        {name} → OUTPUT\n        OUTPUT → =\n    }}"
+        );
+        assert!(parse_rho_program(&source).is_err(), "a space named {name}");
+    }
+
+    // A name that merely starts with one is fine.
+    let source = r#"{
+        exposure:◯ □ 4 1
+        (exposure + 1.0) → OUTPUT
+        OUTPUT → =
+    }"#;
+    assert!(parse_rho_program(source).is_ok());
+}

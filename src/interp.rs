@@ -114,7 +114,9 @@ fn shape_of<S: Numeric>(expr: &Expr, env: &Env<S>, line: usize) -> Result<Option
         Expr::AuditTrace(inner) | Expr::Shift { operand: inner, .. } => {
             shape_of(inner, env, line)?
         }
-        Expr::Scan { operand, .. } => shape_of(operand, env, line)?,
+        Expr::Scan { operand, .. } | Expr::Builtin { operand, .. } => {
+            shape_of(operand, env, line)?
+        }
         Expr::Lift { axis, operand } => match shape_of(operand, env, line)? {
             Some(inner) => Some(shape_with_unit_axis(&inner, *axis).ok_or_else(|| {
                 err(line, format!("axis {axis} is past the end of {inner:?}"))
@@ -193,6 +195,30 @@ fn eval_cell<S: Numeric>(
         }
 
         Expr::AuditTrace(inner) => eval_cell(inner, env, tau, line, at_shape, index, lifts),
+
+        // `ind` of a comparison is that comparison's truth. Evaluating the
+        // operand first would hand back the mask, which cannot tell a blocked
+        // cell from one that passed a zero through.
+        Expr::Builtin {
+            op: BuiltinOp::Indicator,
+            operand,
+        } => {
+            let one = S::constant(1.0);
+            let zero = S::constant(0.0);
+            if let Expr::BinaryOp { op, lhs, rhs } = &**operand {
+                if let Some(how) = compare_of(op) {
+                    let l = eval_cell(lhs, env, tau, line, at_shape, index, lifts)?;
+                    let r = eval_cell(rhs, env, tau, line, at_shape, index, lifts)?;
+                    return Ok(S::select(&l.compare(&r, how), &one, &zero));
+                }
+            }
+            let value = eval_cell(operand, env, tau, line, at_shape, index, lifts)?;
+            Ok(S::select(&value.compare(&zero, Compare::Eq), &zero, &one))
+        }
+
+        Expr::Builtin { op, operand } => {
+            Ok(eval_cell(operand, env, tau, line, at_shape, index, lifts)?.unary(*op))
+        }
 
         Expr::Lift { axis, operand } => {
             let mut nested = lifts.to_vec();
@@ -383,6 +409,18 @@ fn map_index(source: &[usize], at_shape: &[usize], index: usize) -> usize {
             coord * src_strides[axis]
         })
         .sum()
+}
+
+/// The comparison a binary operator stands for, if it is one.
+fn compare_of(op: &BinaryOpKind) -> Option<Compare> {
+    Some(match op {
+        BinaryOpKind::Gt => Compare::Gt,
+        BinaryOpKind::Lt => Compare::Lt,
+        BinaryOpKind::Gte => Compare::Gte,
+        BinaryOpKind::Lte => Compare::Lte,
+        BinaryOpKind::Eq => Compare::Eq,
+        _ => return None,
+    })
 }
 
 fn is_tau(name: &str) -> bool {

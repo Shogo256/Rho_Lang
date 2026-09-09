@@ -27,6 +27,8 @@ Working prototype. What runs today:
 - Folds `◇+` `◇×` `◇>` `◇<` that collapse an axis, so sums, means, dot products
   and norms are one line each
 - Scans `◈+` `◈×` `◈>` `◈<` for running totals, which keep the shape they walk
+- Named functions `exp` `log` `sqrt` `sin` `cos` `abs`, with their domains
+  checked, and `ind` so a program can count
 - `□` lifting and broadcasting, so an outer product — and a matrix product — is
   one flow
 - Explicit `<4 x double>` vector lowering, verified bit-identical to the scalar path
@@ -185,6 +187,15 @@ Passing `NULL` as the output pointer makes the kernel write in place. Passing
 
 ```rho
 {
+    /* a softmax */
+    INPUT:◯ □ 1024 1
+    exp INPUT → E
+    (E / (□0 (◇+ E))) → =
+}
+```
+
+```rho
+{
     /* a matrix product, contracted in one flow */
     A:◯ □ 2 3 1
     B:◯ □ 1 3 4
@@ -243,6 +254,7 @@ smooth input drives it to zero and the kernel returns infinities.
 | Folds (`◇`) collapsing an axis | ✅ implemented — scalar inner loop, no scan yet |
 | Scans (`◈`) keeping the shape | ✅ implemented — scalar, no parallel scan |
 | Lifting (`□`) and broadcasting | ✅ implemented — no implicit rank promotion |
+| Named functions and their domain checks | ✅ implemented |
 | Explicit `<4 x double>` vector lowering | ✅ implemented — see the note below |
 | Zero-copy binding (`&[0x…]`, `--bind`) | ✅ implemented |
 | `!` constraint solver | ✅ interval arithmetic; Z3 with `--features z3-solver`. Models binary64 rounding, not ℝ |

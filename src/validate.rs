@@ -105,6 +105,9 @@ mod smt {
         /// apply the same function to the same arguments, so equality still
         /// follows without anyone reasoning about real exponentiation.
         power: FuncDecl<'ctx>,
+        /// The same treatment for the named functions: an exponential is a
+        /// symbol here, and equivalence needs only that both sides use it.
+        named: BTreeMap<&'static str, FuncDecl<'ctx>>,
     }
 
     impl<'ctx> Encoder<'ctx> {
@@ -115,6 +118,15 @@ mod smt {
                 inputs: BTreeMap::new(),
                 terms: BTreeMap::new(),
                 power: FuncDecl::new(ctx, "rho_power", &[&real, &real], &real),
+                named: crate::ast::BuiltinOp::ALL
+                    .iter()
+                    .map(|name| {
+                        (
+                            *name,
+                            FuncDecl::new(ctx, format!("rho_{name}"), &[&real], &real),
+                        )
+                    })
+                    .collect(),
             }
         }
 
@@ -173,6 +185,13 @@ mod smt {
                         .as_real()
                         .expect("rho_power returns a real")
                 }
+                Node::Unary(op, a) => {
+                    let x = self.term(a);
+                    self.named[op.name()]
+                        .apply(&[&x])
+                        .as_real()
+                        .expect("a named function returns a real")
+                }
                 Node::Select(condition, a, b) => {
                     let flag = self.predicate(condition);
                     let (x, y) = (self.term(a), self.term(b));
@@ -194,6 +213,7 @@ mod smt {
                         Compare::Gte => x.ge(&y),
                         Compare::Lte => x.le(&y),
                         Compare::Eq => x._eq(&y),
+                        Compare::Ne => x._eq(&y).not(),
                     }
                 }
                 BoolNode::Or(a, b) => {

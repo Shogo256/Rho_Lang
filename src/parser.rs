@@ -270,6 +270,25 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         }
     }
 
+    // A named function: `exp X`, `ind (A > B)`. The name has to be followed by
+    // whitespace or a bracket, so a space called `expansion` stays a space.
+    for name in BuiltinOp::ALL {
+        let Some(rest) = expr_str.strip_prefix(name) else {
+            continue;
+        };
+        if !rest.starts_with(|c: char| c.is_whitespace() || c == '(') {
+            continue;
+        }
+        let operand = rest.trim();
+        if operand.is_empty() {
+            continue;
+        }
+        return Ok(Expr::Builtin {
+            op: BuiltinOp::from_name(name).unwrap(),
+            operand: Box::new(parse_expr(operand)?),
+        });
+    }
+
     // Lift: □2X views X with a length-1 axis inserted at position 2.
     if expr_str.starts_with('□') && expr_str.chars().count() > 1 {
         let rest = &expr_str['□'.len_utf8()..];
@@ -450,6 +469,28 @@ fn is_enclosed_by_outer_parens(s: &str) -> bool {
 pub fn validate_space_declarations(block: &ToposBlock) -> Result<()> {
     let mut declared_spaces = HashSet::new();
 
+    // A space that shadowed a function name would make `exp X` ambiguous.
+    for (index, stmt) in block.statements.iter().enumerate() {
+        let name = match stmt {
+            Statement::SpaceDef(d) => Some(&d.name),
+            Statement::ExtBind(b) => Some(&b.space.name),
+            Statement::Flow {
+                target: FlowTarget::Var(n),
+                ..
+            } => Some(n),
+            _ => None,
+        };
+        if let Some(name) = name {
+            if BuiltinOp::ALL.contains(&name.as_str()) {
+                return Err(HarmonyDisruption::GlyphErr {
+                    symbol: name.clone(),
+                    line: block.line_of(index),
+                    column: 1,
+                });
+            }
+        }
+    }
+
     for stmt in &block.statements {
         match stmt {
             Statement::SpaceDef(decl) => {
@@ -494,6 +535,7 @@ fn check_expr_spaces(expr: &Expr, declared: &HashSet<String>, line: usize) -> Re
         Expr::Shift { operand: inner, .. }
         | Expr::Reduce { operand: inner, .. }
         | Expr::Scan { operand: inner, .. }
+        | Expr::Builtin { operand: inner, .. }
         | Expr::Lift { operand: inner, .. }
         | Expr::AuditTrace(inner) => {
             check_expr_spaces(inner, declared, line)?;
@@ -552,7 +594,9 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
                 let inner = get_expr_shape(operand, shapes)?;
                 shape_with_unit_axis(&inner, *axis)
             }
-            Expr::Scan { operand, .. } => get_expr_shape(operand, shapes),
+            Expr::Scan { operand, .. } | Expr::Builtin { operand, .. } => {
+                get_expr_shape(operand, shapes)
+            }
             Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
                 get_expr_shape(inner, shapes)
             }
@@ -601,6 +645,7 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
             Expr::Shift { operand: inner, .. }
             | Expr::Reduce { operand: inner, .. }
             | Expr::Scan { operand: inner, .. }
+            | Expr::Builtin { operand: inner, .. }
             | Expr::Lift { operand: inner, .. }
             | Expr::AuditTrace(inner) => check_broadcast(inner, shapes, line)?,
             Expr::Var(_) | Expr::Number(_) => {}

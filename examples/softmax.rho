@@ -1,0 +1,23 @@
+{
+    /* A softmax, and the count of the entries it puts above a tenth.
+
+       The board operations are glyphs because they describe a shape. These are
+       named because they describe a quantity — which is the same line Wasan
+       drew: enri (円理), Seki and Takebe's theory of series, was how the
+       analytic functions were reached, and it was a named technique rather
+       than a movement of beads. */
+    INPUT:◯ □ 1024 1
+
+    exp INPUT → E
+    (E / (□0 (◇+ E))) → P
+
+    /* ind turns a test into 1 or 0, which is what lets a fold count.
+       A mask cannot: one that passes a value which happens to be zero is
+       indistinguishable from one that blocked it. */
+    (ind (P > 0.001)) → ABOVE
+
+    (□0 (◇+ ABOVE)) → OUTPUT
+    ! (OUTPUT >= 0.0)
+
+    OUTPUT → =
+}

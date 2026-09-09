@@ -18,10 +18,15 @@ compiler emits explicit CPU vector IR; GPU backends are still future work.
 
 ---
 
-## 2. The 20-Symbol Dictionary
+## 2. The Symbol Dictionary
 
-RHO source consists of these symbols plus identifiers, digits, and grouping
-punctuation.
+RHO source consists of these symbols, a handful of named functions, identifiers,
+digits, and grouping punctuation.
+
+The dictionary was once fixed at twenty. It is not any more, and pretending
+otherwise would have cost more than the slogan was worth: folds, scans and the
+analytic functions each earn their place, and a count is not a design
+principle.
 
 | Symbol | Name | Wasan Concept | Semantics | Status |
 |---|---|---|---|---|
@@ -51,6 +56,49 @@ punctuation.
 
 ASCII aliases: `->` or `=>` for `→`, `>>` for `▷`, `<<` for `▽`, `@` for `&`,
 `<>` for `◇`, `<.>` for `◈`, `[]` for `□`.
+
+### Named functions
+
+| Name | Meaning | Domain |
+|---|---|---|
+| `exp X` | `e` to the power of each cell | — |
+| `log X` | natural logarithm | the argument must be positive |
+| `sqrt X` | square root | the argument must not be negative |
+| `sin X`, `cos X` | trigonometric, in radians | — |
+| `abs X` | magnitude | — |
+| `ind X` | 1 where it holds, 0 elsewhere | — |
+
+They are written as names rather than glyphs because they describe a *quantity*
+rather than a shape. The board operations move beads; these are the analytic
+functions, which Wasan also reached by a named technique — enri (円理), Seki and
+Takebe's theory of series.
+
+A space may not take one of these names, since `exp X` would then be ambiguous.
+A name that merely begins with one, like `exposure`, is fine.
+
+`ind` is how a program counts. Applied to a comparison it is that comparison's
+truth; applied to anything else it asks whether the value is not zero. A mask
+cannot do this: one that passes a value which happens to be zero is
+indistinguishable from one that blocked it.
+
+```rho
+(ind (INPUT > 5.0)) → ABOVE
+◇+ ABOVE → =                 /* how many cells exceed five */
+```
+
+The domains are checked the way divisions are. `log` of something the solver
+cannot show is positive becomes an open obligation on the kernel's contract:
+
+```
+[proved]   log ((INPUT ^ 2) + 1)
+[unproven] log INPUT — the argument must be positive; it ranges over [-inf, +inf]
+```
+
+Their ranges also give the interval backend facts it could not otherwise have.
+A sine is bounded whatever it was given, so `! ((sin X) + 2.0 > 0)` is proved
+outright. And `exp X > 0` is deliberately *not* proved: `exp` underflows to
+exactly zero for a large enough negative argument, so a proof there would be a
+false one.
 
 A shift may name its axis with a digit: `▷0X` shifts along axis 0, `▽1X` along
 axis 1. A bare `▷X` uses the innermost axis that has more than one cell. A fold

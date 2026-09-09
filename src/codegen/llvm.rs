@@ -77,6 +77,13 @@ impl Mode {
         }
     }
 
+    fn unary_intrinsic(self, name: &str) -> String {
+        match self {
+            Mode::Scalar => format!("@llvm.{name}.f64"),
+            Mode::Vector(w) => format!("@llvm.{name}.v{w}f64"),
+        }
+    }
+
     fn pow_intrinsic(self) -> String {
         match self {
             Mode::Scalar => "@llvm.pow.f64".to_string(),
@@ -223,6 +230,15 @@ impl LlvmCodeGen {
                 "declare <{w} x double> @llvm.pow.v{w}f64(<{w} x double>, <{w} x double>)\n",
                 w = VECTOR_WIDTH
             ));
+        }
+        for name in ["exp", "log", "sqrt", "sin", "cos", "fabs"] {
+            ir.push_str(&format!("declare double @llvm.{name}.f64(double)\n"));
+            if self.simd {
+                ir.push_str(&format!(
+                    "declare <{w} x double> @llvm.{name}.v{w}f64(<{w} x double>)\n",
+                    w = VECTOR_WIDTH
+                ));
+            }
         }
         ir.push_str("declare ptr @malloc(i64)\n");
         ir.push_str("declare void @free(ptr)\n\n");
@@ -400,7 +416,9 @@ impl LlvmCodeGen {
                 let inner = Self::expr_shape(operand, shapes)?;
                 crate::ast::shape_with_unit_axis(&inner, *axis)
             }
-            Expr::Scan { operand, .. } => Self::expr_shape(operand, shapes),
+            Expr::Scan { operand, .. } | Expr::Builtin { operand, .. } => {
+                Self::expr_shape(operand, shapes)
+            }
             Expr::Reduce { axis, operand, .. } => {
                 let inner = Self::expr_shape(operand, shapes)?;
                 let a = axis.unwrap_or_else(|| crate::ast::default_axis(&inner));
@@ -660,6 +678,7 @@ impl LlvmCodeGen {
             Expr::Var(_) | Expr::Number(_) => {}
             Expr::AuditTrace(inner)
             | Expr::Shift { operand: inner, .. }
+            | Expr::Builtin { operand: inner, .. }
             | Expr::Lift { operand: inner, .. } => {
                 block = self.emit_fold_prepass(inner, ir, bufs, &block, counter)?;
             }
@@ -997,7 +1016,9 @@ impl LlvmCodeGen {
             // A fold is precomputed into its own buffer before the sweep, so
             // it contributes no reach to the sweep itself.
             Expr::Reduce { .. } | Expr::Scan { .. } => 0,
-            Expr::Lift { operand, .. } => self.max_shift_stride(operand)?,
+            Expr::Lift { operand, .. } | Expr::Builtin { operand, .. } => {
+                self.max_shift_stride(operand)?
+            }
             Expr::Shift { axis, operand, .. } => {
                 let inner = self.max_shift_stride(operand)?;
                 let Some(name) = Self::place_name(operand) else {
@@ -1062,6 +1083,41 @@ impl LlvmCodeGen {
         } else {
             ir.push_str(&format!("  {out} = fadd {ty} {}, {acc}\n", mode.zero(), ));
         }
+    }
+
+    /// The LLVM predicate a comparison lowers to, if it is one.
+    fn compare_predicate(op: &BinaryOpKind) -> Option<&'static str> {
+        Some(match op {
+            BinaryOpKind::Gt => "ogt",
+            BinaryOpKind::Lt => "olt",
+            BinaryOpKind::Gte => "oge",
+            BinaryOpKind::Lte => "ole",
+            BinaryOpKind::Eq => "oeq",
+            _ => return None,
+        })
+    }
+
+    /// A flag that holds where the operand is not zero.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_nonzero(
+        &self,
+        operand: &Expr,
+        ir: &mut String,
+        bufs: &Buffers,
+        idx: &str,
+        counter: &mut usize,
+        mode: Mode,
+        result_shape: &[usize],
+        lifts: &[usize],
+    ) -> Result<String> {
+        let value = self.emit_expr(operand, ir, bufs, idx, counter, mode, result_shape, lifts)?;
+        let flag = Self::fresh(counter);
+        ir.push_str(&format!(
+            "  {flag} = fcmp one {} {value}, {}\n",
+            mode.ty(),
+            mode.zero()
+        ));
+        Ok(flag)
     }
 
     /// The shape of the buffer a fold or scan was precomputed into.
@@ -1148,7 +1204,9 @@ impl LlvmCodeGen {
         match expr {
             Expr::Number(_) => false,
             Expr::Var(name) => Self::lifted_shape(&self.shape_for(name), lifts) != result_shape,
-            Expr::AuditTrace(inner) | Expr::Shift { operand: inner, .. } => {
+            Expr::AuditTrace(inner)
+            | Expr::Shift { operand: inner, .. }
+            | Expr::Builtin { operand: inner, .. } => {
                 self.needs_broadcast(inner, result_shape, lifts)
             }
             Expr::Lift { axis, operand } => {
@@ -1215,6 +1273,66 @@ impl LlvmCodeGen {
 
             Expr::AuditTrace(inner) => {
                 self.emit_expr(inner, ir, bufs, idx, counter, mode, result_shape, lifts)
+            }
+
+            // `ind` of a comparison is that comparison's truth. Reading the
+            // operand's value first would give the mask, which cannot tell a
+            // blocked cell from one that passed a zero.
+            Expr::Builtin {
+                op: BuiltinOp::Indicator,
+                operand,
+            } => {
+                let out = Self::fresh(counter);
+                let flag = if let Expr::BinaryOp { op, lhs, rhs } = &**operand {
+                    match Self::compare_predicate(op) {
+                        Some(predicate) => {
+                            let l = self
+                                .emit_expr(lhs, ir, bufs, idx, counter, mode, result_shape, lifts)?;
+                            let r = self
+                                .emit_expr(rhs, ir, bufs, idx, counter, mode, result_shape, lifts)?;
+                            let flag = Self::fresh(counter);
+                            ir.push_str(&format!(
+                                "  {flag} = fcmp {predicate} {ty} {l}, {r}\n"
+                            ));
+                            flag
+                        }
+                        None => self.emit_nonzero(operand, ir, bufs, idx, counter, mode, result_shape, lifts)?,
+                    }
+                } else {
+                    self.emit_nonzero(operand, ir, bufs, idx, counter, mode, result_shape, lifts)?
+                };
+                ir.push_str(&format!(
+                    "  {out} = select {} {flag}, {ty} {}, {ty} {}\n",
+                    mode.bool_ty(),
+                    mode.splat(1.0),
+                    mode.zero()
+                ));
+                Ok(out)
+            }
+
+            Expr::Builtin { op, operand } => {
+                let value =
+                    self.emit_expr(operand, ir, bufs, idx, counter, mode, result_shape, lifts)?;
+                let out = Self::fresh(counter);
+                match op {
+                    // A magnitude and a sign test are exact; the rest are calls.
+                    BuiltinOp::Abs => ir.push_str(&format!(
+                        "  {out} = call {ty} {}({ty} {value})\n",
+                        mode.unary_intrinsic("fabs")
+                    )),
+                    BuiltinOp::Indicator => unreachable!("handled above"),
+                    _ => ir.push_str(&format!(
+                        "  {out} = call {ty} {}({ty} {value})\n",
+                        mode.unary_intrinsic(match op {
+                            BuiltinOp::Exp => "exp",
+                            BuiltinOp::Log => "log",
+                            BuiltinOp::Sqrt => "sqrt",
+                            BuiltinOp::Sin => "sin",
+                            _ => "cos",
+                        })
+                    )),
+                }
+                Ok(out)
             }
 
             // A lift stores nothing. It records that the operand is viewed with

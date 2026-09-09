@@ -405,18 +405,24 @@ system draw a line that unproven kernels cannot cross.
 `src/interp.rs` evaluates a program directly, written from this specification
 rather than from the code generator. It exists to be an independent second
 opinion: `cargo run --bin difftest` generates random programs, shapes and
-inputs, runs both, and reports any cell where they disagree.
+inputs — one program in three reads a second input, of `INPUT`'s shape, of one
+that stretches against it, or of one an axis shorter — runs both, and reports
+any cell where they disagree.
 
 That is a stronger check than a test suite, because neither implementation was
-written to match the other. It has already found four defects:
+written to match the other. It has already found five defects:
 
 - the interpreter treated a fold's surviving index as the start of the line that
   cell summarises, so every row after the first folded the wrong values;
 - the parser split `A × -3.0` at the minus and left `A ×` behind as a name,
   because it never asked whether a sign was a sign;
 - the same, one step further, for an axis index: `◈×0 -3.0`;
-- and `^` had no pinned meaning, so the compiler and the interpreter rounded a
-  square differently.
+- `^` had no pinned meaning, so the compiler and the interpreter rounded a
+  square differently;
+- and `ind` of NaN was 0 from the kernel and 1 from the interpreter, because
+  the compiler emitted an ordered comparison. The IR reader had hidden it by
+  reading `one` and `une` alike; it now refuses the one the compiler no longer
+  emits.
 
 ### The chain
 
@@ -454,21 +460,30 @@ graph per output cell from each side and asks the solver the negation: *is there
 an input for which some cell differs?* `unsat` is the proof.
 
 ```
-proved   [3 4] (▷INPUT - INPUT) → OUTPUT   (36 / 44 nodes)
-proved   [3 4] ◈+ INPUT → OUTPUT           (72 / 72 nodes)
-checked 40: proved 40, unsettled 0, differing 0
+proved   [3 4] (▷INPUT - INPUT) → OUTPUT   (36 / 44 nodes, 2 entrypoints)
+proved   [3 4] ◈+ INPUT → OUTPUT           (72 / 72 nodes, 2 entrypoints)
+proved   [3 4] A:◯ □ 2 3 1                 (104 / 104 nodes, 1 entrypoint)
+checked 68: proved 68, unsettled 0, differing 0
 ```
 
 The node counts differ where the vector path takes a longer route to the same
 answer — which is the point: the SIMD lowering is *proved* equal to the source,
 not merely observed to agree.
 
+Every space the kernel reads gets one symbol per cell, so a program with two
+inputs — the matrix product on the third line — is as provable as one with
+`INPUT` alone. And each entrypoint that can carry the program is proved on its
+own: the two-pointer form and the table form share the lowered body but not
+the plumbing that hands it its buffers, so a proof of one says nothing about
+the other.
+
 `--bin negcontrol` is the other half of trusting this. A checker that never
 fails proves nothing about the thing it checks, so it damages the emitted IR in
 five small ways a careless generator might plausibly produce — an add that
 became a subtract, a sweep that stops a cell early, a flipped boundary test —
-and insists the validator notices each one. It does, and the undamaged kernel
-still comes out equivalent.
+inside each entrypoint in turn, and insists the validator notices every one of
+the ten. It does, and the undamaged kernel still comes out equivalent both
+ways in.
 
 📋 The proof is per program and per shape, not for all shapes at once. Terms
 that no solver reasons about exactly — a power with a fractional exponent —

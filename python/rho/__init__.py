@@ -86,8 +86,7 @@ class RhoEngine:
         self._lib = None
         self._bound = {}
 
-    def compile_rho_file(self, rho_file_path, bind=None, tau=None, require_contract=False,
-                         max_iter=None):
+    def compile_rho_file(self, rho_file_path, bind=None, tau=None, max_iter=None):
         """Compile a .rho script with the rhoc driver.
 
         `bind` maps space names to the buffers (or raw addresses) the kernel
@@ -103,8 +102,6 @@ class RhoEngine:
             cmd += ["--tau", str(tau)]
         if max_iter is not None:
             cmd += ["--max-iter", str(max_iter)]
-        if require_contract:
-            cmd += ["--require-contract"]
         self._bound = {}
         for name, target in (bind or {}).items():
             address = _buffer_address(target)
@@ -124,38 +121,6 @@ class RhoEngine:
         if self._lib is None:
             self._load_library()
         return self._lib
-
-    def contract(self):
-        """What the compiler proved about this kernel.
-
-        The facts travel inside the .so, so a host can check them at load time
-        rather than trusting a line that scrolled past during the build.
-        Returns None for a kernel built before contracts existed.
-        """
-        return self.get_metadata().get("contract")
-
-    def require_contract(self, finite_output=False):
-        """Raise unless the kernel's contract is complete.
-
-        Use it as an admission check at the boundary of a system that is not
-        allowed to run kernels with unproven behaviour.
-        """
-        c = self.contract()
-        if c is None:
-            raise RuntimeError(
-                "this kernel carries no contract; rebuild it with a current rhoc"
-            )
-        problems = []
-        if not c.get("divisions_proven_safe", False):
-            problems.append("a division may divide by zero")
-        if c.get("open_obligations", 0):
-            problems.append(f"{c['open_obligations']} obligation(s) unproven")
-        if finite_output and not c.get("output_proven_finite", False):
-            lo, hi = c.get("output_range", [None, None])
-            problems.append(f"output range is not bounded on both ends ({lo}, {hi})")
-        if problems:
-            raise RuntimeError("incomplete contract: " + "; ".join(problems))
-        return c
 
     def element_count(self):
         """Cells the kernel sweeps. Buffers shorter than this are rejected."""

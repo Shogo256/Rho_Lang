@@ -21,10 +21,7 @@ def main():
     # the tolerance is the threshold symbol 𝜏.
     engine = RhoEngine(kernel_so_path="libjacobi.so")
     engine.compile_rho_file("examples/jacobi.rho", tau=1e-12, max_iter=200)
-    contract = engine.contract()
-    print("\n[Step 1] What the compiler proved about the loop:")
-    for claim in contract.get("iterations", []):
-        print(f"  ⇒ {claim['target']}: converges={claim['converges']} factor={claim['factor']}")
+    print("\n[Step 1] Built with", engine.get_metadata().get("iteration"))
 
     print("\n[Step 2] Running...")
     engine.execute_kernel_with_args(b, x)
@@ -36,13 +33,12 @@ def main():
     )
     print(f"  largest residual of the system: {residual:.3e}")
 
-    ok = engine.converged() and residual < 1e-10 and contract["iterations"][0]["converges"]
-    if ok:
+    if engine.converged() and residual < 1e-10:
         print("\n=====================================================")
-        print("  [SUCCESS] Settled on the tolerance, as the proof said it would")
+        print("  [SUCCESS] Settled on the tolerance")
         print("=====================================================")
     else:
-        print("\n[ERROR] the iteration did not behave as proved")
+        print("\n[ERROR] the iteration did not settle")
         sys.exit(1)
 
 

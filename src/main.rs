@@ -32,10 +32,6 @@ struct Args {
     #[arg(long)]
     dump_dag: bool,
 
-    /// Refuse to emit a kernel whose contract has unproven obligations
-    #[arg(long)]
-    require_contract: bool,
-
     /// Compute at single precision. Halves the memory traffic these kernels
     /// are bound by, and widens the doubt every proof carries.
     #[arg(long)]
@@ -137,53 +133,17 @@ fn run(args: &Args) -> anyhow::Result<()> {
     } else {
         println!("  └─ Passed with {open_questions} unproven obligation(s)");
     }
-    // Convergence is reported on its own: a loop that is not shown to
-    // converge still ends, at its cap, so nothing unsafe follows.
-    for (finding, claim) in report.iterations.iter().zip(&report.contract.iterations) {
-        let range = format!(
-            "[{}, {}]",
-            fmt_bound(claim.invariant.lo),
-            fmt_bound(claim.invariant.hi)
-        );
-        match (&finding.verdict, claim.factor) {
-            (Verdict::Proved, Some(c)) => println!(
-                "  └─ [proved]   ⇒ {} converges: each sweep contracts by {c} (∞-norm), iterates stay in {range}",
-                claim.target
-            ),
-            (Verdict::Unproven(why), _) => println!(
-                "  └─ [open]     ⇒ {} convergence not shown — {why}; iterates stay in {range}",
-                claim.target
-            ),
-            (other, _) => println!("  └─ [{other:?}] {}", finding.subject),
-        }
-    }
-
-    let contract = &report.contract;
     println!(
-        "  └─ Contract: output ∈ [{}, {}], divisions {}",
-        fmt_bound(contract.output_range.lo),
-        fmt_bound(contract.output_range.hi),
-        if contract.divisions_proven_safe {
-            "proven safe"
-        } else {
-            "not proven safe"
-        }
+        "  └─ Output ∈ [{}, {}]",
+        fmt_bound(report.output_range.lo),
+        fmt_bound(report.output_range.hi)
     );
-    if args.require_contract && !contract.is_complete() {
-        anyhow::bail!(
-            "--require-contract: {} obligation(s) unproven and divisions {}. \
-             Refusing to emit a kernel whose contract is incomplete.",
-            contract.open_obligations,
-            if contract.divisions_proven_safe { "safe" } else { "unproven" }
-        );
-    }
 
     // 4. CodeGen & Native Compilation
     println!("[Phase 4] LLVM Hardware Mapping...");
     let mut codegen = LlvmCodeGen::new("rho_kernel")
         .with_tau(args.tau)
-        .with_precision(precision)
-        .with_contract(report.contract.to_json());
+        .with_precision(precision);
     if args.no_simd {
         codegen = codegen.without_simd();
     }

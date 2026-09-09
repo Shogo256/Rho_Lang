@@ -1049,88 +1049,23 @@ fn test_statements_record_their_source_line() {
 }
 
 // --------------------------------------------------------------------------
-// Contracts. What the solver proves has to reach whoever loads the kernel,
+// The output range. What the intervals conclude about the last flow,
 // not just whoever watched the build.
 // --------------------------------------------------------------------------
 
 #[test]
-fn test_contract_states_the_output_range() {
+fn test_the_analysis_states_the_output_range() {
     let source = r#"{
         INPUT:◯ □ 4 1
         (INPUT ^ 2) → OUTPUT
         OUTPUT → =
     }"#;
     let block = parse_rho_program(source).unwrap();
-    let contract = ConstraintSolver::analyze(&block, 0.0).contract;
+    let report = ConstraintSolver::analyze(&block, 0.0);
 
-    assert_eq!(contract.output_range.lo, 0.0, "a square is never negative");
-    assert!(contract.output_range.hi.is_infinite());
-    assert!(!contract.output_proven_finite);
-    assert!(contract.divisions_proven_safe, "there are no divisions to fail");
-}
-
-#[test]
-fn test_contract_flags_a_division_that_can_vanish() {
-    let source = r#"{
-        INPUT:◯ □ 8 1
-        (▷INPUT - INPUT) → D
-        (INPUT / D) → OUTPUT
-        OUTPUT → =
-    }"#;
-    let block = parse_rho_program(source).unwrap();
-    let contract = ConstraintSolver::analyze(&block, 0.0).contract;
-
-    assert!(!contract.divisions_proven_safe);
-    assert!(!contract.is_complete());
-    assert!(contract.open_obligations >= 1);
-}
-
-#[test]
-fn test_contract_is_complete_when_everything_is_proved() {
-    let source = r#"{
-        INPUT:◯ □ 4 1
-        (INPUT ^ 2) → SQ
-        (SQ / ((INPUT ^ 2) + 1.0)) → OUTPUT
-        ! (OUTPUT >= 0)
-        OUTPUT → =
-    }"#;
-    let block = parse_rho_program(source).unwrap();
-    let contract = ConstraintSolver::analyze(&block, 0.0).contract;
-
-    assert!(contract.divisions_proven_safe, "x^2 + 1 is never zero");
-    assert_eq!(contract.open_obligations, 0);
-    assert!(contract.is_complete());
-    assert_eq!(contract.output_range.lo, 0.0);
-}
-
-#[test]
-fn test_contract_travels_inside_the_shared_library() {
-    let source = r#"{
-        INPUT:◯ □ 4 1
-        (INPUT ^ 2) → OUTPUT
-        OUTPUT → =
-    }"#;
-    let block = parse_rho_program(source).unwrap();
-    let contract = ConstraintSolver::analyze(&block, 0.0).contract;
-
-    let mut codegen = LlvmCodeGen::new("contract_abi").with_contract(contract.to_json());
-    let ir = codegen.generate_llvm_ir(&block).unwrap();
-    let so_path = "target/contract_abi.so";
-    assert!(codegen.compile_to_so(&ir, so_path).is_ok());
-
-    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
-    let meta: libloading::Symbol<unsafe extern "C" fn() -> *const std::os::raw::c_char> =
-        unsafe { lib.get(b"rho_kernel_metadata").unwrap() };
-    let json = unsafe { std::ffi::CStr::from_ptr(meta()) }
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    // A caller can read the guarantee without having watched the build.
-    assert!(json.contains("\"contract\""), "{json}");
-    assert!(json.contains("\"divisions_proven_safe\":true"), "{json}");
-    assert!(json.contains("\"output_range\":[0,null]"), "{json}");
-    assert!(json.contains("no NaN input"), "assumptions must ship too: {json}");
+    assert_eq!(report.output_range.lo, 0.0, "a square is never negative");
+    assert!(report.output_range.hi.is_infinite());
+    assert!(report.divisions.is_empty(), "there are no divisions to fail");
 }
 
 #[test]
@@ -1146,7 +1081,7 @@ fn test_division_by_a_square_plus_one_is_proved_safe() {
     let block = parse_rho_program(source).unwrap();
     let report = ConstraintSolver::analyze(&block, 0.0);
     assert_eq!(report.constraints[0].verdict, Verdict::Proved);
-    assert_eq!(report.contract.output_range.lo, 0.0);
+    assert_eq!(report.output_range.lo, 0.0);
 }
 
 // --------------------------------------------------------------------------
@@ -1871,7 +1806,7 @@ fn test_the_solver_learned_what_these_functions_do() {
     }"#,
     );
     assert_eq!(indicator.constraints[0].verdict, Verdict::Proved);
-    assert_eq!(indicator.contract.output_range.hi, 1.0);
+    assert_eq!(indicator.output_range.hi, 1.0);
 }
 
 #[test]
@@ -2009,9 +1944,9 @@ fn test_the_interpreter_follows_the_kernel_into_single_precision() {
 }
 
 #[test]
-fn test_a_proof_carries_the_width_it_was_made_at() {
+fn test_the_analysis_follows_the_width_it_was_made_at() {
     // The rounding model follows the precision: 2^-24 instead of 2^-53. A
-    // bound proved at f64 is not the same bound at f32, and the contract says
+    // bound found at f64 is not the same bound at f32, and the report says
     // which one it is.
     let source = r#"{
         INPUT:◯ □ 4 1
@@ -2020,8 +1955,8 @@ fn test_a_proof_carries_the_width_it_was_made_at() {
     }"#;
     let block = parse_rho_program(source).unwrap();
 
-    let wide = ConstraintSolver::analyze_at(&block, 0.0, Precision::F64).contract;
-    let narrow = ConstraintSolver::analyze_at(&block, 0.0, Precision::F32).contract;
+    let wide = ConstraintSolver::analyze_at(&block, 0.0, Precision::F64);
+    let narrow = ConstraintSolver::analyze_at(&block, 0.0, Precision::F32);
 
     assert_eq!(wide.precision, Precision::F64);
     assert_eq!(narrow.precision, Precision::F32);
@@ -2031,7 +1966,6 @@ fn test_a_proof_carries_the_width_it_was_made_at() {
         narrow.output_range.lo,
         wide.output_range.lo
     );
-    assert!(narrow.to_json().contains("\"precision\":\"f32\""));
 }
 
 // --------------------------------------------------------------------------
@@ -2666,136 +2600,4 @@ fn test_a_kernel_without_iteration_reports_none() {
     assert_eq!(out, vec![2.0, 3.0, 4.0, 5.0]);
     assert_eq!(sweeps, 0);
     assert!(converged);
-}
-
-// --------------------------------------------------------------------------
-// What is proved about an iteration: a range every iterate stays in, and —
-// when one sweep contracts in the ∞-norm — convergence from any start.
-// --------------------------------------------------------------------------
-
-use rho_lang::solver::Verdict as Proof;
-
-#[test]
-fn test_jacobi_on_a_diagonally_dominant_system_is_proved_to_converge() {
-    let block = parse_rho_program(JACOBI_1D).unwrap();
-    let report = ConstraintSolver::analyze(&block, 0.0);
-
-    assert_eq!(report.iterations.len(), 1);
-    assert_eq!(report.iterations[0].verdict, Proof::Proved, "{:?}", report.iterations[0]);
-    assert_eq!(report.iterations[0].line, 4);
-
-    let claim = &report.contract.iterations[0];
-    assert_eq!(claim.target, "X");
-    assert!(claim.converges);
-    // Two neighbours, each weighted 1/4: the sweep contracts by 1/2.
-    assert_eq!(claim.factor, Some(0.5));
-
-    let json = report.contract.to_json();
-    assert!(
-        json.contains("\"iterations\":[{\"target\":\"X\",\"converges\":true,\"factor\":0.5,\"invariant\":[null,null]}]"),
-        "{json}"
-    );
-    // Convergence is not a safety obligation: the contract is complete
-    // without it and, here, with it.
-    assert!(report.contract.is_complete());
-}
-
-#[test]
-fn test_laplace_is_kept_in_range_but_not_proved_to_converge() {
-    // The start lies in [0, 1] and averaging keeps it there. Its coefficients
-    // sum to exactly 1, so the ∞-norm argument does not prove convergence,
-    // and the checker says so rather than claiming what it cannot show.
-    let source = r#"{
-        INPUT:◯ □ 8 8
-        (ind (INPUT > 0.0)) → U
-        ((▷0U + ▽0U + ▷1U + ▽1U) / 4.0) ⇒ U
-        U → =
-    }"#;
-    let block = parse_rho_program(source).unwrap();
-    let report = ConstraintSolver::analyze(&block, 0.0);
-
-    let finding = &report.iterations[0];
-    match &finding.verdict {
-        Proof::Unproven(why) => assert!(why.contains("exactly 1"), "{why}"),
-        other => panic!("Laplace must not be claimed to contract: {other:?}"),
-    }
-    let claim = &report.contract.iterations[0];
-    assert!(!claim.converges);
-    assert_eq!(claim.factor, Some(1.0));
-    assert_eq!((claim.invariant.lo, claim.invariant.hi), (0.0, 1.0));
-
-    // The invariant is what the caller receives: the output range is [0, 1]
-    // whatever the sweep count, and the contract is still complete.
-    assert_eq!(
-        (report.contract.output_range.lo, report.contract.output_range.hi),
-        (0.0, 1.0)
-    );
-    assert!(report.contract.output_proven_finite);
-    assert!(report.contract.is_complete());
-}
-
-#[test]
-fn test_a_division_inside_a_loop_is_judged_on_the_invariant() {
-    // U starts in [0, 1] and (U + 1) / (U + 2) maps [0, 1] into [1/3, 1], so
-    // every iterate stays in [0, 1] and the denominator never vanishes.
-    let source = r#"{
-        INPUT:◯ □ 6 1
-        (ind (INPUT > 0.0)) → U
-        ((U + 1.0) / (U + 2.0)) ⇒ U
-        U → =
-    }"#;
-    let block = parse_rho_program(source).unwrap();
-    let report = ConstraintSolver::analyze(&block, 0.0);
-    assert_eq!(report.divisions.len(), 1);
-    assert_eq!(report.divisions[0].verdict, Proof::Proved, "{:?}", report.divisions[0]);
-    assert!(report.contract.divisions_proven_safe);
-    let claim = &report.contract.iterations[0];
-    assert_eq!((claim.invariant.lo, claim.invariant.hi), (0.0, 1.0));
-    // Dividing by the iterate is beyond the contraction argument made here.
-    assert!(!claim.converges);
-
-    // Without the invariant the same denominator is unbounded: an iteration
-    // that starts anywhere gives the checker nothing to hold on to.
-    let anywhere = r#"{
-        INPUT:◯ □ 6 1
-        INPUT → U
-        ((U + 1.0) / (U + 2.0)) ⇒ U
-        U → =
-    }"#;
-    let block = parse_rho_program(anywhere).unwrap();
-    let report = ConstraintSolver::analyze(&block, 0.0);
-    assert_ne!(report.divisions[0].verdict, Proof::Proved);
-    let claim = &report.contract.iterations[0];
-    assert!(claim.invariant.lo.is_infinite() && claim.invariant.hi.is_infinite());
-}
-
-#[test]
-fn test_a_damped_average_is_proved_to_contract() {
-    // Nine tenths of the neighbours' mean: coefficients sum to 0.9.
-    let source = r#"{
-        INPUT:◯ □ 8 8
-        INPUT → U
-        (((▷0U + ▽0U + ▷1U + ▽1U) / 4.0) × 0.9) ⇒ U
-        U → =
-    }"#;
-    let block = parse_rho_program(source).unwrap();
-    let report = ConstraintSolver::analyze(&block, 0.0);
-    assert_eq!(report.iterations[0].verdict, Proof::Proved);
-    assert_eq!(report.contract.iterations[0].factor, Some(0.9));
-
-    // A product of the iterate with itself is not a contraction argument
-    // this checker makes, and it says why.
-    let squared = r#"{
-        INPUT:◯ □ 8 8
-        INPUT → U
-        ((U × U) / 4.0) ⇒ U
-        U → =
-    }"#;
-    let block = parse_rho_program(squared).unwrap();
-    let report = ConstraintSolver::analyze(&block, 0.0);
-    match &report.iterations[0].verdict {
-        Proof::Unproven(why) => assert!(why.contains("by itself"), "{why}"),
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(report.contract.iterations[0].factor, None);
 }

@@ -167,9 +167,6 @@ pub struct LlvmCodeGen {
     /// Spaces some flow writes. Every other space is read from memory the
     /// caller owns, which is what decides whether an entrypoint may run.
     written_spaces: BTreeSet<String>,
-    /// What the solver proved, embedded in the artifact so a caller can check
-    /// it at load time instead of trusting a line from the build log.
-    contract_json: Option<String>,
     /// Number of cells swept by every flow loop.
     elements: usize,
     /// Source line of the flow being lowered, so a lowering failure can point
@@ -191,7 +188,6 @@ impl LlvmCodeGen {
             max_sweeps: None,
             iterates: false,
             written_spaces: BTreeSet::new(),
-            contract_json: None,
             elements: 0,
             current_line: std::cell::Cell::new(0),
         }
@@ -204,11 +200,6 @@ impl LlvmCodeGen {
     }
 
     /// Record what the solver proved, so it ships with the kernel.
-    pub fn with_contract(mut self, contract_json: String) -> Self {
-        self.contract_json = Some(contract_json);
-        self
-    }
-
     /// Compute at the given width.
     pub fn with_precision(mut self, precision: Precision) -> Self {
         self.precision = precision;
@@ -2119,10 +2110,6 @@ impl LlvmCodeGen {
             .iter()
             .map(|(name, addr)| format!("{{\"name\":\"{name}\",\"address\":{addr}}}"))
             .collect();
-        let contract = match &self.contract_json {
-            Some(json) => format!(",\"contract\":{json}"),
-            None => String::new(),
-        };
         // A kernel that iterates says how far it may go and when it stops,
         // since both are part of what it computes.
         let iteration = match (self.iterates, self.max_sweeps) {
@@ -2133,12 +2120,11 @@ impl LlvmCodeGen {
             _ => String::new(),
         };
         format!(
-            "{{\"precision\":\"{}\",\"elements\":{},\"spaces\":[{}],\"bindings\":[{}]{}{}}}",
+            "{{\"precision\":\"{}\",\"elements\":{},\"spaces\":[{}],\"bindings\":[{}]{}}}",
             self.precision,
             self.elements,
             spaces.join(","),
             bindings.join(","),
-            contract,
             iteration
         )
     }

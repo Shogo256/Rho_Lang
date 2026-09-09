@@ -63,7 +63,9 @@ pub fn analyze(expansion: &Expansion) -> Report {
         constraints,
         divisions,
         domains,
-        // Filled in by ConstraintSolver::analyze once the findings are known.
+        // Filled in by ConstraintSolver::analyze, along with the contract,
+        // once the findings are known.
+        iterations: Vec::new(),
         contract: Contract {
             backend: "z3",
             precision: crate::numeric::Precision::F64,
@@ -71,6 +73,7 @@ pub fn analyze(expansion: &Expansion) -> Report {
             divisions_proven_safe: false,
             output_proven_finite: false,
             open_obligations: 0,
+            iterations: Vec::new(),
             assumes: CONTRACT_ASSUMPTIONS,
         },
     }
@@ -160,6 +163,20 @@ impl<'ctx> Translator<'ctx> {
     fn build(&mut self, sym: &Sym) -> Real<'ctx> {
         match sym {
             Sym::Free(name) => self.var(name),
+            // An iterate is a real like any other, kept inside the range the
+            // loop was shown to preserve.
+            Sym::Bounded { name, lo, hi } => {
+                let value = self.var(name);
+                if lo.is_finite() {
+                    let bound = self.constant(*lo);
+                    self.rounding_bounds.push(value.ge(&bound));
+                }
+                if hi.is_finite() {
+                    let bound = self.constant(*hi);
+                    self.rounding_bounds.push(value.le(&bound));
+                }
+                value
+            }
             Sym::Const(v) => self.constant(*v),
             Sym::Add(a, b) => {
                 let (a, b) = (self.build(a), self.build(b));

@@ -47,6 +47,10 @@ pub trait Numeric: Clone + fmt::Debug {
 
     fn boolean(value: bool) -> Self::Bool;
     fn or(a: &Self::Bool, b: &Self::Bool) -> Self::Bool;
+    /// The flag's value when it is known — which it always is on numbers and
+    /// never is on symbols, short of a constant. The exit of a `⇒` loop is
+    /// the one decision in the language that asks.
+    fn truth(flag: &Self::Bool) -> Option<bool>;
 }
 
 impl Numeric for f64 {
@@ -112,6 +116,9 @@ impl Numeric for f64 {
     }
     fn or(a: &bool, b: &bool) -> bool {
         *a || *b
+    }
+    fn truth(flag: &bool) -> Option<bool> {
+        Some(*flag)
     }
 }
 
@@ -237,6 +244,9 @@ impl Numeric for f32 {
     }
     fn or(a: &bool, b: &bool) -> bool {
         *a || *b
+    }
+    fn truth(flag: &bool) -> Option<bool> {
+        Some(*flag)
     }
 }
 
@@ -400,6 +410,12 @@ impl Numeric for Term {
 
     fn or(a: &Predicate, b: &Predicate) -> Predicate {
         Predicate(Rc::new(BoolNode::Or(a.clone(), b.clone())))
+    }
+    fn truth(flag: &Predicate) -> Option<bool> {
+        match &*flag.0 {
+            BoolNode::Const(v) => Some(*v),
+            _ => None,
+        }
     }
 }
 

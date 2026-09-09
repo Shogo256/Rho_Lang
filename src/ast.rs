@@ -239,6 +239,16 @@ pub enum Statement {
         src: Expr,
         target: FlowTarget,
     },
+    /// `expr ⇒ NAME`: sweep `expr` into NAME again and again until no cell
+    /// moves by more than 𝜏, or the cap on sweeps is reached. Every sweep reads
+    /// the whole of the previous one — a Jacobi step, never a Gauss–Seidel one
+    /// — so `→`'s rule that a shift sees a finished grid still holds inside
+    /// the loop. NAME must have been written by an earlier flow: the starting
+    /// point of an iteration is part of its meaning and is spelled out.
+    Iterate {
+        src: Expr,
+        target: String,
+    },
     Constraint(Expr), // ! (Expr)
     AuditTrace(Expr), // $ Expr
 }

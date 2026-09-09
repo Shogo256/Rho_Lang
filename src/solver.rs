@@ -14,7 +14,8 @@
 use crate::ast::*;
 use crate::error::{HarmonyDisruption, Result};
 use crate::numeric::Precision;
-use crate::symbolic::{expand, Cmp, Domain, Sym};
+use crate::symbolic::{expand, Cmp, Domain, Iteration, Sym};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(feature = "z3-solver")]
 mod smt;
@@ -52,8 +53,23 @@ pub struct Contract {
     pub output_proven_finite: bool,
     /// Constraints the solver could not settle either way.
     pub open_obligations: usize,
+    /// One claim per `⇒`, in source order.
+    pub iterations: Vec<IterationClaim>,
     /// What every claim above rests on.
     pub assumes: &'static [&'static str],
+}
+
+/// What the contract says about one `⇒`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IterationClaim {
+    pub target: String,
+    /// Proved to converge from any start: the update contracts in the ∞-norm.
+    pub converges: bool,
+    /// The contraction factor per sweep when one was bounded, whether or not
+    /// it is below 1.
+    pub factor: Option<f64>,
+    /// Every iterate stays in this range; infinite ends mean "not bounded".
+    pub invariant: Interval,
 }
 
 /// Facts a proof depends on but does not establish.
@@ -78,8 +94,22 @@ impl Contract {
             }
         };
         let assumes: Vec<String> = self.assumes.iter().map(|a| format!("\"{a}\"")).collect();
+        let iterations: Vec<String> = self
+            .iterations
+            .iter()
+            .map(|it| {
+                format!(
+                    "{{\"target\":\"{}\",\"converges\":{},\"factor\":{},\"invariant\":[{},{}]}}",
+                    it.target,
+                    it.converges,
+                    it.factor.map(bound).unwrap_or_else(|| "null".to_string()),
+                    bound(it.invariant.lo),
+                    bound(it.invariant.hi)
+                )
+            })
+            .collect();
         format!(
-            "{{\"backend\":\"{}\",\"precision\":\"{}\",\"output_range\":[{},{}],\"divisions_proven_safe\":{},\"output_proven_finite\":{},\"open_obligations\":{},\"assumes\":[{}]}}",
+            "{{\"backend\":\"{}\",\"precision\":\"{}\",\"output_range\":[{},{}],\"divisions_proven_safe\":{},\"output_proven_finite\":{},\"open_obligations\":{},\"iterations\":[{}],\"assumes\":[{}]}}",
             self.backend,
             self.precision,
             bound(self.output_range.lo),
@@ -87,6 +117,7 @@ impl Contract {
             self.divisions_proven_safe,
             self.output_proven_finite,
             self.open_obligations,
+            iterations.join(","),
             assumes.join(",")
         )
     }
@@ -99,6 +130,11 @@ pub struct Report {
     pub divisions: Vec<Finding>,
     /// Arguments that have to stay inside a named function's domain.
     pub domains: Vec<Finding>,
+    /// Whether each `⇒` was shown to converge. Never a violation: a loop that
+    /// is not shown to converge still ends, at its cap. Not counted among the
+    /// open obligations either, since nothing unsafe follows from it — the
+    /// contract says which it is.
+    pub iterations: Vec<Finding>,
     pub contract: Contract,
 }
 
@@ -129,6 +165,8 @@ impl ConstraintSolver {
         #[cfg(feature = "z3-solver")]
         {
             let mut report = smt::analyze(&expansion);
+            // Convergence is an interval argument whichever backend runs.
+            report.iterations = expansion.iterations.iter().map(check_convergence).collect();
             report.contract = build_contract(report.backend, &expansion, &report);
             report
         }
@@ -170,6 +208,7 @@ impl ConstraintSolver {
                 constraints,
                 divisions,
                 domains,
+                iterations: expansion.iterations.iter().map(check_convergence).collect(),
                 contract: Contract {
                     backend: "interval",
                     precision,
@@ -177,6 +216,7 @@ impl ConstraintSolver {
                     divisions_proven_safe: false,
                     output_proven_finite: false,
                     open_obligations: 0,
+                    iterations: Vec::new(),
                     assumes: CONTRACT_ASSUMPTIONS,
                 },
             };
@@ -237,6 +277,18 @@ fn build_contract(
         .filter(|f| !matches!(f.verdict, Verdict::Proved))
         .count();
 
+    let iterations = expansion
+        .iterations
+        .iter()
+        .zip(report.iterations.iter())
+        .map(|(it, finding)| IterationClaim {
+            target: it.target.clone(),
+            converges: matches!(finding.verdict, Verdict::Proved),
+            factor: contraction_factor(it).filter(|c| c.is_finite()),
+            invariant: it.invariant,
+        })
+        .collect();
+
     Contract {
         backend,
         precision: PRECISION.with(|p| p.get()),
@@ -244,8 +296,171 @@ fn build_contract(
         divisions_proven_safe,
         output_proven_finite: output_range.lo.is_finite() && output_range.hi.is_finite(),
         open_obligations,
+        iterations,
         assumes: CONTRACT_ASSUMPTIONS,
     }
+}
+
+// -------------------------------------------------------------- convergence
+
+/// Whether one `⇒` is proved to converge.
+///
+/// The argument is Banach's: if one sweep moves any two grids closer by a
+/// factor below 1 in the ∞-norm, the iteration converges from any start to
+/// its one fixed point. The factor is the largest, over the cells, of the sum
+/// of the coefficients' magnitudes on the iterate — read off the body when
+/// the body is a Lipschitz map of the iterate this checker can bound. Jacobi
+/// on a strictly diagonally dominant system passes; an averaging like
+/// Laplace's sums to exactly 1 and needs a spectral argument that is not made
+/// here. The bound is for exact arithmetic; each sweep also adds a rounding
+/// error of the order of the unit roundoff.
+fn check_convergence(iteration: &Iteration) -> Finding {
+    let subject = format!("⇒ {} converges", iteration.target);
+    let verdict = match contraction_factor(iteration) {
+        None => Verdict::Unproven(
+            "the update is not a map of the iterate this checker can bound: it multiplies \
+             the iterate by itself, divides by it, masks on it, folds it, or passes it \
+             through a function that is not 1-Lipschitz"
+                .to_string(),
+        ),
+        Some(c) => {
+            if c < 1.0 {
+                Verdict::Proved
+            } else if c.is_infinite() {
+                Verdict::Unproven(
+                    "a coefficient on the iterate is unbounded, so no contraction factor follows"
+                        .to_string(),
+                )
+            } else if c == 1.0 {
+                Verdict::Unproven(
+                    "the coefficients on the iterate sum to exactly 1 in the ∞-norm; an averaging \
+                     like this converges by a spectral argument this checker does not make"
+                        .to_string(),
+                )
+            } else {
+                Verdict::Unproven(format!(
+                    "the coefficients on the iterate sum to {c} in the ∞-norm, not below 1"
+                ))
+            }
+        }
+    };
+    Finding {
+        subject,
+        verdict,
+        line: iteration.line,
+    }
+}
+
+/// The ∞-norm contraction factor of one sweep, when the body is a Lipschitz
+/// map of the iterate this checker can bound.
+fn contraction_factor(iteration: &Iteration) -> Option<f64> {
+    let bounds = lipschitz(&iteration.body, &iteration.folds_of_iterate)?;
+    Some(bounds.values().sum())
+}
+
+/// Per-cell Lipschitz constants of `sym` with respect to the iterate's free
+/// cells: an upper bound on how far a change in each cell can move the value.
+/// `None` when the operators used give no such bound.
+fn lipschitz(sym: &Sym, folds_of_iterate: &BTreeSet<usize>) -> Option<BTreeMap<String, f64>> {
+    let of = |s: &Sym| lipschitz(s, folds_of_iterate);
+    let magnitude = |iv: Interval| iv.lo.abs().max(iv.hi.abs());
+    let scaled = |bounds: BTreeMap<String, f64>, by: f64| -> BTreeMap<String, f64> {
+        bounds.into_iter().map(|(k, v)| (k, v * by)).collect()
+    };
+    let summed = |mut a: BTreeMap<String, f64>, b: BTreeMap<String, f64>| {
+        for (k, v) in b {
+            *a.entry(k).or_insert(0.0) += v;
+        }
+        a
+    };
+
+    Some(match sym {
+        Sym::Free(name) if name.starts_with('~') => BTreeMap::from([(name.clone(), 1.0)]),
+        Sym::Free(_) | Sym::Bounded { .. } | Sym::Const(_) => BTreeMap::new(),
+        // A fold of the iterate mixes every cell into one; nothing here
+        // bounds that.
+        Sym::Fold { id, .. } => {
+            if folds_of_iterate.contains(id) {
+                return None;
+            }
+            BTreeMap::new()
+        }
+        Sym::Add(a, b) | Sym::Sub(a, b) => summed(of(a)?, of(b)?),
+        Sym::Mul(a, b) => {
+            let (la, lb) = (of(a)?, of(b)?);
+            match (la.is_empty(), lb.is_empty()) {
+                (true, true) => BTreeMap::new(),
+                (true, false) => scaled(lb, magnitude(eval_interval(a))),
+                (false, true) => scaled(la, magnitude(eval_interval(b))),
+                // A product of two terms in the iterate is not Lipschitz.
+                (false, false) => return None,
+            }
+        }
+        Sym::Div(a, b) => {
+            if !of(b)?.is_empty() {
+                return None;
+            }
+            let la = of(a)?;
+            if la.is_empty() {
+                return BTreeMap::new().into();
+            }
+            let d = eval_interval(b);
+            let least = if d.lo > 0.0 {
+                d.lo
+            } else if d.hi < 0.0 {
+                -d.hi
+            } else {
+                0.0
+            };
+            scaled(la, 1.0 / least)
+        }
+        Sym::Pow(base, exp) => {
+            if !of(exp)?.is_empty() {
+                return None;
+            }
+            let lb = of(base)?;
+            if lb.is_empty() {
+                BTreeMap::new()
+            } else {
+                // Only the trivial powers keep a Lipschitz bound.
+                match **exp {
+                    Sym::Const(e) => {
+                        if e == 1.0 {
+                            lb
+                        } else if e == 0.0 {
+                            BTreeMap::new()
+                        } else {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        // Past the boundary the value is 0, a constant; inside it is the
+        // interior's, so the interior's bound covers both.
+        Sym::Boundary { interior, .. } => of(interior)?,
+        // A mask switches between a value and 0, which no Lipschitz constant
+        // covers once the iterate can move the switch.
+        Sym::Mask { lhs, rhs, .. } => {
+            if !of(lhs)?.is_empty() || !of(rhs)?.is_empty() {
+                return None;
+            }
+            BTreeMap::new()
+        }
+        Sym::Named { op, operand } => {
+            let inner = of(operand)?;
+            if inner.is_empty() {
+                BTreeMap::new()
+            } else {
+                match op {
+                    // 1-Lipschitz: they never move further than their argument.
+                    BuiltinOp::Abs | BuiltinOp::Sin | BuiltinOp::Cos => inner,
+                    _ => return None,
+                }
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------- intervals
@@ -372,6 +587,22 @@ fn unit_roundoff() -> f64 {
     ROUNDOFF.with(|r| r.get())
 }
 
+/// Evaluate `f` with the rounding model set to `u`. Zero drops the model,
+/// which is sound for a binary64 kernel whose operations are all correctly
+/// rounded: rounding is then monotone, and bounds that are binary64 values
+/// are preserved by it.
+pub fn with_roundoff<T>(u: f64, f: impl FnOnce() -> T) -> T {
+    let previous = ROUNDOFF.with(|r| r.replace(u));
+    let result = f();
+    ROUNDOFF.with(|r| r.set(previous));
+    result
+}
+
+/// The width the analysis is currently reasoning at.
+pub fn current_precision() -> Precision {
+    PRECISION.with(|p| p.get())
+}
+
 /// Widen a range to cover the rounding the hardware will apply to it.
 ///
 /// Without this the analysis reasons about ℝ while the kernel computes in
@@ -457,6 +688,7 @@ fn pow(base: Interval, exp: Interval) -> Interval {
 pub fn eval_interval(sym: &Sym) -> Interval {
     match sym {
         Sym::Free(_) => Interval::UNBOUNDED,
+        Sym::Bounded { lo, hi, .. } => Interval { lo: *lo, hi: *hi },
         Sym::Const(v) => Interval::point(*v),
         Sym::Add(a, b) => {
             let (a, b) = (eval_interval(a), eval_interval(b));

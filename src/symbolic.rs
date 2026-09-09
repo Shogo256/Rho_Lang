@@ -8,7 +8,8 @@
 //! this tree corresponds to a real input.
 
 use crate::ast::*;
-use std::collections::BTreeMap;
+use crate::solver::{current_precision, eval_interval, with_roundoff, Interval};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// Comparison used by a masking operator or a constraint.
@@ -55,6 +56,11 @@ impl fmt::Display for Cmp {
 pub enum Sym {
     /// A cell of an unwritten space, named `SPACE@offset`. Ranges over all reals.
     Free(String),
+    /// A value known only by the range it lies in: what a `⇒` leaves in its
+    /// target. The range is the loop's invariant when one was found, and
+    /// unbounded otherwise — sound either way, since a fixed point of the
+    /// body lies wherever every iterate does.
+    Bounded { name: String, lo: f64, hi: f64 },
     Const(f64),
     Add(Box<Sym>, Box<Sym>),
     Sub(Box<Sym>, Box<Sym>),
@@ -113,8 +119,27 @@ pub struct Obligation {
     pub line: usize,
 }
 
+/// What the expansion established about one `⇒`.
+pub struct Iteration {
+    pub target: String,
+    pub line: usize,
+    /// The loop's body as one cell sees it, with the iterate's cells left
+    /// free and named `~TARGET@offset`. A contraction bound is read off this.
+    pub body: Sym,
+    /// Ids of the folds in `body` whose operand reads the iterate.
+    pub folds_of_iterate: BTreeSet<usize>,
+    /// A range the loop keeps its target in: the start lies in it and the
+    /// body maps it into itself, so every iterate does, and everything after
+    /// the loop may assume it. Unbounded when none was found.
+    pub invariant: Interval,
+    /// How the invariant was checked.
+    pub invariant_by: &'static str,
+}
+
 pub struct Expansion {
     pub obligations: Vec<Obligation>,
+    /// One entry per `⇒`, in source order.
+    pub iterations: Vec<Iteration>,
     /// Every division that appears in a lowered flow: text, denominator, line.
     pub divisions: Vec<(String, Sym, usize)>,
     /// Every argument that has to stay inside a function's domain: the call as
@@ -128,6 +153,17 @@ pub struct Expansion {
 struct Builder<'a> {
     /// Flow definitions in source order: (target, source expression).
     defs: &'a [(String, Expr)],
+    /// Which definitions are a `⇒` rather than a `→`.
+    looped: &'a [bool],
+    /// The invariant range found for each `⇒`, by definition index.
+    loop_ranges: BTreeMap<usize, (f64, f64)>,
+    /// While set, the iterate of this `⇒` expands to free cells rather than
+    /// to a bounded value, so the body can be read as a map of them.
+    linearising: Option<usize>,
+    /// How many times the iterate was read while linearising.
+    iterate_mentions: usize,
+    /// Folds whose operand read the iterate while linearising.
+    folds_of_iterate: BTreeSet<usize>,
     shapes: &'a BTreeMap<String, Vec<usize>>,
     fallback_shape: Vec<usize>,
     tau: f64,
@@ -135,6 +171,31 @@ struct Builder<'a> {
 }
 
 impl Builder<'_> {
+    /// Whether `name`, read while expanding definition `at`, is that
+    /// definition's own iterate rather than an earlier flow's value.
+    fn is_iterate_of(&self, at: usize, name: &str) -> bool {
+        self.looped.get(at).copied().unwrap_or(false) && self.defs[at].0 == name
+    }
+
+    /// What a `⇒` leaves in its target: a value known by its range alone —
+    /// or, while linearising that loop, a free cell of the iterate.
+    fn iterate_value(&mut self, idx: usize, name: &str, offset: i64) -> Sym {
+        if self.linearising == Some(idx) {
+            self.iterate_mentions += 1;
+            return Sym::Free(format!("~{name}@{}", offset_tag(offset)));
+        }
+        let (lo, hi) = self
+            .loop_ranges
+            .get(&idx)
+            .copied()
+            .unwrap_or((f64::NEG_INFINITY, f64::INFINITY));
+        Sym::Bounded {
+            name: format!("{name}⇒{idx}@{}", offset_tag(offset)),
+            lo,
+            hi,
+        }
+    }
+
     fn shape_of(&self, name: &str) -> Vec<usize> {
         self.shapes
             .get(name)
@@ -149,10 +210,18 @@ impl Builder<'_> {
         match expr {
             Expr::Number(v) => Sym::Const(*v),
             Expr::Var(name) if is_tau(name) => Sym::Const(self.tau),
-            Expr::Var(name) => match self.definition(name, before) {
-                Some((idx, def)) => self.build(&def, idx, offset),
-                None => Sym::Free(format!("{name}@{offset}")),
-            },
+            Expr::Var(name) => {
+                // Inside the body of a `⇒`, its own target is the iterate,
+                // not the starting value the previous flow wrote.
+                if self.is_iterate_of(before, name) {
+                    return self.iterate_value(before, name, offset);
+                }
+                match self.definition(name, before) {
+                    Some((idx, _)) if self.looped[idx] => self.iterate_value(idx, name, offset),
+                    Some((idx, def)) => self.build(&def, idx, offset),
+                    None => Sym::Free(format!("{name}@{offset}")),
+                }
+            }
             Expr::AuditTrace(inner) | Expr::Lift { operand: inner, .. } => {
                 self.build(inner, before, offset)
             }
@@ -205,8 +274,12 @@ impl Builder<'_> {
             // the program cannot expand it. It becomes an opaque value whose
             // range the interval backend still bounds.
             Expr::Scan { op, operand, .. } | Expr::Reduce { op, operand, .. } => {
+                let mentions_before = self.iterate_mentions;
                 let _ = self.build(operand, before, offset);
                 self.folds += 1;
+                if self.iterate_mentions > mentions_before {
+                    self.folds_of_iterate.insert(self.folds);
+                }
                 Sym::Fold {
                     op: *op,
                     id: self.folds,
@@ -265,6 +338,7 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
 
     // Flow definitions in order, and where each constraint sits among them.
     let mut defs: Vec<(String, Expr)> = Vec::new();
+    let mut looped: Vec<bool> = Vec::new();
     let mut def_lines: Vec<usize> = Vec::new();
     let mut constraints: Vec<(usize, Expr, usize)> = Vec::new();
     for (index, stmt) in block.statements.iter().enumerate() {
@@ -278,6 +352,15 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
                     .entry(name.clone())
                     .or_insert_with(|| fallback_shape.clone());
                 defs.push((name, src.clone()));
+                looped.push(false);
+                def_lines.push(block.line_of(index));
+            }
+            Statement::Iterate { src, target } => {
+                shapes
+                    .entry(target.clone())
+                    .or_insert_with(|| fallback_shape.clone());
+                defs.push((target.clone(), src.clone()));
+                looped.push(true);
                 def_lines.push(block.line_of(index));
             }
             Statement::Constraint(expr) => {
@@ -290,11 +373,50 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
     let defs_snapshot = defs.clone();
     let mut builder = Builder {
         defs: &defs_snapshot,
+        looped: &looped,
+        loop_ranges: BTreeMap::new(),
+        linearising: None,
+        iterate_mentions: 0,
+        folds_of_iterate: BTreeSet::new(),
         shapes: &shapes,
         fallback_shape,
         tau,
         folds: 0,
     };
+
+    // Each `⇒` in order: the range it keeps its target in, so that every
+    // later reading of the target is sound, and its body with the iterate
+    // free, so that a contraction bound can be read off.
+    let mut iterations = Vec::new();
+    for idx in 0..defs_snapshot.len() {
+        if !looped[idx] {
+            continue;
+        }
+        let (target, body_expr) = &defs_snapshot[idx];
+        // Where the loop starts from: the target as the flow before left it.
+        let start = match builder.definition(target, idx) {
+            Some((j, def)) => eval_interval(&builder.build(&def, j, 0)),
+            None => Interval::UNBOUNDED,
+        };
+        let exact = current_precision() == crate::numeric::Precision::F64
+            && only_correctly_rounded(body_expr);
+        let (invariant, invariant_by) = find_invariant(&mut builder, idx, body_expr, start, exact);
+        builder.loop_ranges.insert(idx, (invariant.lo, invariant.hi));
+
+        builder.linearising = Some(idx);
+        builder.iterate_mentions = 0;
+        builder.folds_of_iterate.clear();
+        let body = builder.build(body_expr, idx, 0);
+        builder.linearising = None;
+        iterations.push(Iteration {
+            target: target.clone(),
+            line: def_lines.get(idx).copied().unwrap_or(0),
+            body,
+            folds_of_iterate: builder.folds_of_iterate.clone(),
+            invariant,
+            invariant_by,
+        });
+    }
 
     // One entry per division written in the source, with its denominator
     // expanded in the context of the flow that performs it.
@@ -335,9 +457,92 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
 
     Expansion {
         obligations,
+        iterations,
         divisions,
         domains,
         output,
+    }
+}
+
+/// A range the loop maps into itself, starting from the range the target held.
+///
+/// The body is evaluated over a candidate range with the iterate bound to it;
+/// if the result lies inside, the candidate is an invariant. If not, the
+/// candidate grows to cover the result and the check repeats — and after a
+/// few rounds of growth an end that is still moving is given up as unbounded,
+/// rather than chased forever.
+///
+/// `exact` drops the rounding model: for a binary64 kernel whose body uses
+/// only correctly rounded operations, rounding is monotone, so an exact
+/// result inside a range of binary64 bounds rounds to a value inside it.
+/// Without that an averaging like Laplace's has no finite invariant, because
+/// the model pushes the top of the range a rounding above itself each round.
+fn find_invariant(
+    builder: &mut Builder,
+    idx: usize,
+    body: &Expr,
+    start: Interval,
+    exact: bool,
+) -> (Interval, &'static str) {
+    let by = if exact {
+        "the body maps the range into itself; rounding is monotone at binary64"
+    } else {
+        "the body maps the range into itself under the rounding model"
+    };
+    let mut range = start;
+    for step in 0..32 {
+        builder.loop_ranges.insert(idx, (range.lo, range.hi));
+        let sym = builder.build(body, idx, 0);
+        let next = if exact {
+            with_roundoff(0.0, || eval_interval(&sym))
+        } else {
+            eval_interval(&sym)
+        };
+        if next.lo >= range.lo && next.hi <= range.hi {
+            return (range, by);
+        }
+        let grown = Interval {
+            lo: range.lo.min(next.lo),
+            hi: range.hi.max(next.hi),
+        };
+        range = if step >= 6 {
+            Interval {
+                lo: if grown.lo < range.lo { f64::NEG_INFINITY } else { grown.lo },
+                hi: if grown.hi > range.hi { f64::INFINITY } else { grown.hi },
+            }
+        } else {
+            grown
+        };
+    }
+    (Interval::UNBOUNDED, "no invariant was found")
+}
+
+/// Whether every operation in `expr` is correctly rounded by the hardware:
+/// `+ - × /`, `sqrt`, `abs` and a whole-number power are; the transcendental
+/// functions and a fractional power come from a library and need not be.
+fn only_correctly_rounded(expr: &Expr) -> bool {
+    match expr {
+        Expr::Var(_) | Expr::Number(_) => true,
+        Expr::Builtin { op, operand } => {
+            matches!(op, BuiltinOp::Abs | BuiltinOp::Sqrt | BuiltinOp::Indicator)
+                && only_correctly_rounded(operand)
+        }
+        Expr::BinaryOp {
+            op: BinaryOpKind::Pow,
+            lhs,
+            rhs,
+        } => {
+            matches!(**rhs, Expr::Number(e) if e == e.trunc() && e.abs() <= 64.0)
+                && only_correctly_rounded(lhs)
+        }
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            only_correctly_rounded(lhs) && only_correctly_rounded(rhs)
+        }
+        Expr::Shift { operand, .. }
+        | Expr::Lift { operand, .. }
+        | Expr::Scan { operand, .. }
+        | Expr::Reduce { operand, .. }
+        | Expr::AuditTrace(operand) => only_correctly_rounded(operand),
     }
 }
 

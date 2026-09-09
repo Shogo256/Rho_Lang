@@ -2658,3 +2658,501 @@ fn test_the_validator_catches_damage_to_the_table_entrypoint_alone() {
         other => panic!("damage to the table entrypoint went unnoticed: {other:?}"),
     }
 }
+
+// --------------------------------------------------------------------------
+// Fixed points. `expr ⇒ U` sweeps `expr` into U until no cell moves by more
+// than 𝜏 or the cap on sweeps is reached. `=` stays what it was — the end of
+// the program — and an iteration is read from afterwards.
+// --------------------------------------------------------------------------
+
+use rho_lang::interp::{interpret_with, ByValue, Options};
+
+/// Jacobi for the tridiagonal system 4·x[i] + x[i-1] + x[i+1] = b[i], with
+/// x = 0 outside the grid. The update's coefficients on x sum to 1/2, so the
+/// iteration contracts in the ∞-norm and settles from any start.
+const JACOBI_1D: &str = r#"{
+    INPUT:◯ □ 6 1
+    INPUT → X
+    ((INPUT - (▷X + ▽X)) / 4.0) ⇒ X
+    X → =
+}"#;
+
+#[test]
+fn test_fixed_point_parses_and_ascii_arrow_equals_is_its_alias() {
+    let block = parse_rho_program(JACOBI_1D).unwrap();
+    assert!(matches!(
+        &block.statements[2],
+        rho_lang::ast::Statement::Iterate { target, .. } if target == "X"
+    ));
+
+    let ascii = JACOBI_1D.replace('⇒', "=>").replace('→', "->");
+    assert_eq!(parse_rho_program(&ascii).unwrap(), block);
+}
+
+#[test]
+fn test_fixed_point_needs_a_starting_value() {
+    // The starting point is part of what an iteration computes, so a program
+    // has to spell it out before iterating. Declared but never written is not
+    // a start: the loop would read whatever the caller left there.
+    let source = "{\n    INPUT:◯ □ 6 1\n    X:◯ □ 6 1\n    (INPUT - X) ⇒ X\n    X → =\n}";
+    let err = parse_rho_program(source).unwrap_err();
+    assert!(
+        matches!(&err, HarmonyDisruption::IterateErr { line: 4, .. }),
+        "{err}"
+    );
+    assert!(err.to_string().contains("starting value"), "{err}");
+
+    // A target that was never even declared is caught as an unknown space.
+    let undeclared = "{\n    INPUT:◯ □ 6 1\n    (INPUT - X) ⇒ X\n    X → =\n}";
+    assert!(matches!(
+        parse_rho_program(undeclared).unwrap_err(),
+        HarmonyDisruption::SpaceErr { line: 3, .. }
+    ));
+}
+
+#[test]
+fn test_fixed_point_cannot_iterate_the_equilibrium() {
+    let source = "{\n    INPUT:◯ □ 6 1\n    INPUT → X\n    (X / 2.0) ⇒ =\n}";
+    let err = parse_rho_program(source).unwrap_err();
+    assert!(
+        matches!(&err, HarmonyDisruption::IterateErr { line: 4, .. }),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_fixed_point_body_must_keep_the_shape() {
+    // The body writes back into the space it reads, so it cannot change shape.
+    let source = "{\n    INPUT:◯ □ 3 4\n    INPUT → X\n    (◇+1 X) ⇒ X\n    X → =\n}";
+    let err = parse_rho_program(source).unwrap_err();
+    assert!(
+        matches!(&err, HarmonyDisruption::DimensionErr { line: 4, .. }),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_the_interpreter_iterates_jacobi_to_the_solution() {
+    let block = parse_rho_program(JACOBI_1D).unwrap();
+    let b: Vec<f64> = vec![1.0, -2.0, 3.0, 0.5, -1.5, 2.0];
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![6, 1], b.clone()));
+
+    // Run to a tight tolerance: the residual of the system is then tiny.
+    let settled = interpret_with(
+        &block,
+        &env,
+        &Options {
+            tau: 1e-13,
+            max_sweeps: 10_000,
+        },
+        &mut ByValue,
+    )
+    .unwrap();
+    let x = &settled["OUTPUT"].cells;
+    for i in 0..6 {
+        let left = if i == 0 { 0.0 } else { x[i - 1] };
+        let right = if i == 5 { 0.0 } else { x[i + 1] };
+        let residual = 4.0 * x[i] + left + right - b[i];
+        assert!(residual.abs() < 1e-11, "cell {i}: residual {residual}");
+    }
+
+    // The cap is a cap: three sweeps is exactly three Jacobi steps.
+    let capped = interpret_with(
+        &block,
+        &env,
+        &Options {
+            tau: 0.0,
+            max_sweeps: 3,
+        },
+        &mut ByValue,
+    )
+    .unwrap();
+    let mut expected = b.clone();
+    for _ in 0..3 {
+        let previous = expected.clone();
+        for i in 0..6 {
+            let left = if i == 0 { 0.0 } else { previous[i - 1] };
+            let right = if i == 5 { 0.0 } else { previous[i + 1] };
+            expected[i] = (b[i] - (left + right)) / 4.0;
+        }
+    }
+    assert_eq!(capped["OUTPUT"].cells, expected);
+
+    // A tolerance the first sweep already meets stops it after one sweep.
+    let one = interpret_with(
+        &block,
+        &env,
+        &Options {
+            tau: 100.0,
+            max_sweeps: 50,
+        },
+        &mut ByValue,
+    )
+    .unwrap();
+    let mut after_one = b.clone();
+    for i in 0..6 {
+        let left = if i == 0 { 0.0 } else { b[i - 1] };
+        let right = if i == 5 { 0.0 } else { b[i + 1] };
+        after_one[i] = (b[i] - (left + right)) / 4.0;
+    }
+    assert_eq!(one["OUTPUT"].cells, after_one);
+}
+
+/// Compile `source` with a cap on sweeps and return the .so path.
+fn compile_iterating(name: &str, source: &str, tau: f64, cap: usize, simd: bool) -> String {
+    let block = parse_rho_program(source).unwrap();
+    let mut codegen = LlvmCodeGen::new(name).with_tau(tau).with_max_sweeps(cap);
+    if !simd {
+        codegen = codegen.without_simd();
+    }
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    let so_path = format!("target/{name}.so");
+    assert!(codegen.compile_to_so(&ir, &so_path).is_ok(), "{name} should link:\n{ir}");
+    so_path
+}
+
+/// Run a compiled kernel over `input` and return (output, sweeps, converged).
+fn run_iterating(so_path: &str, input: &[f64], out_cells: usize) -> (Vec<f64>, i64, bool) {
+    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
+    let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
+        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let sweeps: libloading::Symbol<unsafe extern "C" fn() -> i64> =
+        unsafe { lib.get(b"rho_kernel_sweeps").unwrap() };
+    let converged: libloading::Symbol<unsafe extern "C" fn() -> i64> =
+        unsafe { lib.get(b"rho_kernel_converged").unwrap() };
+    let mut output = vec![0.0f64; out_cells];
+    unsafe { func(input.as_ptr(), output.as_mut_ptr()) };
+    let (s, c) = unsafe { (sweeps(), converged()) };
+    (output, s, c != 0)
+}
+
+fn bits(v: &[f64]) -> Vec<u64> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+#[test]
+fn test_the_kernel_iterates_exactly_as_the_interpreter_does() {
+    let b: Vec<f64> = (0..6).map(|i| (i as f64 * 1.7).sin() * 3.0).collect();
+    let block = parse_rho_program(JACOBI_1D).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![6, 1], b.clone()));
+
+    // Settles well inside the cap: the kernel says so, and agrees on the bits.
+    let (tau, cap) = (1e-10, 500);
+    let meant = interpret_with(&block, &env, &Options { tau, max_sweeps: cap }, &mut ByValue)
+        .unwrap()["OUTPUT"]
+        .cells
+        .clone();
+    let so = compile_iterating("iter_jacobi", JACOBI_1D, tau, cap, true);
+    let (out, sweeps, converged) = run_iterating(&so, &b, 6);
+    assert_eq!(bits(&out), bits(&meant));
+    assert!(converged, "Jacobi contracts by 1/2 a sweep; it must settle");
+    assert!(sweeps > 1 && (sweeps as usize) < cap, "sweeps {sweeps}");
+
+    // Capped at three: three Jacobi steps, and the kernel says it did not settle.
+    let meant = interpret_with(&block, &env, &Options { tau: 0.0, max_sweeps: 3 }, &mut ByValue)
+        .unwrap()["OUTPUT"]
+        .cells
+        .clone();
+    let so = compile_iterating("iter_jacobi_capped", JACOBI_1D, 0.0, 3, true);
+    let (out, sweeps, converged) = run_iterating(&so, &b, 6);
+    assert_eq!(bits(&out), bits(&meant));
+    assert_eq!(sweeps, 3);
+    assert!(!converged);
+
+    // The scalar lowering computes the same bits as the vector one.
+    let so = compile_iterating("iter_jacobi_scalar", JACOBI_1D, tau, cap, false);
+    let (scalar, _, _) = run_iterating(&so, &b, 6);
+    let so = compile_iterating("iter_jacobi_vector", JACOBI_1D, tau, cap, true);
+    let (vector, _, _) = run_iterating(&so, &b, 6);
+    assert_eq!(bits(&scalar), bits(&vector));
+}
+
+#[test]
+fn test_a_relaxation_with_a_vector_body_and_a_fold_inside_the_loop() {
+    // Laplace on 8x8: long enough rows for the vector path, and a boundary
+    // held at zero by the shifts' padding.
+    let laplace = r#"{
+        INPUT:◯ □ 8 8
+        INPUT → U
+        ((▷0U + ▽0U + ▷1U + ▽1U) / 4.0) ⇒ U
+        U → =
+    }"#;
+    let input: Vec<f64> = (0..64).map(|i| ((i * 7) % 11) as f64 - 5.0).collect();
+    let block = parse_rho_program(laplace).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![8, 8], input.clone()));
+    let (tau, cap) = (1e-9, 5000);
+    let meant = interpret_with(&block, &env, &Options { tau, max_sweeps: cap }, &mut ByValue)
+        .unwrap()["OUTPUT"]
+        .cells
+        .clone();
+    let so = compile_iterating("iter_laplace", laplace, tau, cap, true);
+    let (out, sweeps, converged) = run_iterating(&so, &input, 64);
+    assert_eq!(bits(&out), bits(&meant));
+    assert!(converged && sweeps > 10, "sweeps {sweeps}, converged {converged}");
+    // Everything relaxes towards the zero boundary.
+    assert!(out.iter().all(|v| v.abs() < 1e-6), "{out:?}");
+
+    // A fold inside the body: normalise by the total magnitude each round.
+    // The buffer for the fold is reserved once, ahead of the loop.
+    let normalise = r#"{
+        INPUT:◯ □ 6 1
+        INPUT → X
+        (X / (□0 (◇+ (abs X)))) ⇒ X
+        X → =
+    }"#;
+    let input = vec![3.0, -1.0, 4.0, -1.0, 5.0, -9.0];
+    let block = parse_rho_program(normalise).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![6, 1], input.clone()));
+    let meant = interpret_with(&block, &env, &Options { tau: 1e-15, max_sweeps: 20 }, &mut ByValue)
+        .unwrap()["OUTPUT"]
+        .cells
+        .clone();
+    let ir = LlvmCodeGen::new("iter_normalise_ir")
+        .with_tau(1e-15)
+        .with_max_sweeps(20)
+        .generate_llvm_ir(&block)
+        .unwrap();
+    // One fold buffer per entrypoint body, reserved ahead of the loop rather
+    // than allocated afresh on every round.
+    let with_args = ir
+        .split("define void @rho_kernel_exec_with_args")
+        .nth(1)
+        .and_then(|s| s.split("\n}\n").next())
+        .unwrap();
+    let fold_buffers = with_args
+        .lines()
+        .filter(|l| l.contains("fold") && l.contains("alloca"))
+        .count();
+    assert_eq!(fold_buffers, 1, "{with_args}");
+    let loop_start = with_args.find("; Iterate").unwrap();
+    let last_alloca = with_args.rfind("alloca").unwrap();
+    assert!(last_alloca < loop_start, "every allocation precedes the loop:\n{with_args}");
+    let so = compile_iterating("iter_normalise", normalise, 1e-15, 20, true);
+    let (out, sweeps, converged) = run_iterating(&so, &input, 6);
+    assert_eq!(bits(&out), bits(&meant));
+    assert!(converged && sweeps <= 3, "sweeps {sweeps}");
+    let total: f64 = out.iter().map(|v| v.abs()).sum();
+    assert!((total - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn test_the_ir_reader_runs_the_loop_and_agrees_with_the_interpreter() {
+    let b: Vec<f64> = vec![1.0, -2.0, 3.0, 0.5, -1.5, 2.0];
+    let block = parse_rho_program(JACOBI_1D).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![6, 1], b.clone()));
+    let options = Options { tau: 1e-8, max_sweeps: 100 };
+    let meant = interpret_with(&block, &env, &options, &mut ByValue).unwrap()["OUTPUT"]
+        .cells
+        .clone();
+
+    let ir = LlvmCodeGen::new("iter_vm")
+        .with_tau(options.tau)
+        .with_max_sweeps(options.max_sweeps)
+        .generate_llvm_ir(&block)
+        .unwrap();
+    let functions = parse_module(&ir);
+    let entry = functions
+        .iter()
+        .find(|f| f.name == "rho_kernel_exec_with_args")
+        .unwrap();
+    let mut machine = Machine::new();
+    let src = machine.add_buffer(b.clone());
+    let dst = machine.add_buffer(vec![0.0; 6]);
+    machine
+        .run(entry, &[Value::P(src, 0), Value::P(dst, 0)])
+        .unwrap_or_else(|why| panic!("{why}\n{ir}"));
+    assert_eq!(bits(machine.buffer(dst)), bits(&meant));
+    // The counters the kernel keeps are readable after the run too.
+    assert!(machine.global("rho_sweeps") > 1);
+    assert_eq!(machine.global("rho_converged"), 1);
+}
+
+#[test]
+fn test_iteration_at_single_precision_agrees_with_the_interpreter() {
+    let b: Vec<f32> = vec![1.0, -2.0, 3.0, 0.5, -1.5, 2.0];
+    let block = parse_rho_program(JACOBI_1D).unwrap();
+    let mut env: Env<f32> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![6, 1], b.clone()));
+    let options = Options { tau: 1e-5, max_sweeps: 100 };
+    let meant = interpret_with(&block, &env, &options, &mut ByValue).unwrap()["OUTPUT"]
+        .cells
+        .clone();
+
+    let mut codegen = LlvmCodeGen::new("iter_f32")
+        .with_tau(options.tau)
+        .with_max_sweeps(options.max_sweeps)
+        .with_precision(rho_lang::numeric::Precision::F32);
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    let so_path = "target/iter_f32.so";
+    assert!(codegen.compile_to_so(&ir, so_path).is_ok(), "{ir}");
+    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
+    let func: libloading::Symbol<unsafe extern "C" fn(*const f32, *mut f32)> =
+        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let mut out = vec![0.0f32; 6];
+    unsafe { func(b.as_ptr(), out.as_mut_ptr()) };
+    assert_eq!(
+        out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        meant.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_a_program_that_iterates_needs_a_cap() {
+    let block = parse_rho_program(JACOBI_1D).unwrap();
+    let err = LlvmCodeGen::new("iter_no_cap").generate_llvm_ir(&block).unwrap_err();
+    assert!(matches!(&err, HarmonyDisruption::LoweringErr { line: 4, .. }), "{err}");
+    assert!(err.to_string().contains("--max-iter"), "{err}");
+
+    // The cap and the tolerance are part of what the kernel computes, so the
+    // artifact says what they were.
+    let mut codegen = LlvmCodeGen::new("iter_meta").with_tau(0.001).with_max_sweeps(42);
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    assert!(ir.contains("\\22iteration\\22:{\\22max_sweeps\\22:42,\\22tolerance\\22:0.001}"), "{ir}");
+}
+
+#[test]
+fn test_a_kernel_without_iteration_reports_none() {
+    let source = "{\n    INPUT:◯ □ 4 1\n    (INPUT + 1.0) → OUTPUT\n    OUTPUT → =\n}";
+    let so = compile_iterating("iter_none", source, 0.0, 10, true);
+    let (out, sweeps, converged) = run_iterating(&so, &[1.0, 2.0, 3.0, 4.0], 4);
+    assert_eq!(out, vec![2.0, 3.0, 4.0, 5.0]);
+    assert_eq!(sweeps, 0);
+    assert!(converged);
+}
+
+// --------------------------------------------------------------------------
+// What is proved about an iteration: a range every iterate stays in, and —
+// when one sweep contracts in the ∞-norm — convergence from any start.
+// --------------------------------------------------------------------------
+
+use rho_lang::solver::Verdict as Proof;
+
+#[test]
+fn test_jacobi_on_a_diagonally_dominant_system_is_proved_to_converge() {
+    let block = parse_rho_program(JACOBI_1D).unwrap();
+    let report = ConstraintSolver::analyze(&block, 0.0);
+
+    assert_eq!(report.iterations.len(), 1);
+    assert_eq!(report.iterations[0].verdict, Proof::Proved, "{:?}", report.iterations[0]);
+    assert_eq!(report.iterations[0].line, 4);
+
+    let claim = &report.contract.iterations[0];
+    assert_eq!(claim.target, "X");
+    assert!(claim.converges);
+    // Two neighbours, each weighted 1/4: the sweep contracts by 1/2.
+    assert_eq!(claim.factor, Some(0.5));
+
+    let json = report.contract.to_json();
+    assert!(
+        json.contains("\"iterations\":[{\"target\":\"X\",\"converges\":true,\"factor\":0.5,\"invariant\":[null,null]}]"),
+        "{json}"
+    );
+    // Convergence is not a safety obligation: the contract is complete
+    // without it and, here, with it.
+    assert!(report.contract.is_complete());
+}
+
+#[test]
+fn test_laplace_is_kept_in_range_but_not_proved_to_converge() {
+    // The start lies in [0, 1] and averaging keeps it there. Its coefficients
+    // sum to exactly 1, so the ∞-norm argument does not prove convergence,
+    // and the checker says so rather than claiming what it cannot show.
+    let source = r#"{
+        INPUT:◯ □ 8 8
+        (ind (INPUT > 0.0)) → U
+        ((▷0U + ▽0U + ▷1U + ▽1U) / 4.0) ⇒ U
+        U → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let report = ConstraintSolver::analyze(&block, 0.0);
+
+    let finding = &report.iterations[0];
+    match &finding.verdict {
+        Proof::Unproven(why) => assert!(why.contains("exactly 1"), "{why}"),
+        other => panic!("Laplace must not be claimed to contract: {other:?}"),
+    }
+    let claim = &report.contract.iterations[0];
+    assert!(!claim.converges);
+    assert_eq!(claim.factor, Some(1.0));
+    assert_eq!((claim.invariant.lo, claim.invariant.hi), (0.0, 1.0));
+
+    // The invariant is what the caller receives: the output range is [0, 1]
+    // whatever the sweep count, and the contract is still complete.
+    assert_eq!(
+        (report.contract.output_range.lo, report.contract.output_range.hi),
+        (0.0, 1.0)
+    );
+    assert!(report.contract.output_proven_finite);
+    assert!(report.contract.is_complete());
+}
+
+#[test]
+fn test_a_division_inside_a_loop_is_judged_on_the_invariant() {
+    // U starts in [0, 1] and (U + 1) / (U + 2) maps [0, 1] into [1/3, 1], so
+    // every iterate stays in [0, 1] and the denominator never vanishes.
+    let source = r#"{
+        INPUT:◯ □ 6 1
+        (ind (INPUT > 0.0)) → U
+        ((U + 1.0) / (U + 2.0)) ⇒ U
+        U → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let report = ConstraintSolver::analyze(&block, 0.0);
+    assert_eq!(report.divisions.len(), 1);
+    assert_eq!(report.divisions[0].verdict, Proof::Proved, "{:?}", report.divisions[0]);
+    assert!(report.contract.divisions_proven_safe);
+    let claim = &report.contract.iterations[0];
+    assert_eq!((claim.invariant.lo, claim.invariant.hi), (0.0, 1.0));
+    // Dividing by the iterate is beyond the contraction argument made here.
+    assert!(!claim.converges);
+
+    // Without the invariant the same denominator is unbounded: an iteration
+    // that starts anywhere gives the checker nothing to hold on to.
+    let anywhere = r#"{
+        INPUT:◯ □ 6 1
+        INPUT → U
+        ((U + 1.0) / (U + 2.0)) ⇒ U
+        U → =
+    }"#;
+    let block = parse_rho_program(anywhere).unwrap();
+    let report = ConstraintSolver::analyze(&block, 0.0);
+    assert_ne!(report.divisions[0].verdict, Proof::Proved);
+    let claim = &report.contract.iterations[0];
+    assert!(claim.invariant.lo.is_infinite() && claim.invariant.hi.is_infinite());
+}
+
+#[test]
+fn test_a_damped_average_is_proved_to_contract() {
+    // Nine tenths of the neighbours' mean: coefficients sum to 0.9.
+    let source = r#"{
+        INPUT:◯ □ 8 8
+        INPUT → U
+        (((▷0U + ▽0U + ▷1U + ▽1U) / 4.0) × 0.9) ⇒ U
+        U → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let report = ConstraintSolver::analyze(&block, 0.0);
+    assert_eq!(report.iterations[0].verdict, Proof::Proved);
+    assert_eq!(report.contract.iterations[0].factor, Some(0.9));
+
+    // A product of the iterate with itself is not a contraction argument
+    // this checker makes, and it says why.
+    let squared = r#"{
+        INPUT:◯ □ 8 8
+        INPUT → U
+        ((U × U) / 4.0) ⇒ U
+        U → =
+    }"#;
+    let block = parse_rho_program(squared).unwrap();
+    let report = ConstraintSolver::analyze(&block, 0.0);
+    match &report.iterations[0].verdict {
+        Proof::Unproven(why) => assert!(why.contains("by itself"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(report.contract.iterations[0].factor, None);
+}

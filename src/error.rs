@@ -39,6 +39,13 @@ pub enum HarmonyDisruption {
         line: usize,
     },
 
+    /// Iteration Disruption: a `⇒` whose starting point or target is not sound
+    #[error("[Harmony Disruption: Iteration Failure] {detail} (Line {line})")]
+    IterateErr {
+        detail: String,
+        line: usize,
+    },
+
     /// Lowering Disruption: construct cannot be mapped to hardware
     #[error("[Harmony Disruption: Lowering Failure] {detail} (Line {line})")]
     LoweringErr {
@@ -56,6 +63,7 @@ impl HarmonyDisruption {
             HarmonyDisruption::DimensionErr { line, .. } => *line,
             HarmonyDisruption::LogicErr { line, .. } => *line,
             HarmonyDisruption::LoweringErr { line, .. } => *line,
+            HarmonyDisruption::IterateErr { line, .. } => *line,
             HarmonyDisruption::FlowErr => 0,
         };
         (line > 0).then_some(line)

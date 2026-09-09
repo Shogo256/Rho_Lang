@@ -7,7 +7,7 @@ pub fn validate_symbols(input: &str) -> Result<()> {
     let code_only = remove_comments(input);
 
     let allowed_unicode: HashSet<char> = [
-        '◯', '□', '▷', '▽', '△', '◇', '◈', '+', '-', '×', '*', '/', '^', '→', '<', '>', '=', ':', '{', '}', '$', '&', '!',
+        '◯', '□', '▷', '▽', '△', '◇', '◈', '+', '-', '×', '*', '/', '^', '→', '⇒', '<', '>', '=', ':', '{', '}', '$', '&', '!',
         '(', ')', '[', ']', ';', ',', '.', ' ', '\t', '\r', '\n', '_', '𝜏', 'τ'
     ].iter().cloned().collect();
 
@@ -63,7 +63,7 @@ pub fn normalize_ascii_aliases(input: &str) -> String {
         // [] never appears in an address binding, which is always &[0x...].
         .replace("[]", "□")
         .replace("->", "→")
-        .replace("=>", "→")
+        .replace("=>", "⇒")
         .replace(">>", "▷")
         .replace("<<", "▽")
         .replace("@", "&")
@@ -86,7 +86,14 @@ pub fn parse_rho_program(input: &str) -> Result<ToposBlock> {
             continue;
         }
 
-        if let Some(stmt) = parse_line(text)? {
+        let parsed = parse_line(text).map_err(|e| match e {
+            HarmonyDisruption::IterateErr { detail, line: 0 } => HarmonyDisruption::IterateErr {
+                detail,
+                line: index + 1,
+            },
+            other => other,
+        })?;
+        if let Some(stmt) = parsed {
             statements.push(stmt);
             lines.push(index + 1);
         }
@@ -169,7 +176,40 @@ fn parse_line(line: &str) -> Result<Option<Statement>> {
         return Ok(Some(Statement::SpaceDef(parse_space_decl(line)?)));
     }
 
-    // 5. Flow Statement: Expr → Target
+    // 5. Fixed point: Expr ⇒ Name. The target is a space, never `=`: the
+    // equilibrium point is where a program ends, and an iteration has to be
+    // read from afterwards.
+    if line.contains('⇒') {
+        let parts: Vec<&str> = line.split('⇒').collect();
+        if parts.len() != 2 {
+            return Err(HarmonyDisruption::IterateErr {
+                detail: "a line iterates one expression into one space: `expr ⇒ NAME`"
+                    .to_string(),
+                line: 0,
+            });
+        }
+        let src = parse_expr(parts[0].trim())?;
+        let target = parts[1].trim();
+        if target == "=" {
+            return Err(HarmonyDisruption::IterateErr {
+                detail: "`⇒` cannot flow into `=`; iterate into a space and then send it on with `NAME → =`"
+                    .to_string(),
+                line: 0,
+            });
+        }
+        if target.is_empty() || !target.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err(HarmonyDisruption::IterateErr {
+                detail: format!("`⇒` needs a space to iterate, not '{target}'"),
+                line: 0,
+            });
+        }
+        return Ok(Some(Statement::Iterate {
+            src,
+            target: target.to_string(),
+        }));
+    }
+
+    // 6. Flow Statement: Expr → Target
     if line.contains('→') {
         let parts: Vec<&str> = line.split('→').collect();
         if parts.len() == 2 {
@@ -477,7 +517,8 @@ pub fn validate_space_declarations(block: &ToposBlock) -> Result<()> {
             Statement::Flow {
                 target: FlowTarget::Var(n),
                 ..
-            } => Some(n),
+            }
+            | Statement::Iterate { target: n, .. } => Some(n),
             _ => None,
         };
         if let Some(name) = name {
@@ -503,13 +544,36 @@ pub fn validate_space_declarations(block: &ToposBlock) -> Result<()> {
         }
     }
 
+    // Spaces some flow has written so far. A `⇒` may only iterate one of
+    // these: its starting value is part of what it computes, so the program
+    // has to have spelled that value out.
+    let mut written: HashSet<String> = HashSet::new();
+
     for (index, stmt) in block.statements.iter().enumerate() {
         let line = block.line_of(index);
         match stmt {
             Statement::Flow { src, target } => {
                 check_expr_spaces(src, &declared_spaces, line)?;
-                if let FlowTarget::Var(var_name) = target {
-                    declared_spaces.insert(var_name.clone());
+                match target {
+                    FlowTarget::Var(var_name) => {
+                        declared_spaces.insert(var_name.clone());
+                        written.insert(var_name.clone());
+                    }
+                    FlowTarget::Equilibrium => {
+                        written.insert("OUTPUT".to_string());
+                    }
+                }
+            }
+            Statement::Iterate { src, target } => {
+                check_expr_spaces(src, &declared_spaces, line)?;
+                if !written.contains(target) {
+                    return Err(HarmonyDisruption::IterateErr {
+                        detail: format!(
+                            "`⇒ {target}` needs a starting value: write {target} with a flow first, \
+                             e.g. `INPUT → {target}`"
+                        ),
+                        line,
+                    });
                 }
             }
             Statement::Constraint(expr) | Statement::AuditTrace(expr) => {
@@ -655,7 +719,9 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
 
     for (index, stmt) in block.statements.iter().enumerate() {
         match stmt {
-            Statement::Flow { src, .. } | Statement::Constraint(src) => {
+            Statement::Flow { src, .. }
+            | Statement::Iterate { src, .. }
+            | Statement::Constraint(src) => {
                 check_broadcast(src, &space_shapes, block.line_of(index))?
             }
             _ => {}
@@ -664,6 +730,24 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
 
     // 3. Validate shapes across flows
     for (index, stmt) in block.statements.iter().enumerate() {
+        // An iteration writes back into the space it reads, so the body has
+        // to produce exactly that space's shape — nothing to infer here.
+        if let Statement::Iterate { src, target } = stmt {
+            let body = get_expr_shape(src, &space_shapes);
+            let held = space_shapes.get(target).cloned();
+            if let (Some(body), Some(held)) = (body, held) {
+                if body != held {
+                    return Err(HarmonyDisruption::DimensionErr {
+                        space_a: format!("{} ⇒", crate::symbolic::ExprGlyphs(src)),
+                        shape_a: body,
+                        space_b: target.clone(),
+                        shape_b: held,
+                        line: block.line_of(index),
+                    });
+                }
+            }
+            continue;
+        }
         if let Statement::Flow { src, target } = stmt {
             let src_shape = get_expr_shape(src, &space_shapes);
             match target {

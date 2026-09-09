@@ -40,26 +40,34 @@ impl RhoDag {
             }
         }
 
-        // 2. Build directed edges from flow statements (→)
+        // 2. Build directed edges from flow statements (→) and iterations (⇒)
         for stmt in &block.statements {
-            if let Statement::Flow { src, target } = stmt {
-                let target_label = match target {
-                    FlowTarget::Var(name) => name.clone(),
-                    FlowTarget::Equilibrium => "EQUILIBRIUM(=)".to_string(),
-                };
+            let (src, target_label, kind) = match stmt {
+                Statement::Flow { src, target } => (
+                    src,
+                    match target {
+                        FlowTarget::Var(name) => name.clone(),
+                        FlowTarget::Equilibrium => "EQUILIBRIUM(=)".to_string(),
+                    },
+                    "flow",
+                ),
+                Statement::Iterate { src, target } => (src, target.clone(), "iterate"),
+                _ => continue,
+            };
 
-                let target_idx = *node_map.entry(target_label.clone()).or_insert_with(|| {
-                    graph.add_node(DagNode {
-                        label: target_label.clone(),
-                        expr: Some(src.clone()),
-                    })
-                });
+            let target_idx = *node_map.entry(target_label.clone()).or_insert_with(|| {
+                graph.add_node(DagNode {
+                    label: target_label.clone(),
+                    expr: Some(src.clone()),
+                })
+            });
 
-                let dependencies = extract_dependencies(src);
-                for dep in dependencies {
-                    if let Some(&dep_idx) = node_map.get(&dep) {
-                        graph.add_edge(dep_idx, target_idx, "flow".to_string());
-                    }
+            // An iteration feeds on itself; the cycle is the point, and the
+            // trace below knows not to follow it forever.
+            let dependencies = extract_dependencies(src);
+            for dep in dependencies {
+                if let Some(&dep_idx) = node_map.get(&dep) {
+                    graph.add_edge(dep_idx, target_idx, kind.to_string());
                 }
             }
         }
@@ -75,7 +83,8 @@ impl RhoDag {
         out.push_str("====================================================\n");
 
         if let Some(&eq_idx) = self.node_map.get("EQUILIBRIUM(=)") {
-            self.trace_recursive(eq_idx, 0, &mut out);
+            let mut visited = std::collections::HashSet::new();
+            self.trace_recursive(eq_idx, 0, &mut out, &mut visited);
         } else {
             out.push_str("[WARNING] EQUILIBRIUM(=) node not found.\n");
         }
@@ -84,9 +93,19 @@ impl RhoDag {
         out
     }
 
-    fn trace_recursive(&self, node_idx: NodeIndex, indent: usize, out: &mut String) {
+    fn trace_recursive(
+        &self,
+        node_idx: NodeIndex,
+        indent: usize,
+        out: &mut String,
+        visited: &mut std::collections::HashSet<NodeIndex>,
+    ) {
         let node = &self.graph[node_idx];
         let pad = "  ".repeat(indent);
+        if !visited.insert(node_idx) {
+            out.push_str(&format!("{}[Node] {} (⇒ feeds on itself)\n", pad, node.label));
+            return;
+        }
         out.push_str(&format!("{}[Node] {}\n", pad, node.label));
 
         if let Some(ref expr) = node.expr {
@@ -98,7 +117,7 @@ impl RhoDag {
             .neighbors_directed(node_idx, petgraph::Direction::Incoming);
 
         for parent in neighbors {
-            self.trace_recursive(parent, indent + 1, out);
+            self.trace_recursive(parent, indent + 1, out, visited);
         }
     }
 

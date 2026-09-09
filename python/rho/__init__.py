@@ -86,17 +86,23 @@ class RhoEngine:
         self._lib = None
         self._bound = {}
 
-    def compile_rho_file(self, rho_file_path, bind=None, tau=None, require_contract=False):
+    def compile_rho_file(self, rho_file_path, bind=None, tau=None, require_contract=False,
+                         max_iter=None):
         """Compile a .rho script with the rhoc driver.
 
         `bind` maps space names to the buffers (or raw addresses) the kernel
         should read and write directly. Those addresses are baked into the
         kernel, which is what makes rho_kernel_exec() a genuine zero-copy call
         rather than a read of whatever the .rho source happened to write.
+
+        `max_iter` caps every `⇒` in the program; a program that iterates
+        cannot be compiled without it. `tau` is the tolerance it stops at.
         """
         cmd = rhoc_command() + [rho_file_path, "-o", self.kernel_so_path]
         if tau is not None:
             cmd += ["--tau", str(tau)]
+        if max_iter is not None:
+            cmd += ["--max-iter", str(max_iter)]
         if require_contract:
             cmd += ["--require-contract"]
         self._bound = {}
@@ -254,6 +260,30 @@ class RhoEngine:
         out_addr = _buffer_address(output_buf) if output_buf is not None else in_addr
         fn(ctypes.c_void_p(in_addr), ctypes.c_void_p(out_addr), ctypes.c_int64(count))
         return True
+
+    def sweeps(self):
+        """How many sweeps the `⇒` loops of the most recent call took, in all.
+
+        A kernel without `⇒` reports 0. The count is per kernel, not per
+        thread: the language has no concurrency, and neither has this.
+        """
+        fn = getattr(self._lib_or_load(), "rho_kernel_sweeps", None)
+        if fn is None:
+            return 0
+        fn.restype = ctypes.c_int64
+        return int(fn())
+
+    def converged(self):
+        """Whether every `⇒` of the most recent call stopped on the tolerance.
+
+        False means at least one loop ran into its cap. A kernel without `⇒`
+        reports True.
+        """
+        fn = getattr(self._lib_or_load(), "rho_kernel_converged", None)
+        if fn is None:
+            return True
+        fn.restype = ctypes.c_int64
+        return bool(fn())
 
     def spaces(self):
         """Every space of the kernel as (name, shape, role), in table order.

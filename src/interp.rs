@@ -51,10 +51,68 @@ impl<S: Numeric> Grid<S> {
 /// Every space the program has produced so far.
 pub type Env<S = f64> = BTreeMap<String, Grid<S>>;
 
+/// The cap on a `⇒` loop when the caller names none: enough for a small
+/// relaxation to settle, small enough that a mistake cannot hang a test.
+pub const DEFAULT_MAX_SWEEPS: usize = 1000;
+
+/// What a run is parameterised by: the threshold symbol, matching `--tau`,
+/// and the most sweeps a `⇒` may take, matching `--max-iter`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Options {
+    pub tau: f64,
+    pub max_sweeps: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            tau: 0.0,
+            max_sweeps: DEFAULT_MAX_SWEEPS,
+        }
+    }
+}
+
+/// What a run does at the one decision in the language that depends on data:
+/// whether a `⇒` loop has settled. On numbers the flag simply says. On symbols
+/// the caller has to choose, and may replace the loop's cells before the next
+/// round — which is how a proof gets to speak about an arbitrary iterate.
+pub trait Decider<S: Numeric> {
+    /// Whether to stop, given "no cell moved by more than 𝜏". `None` means
+    /// the run cannot tell, which the interpreter reports as an error.
+    fn done(&mut self, settled: &S::Bool) -> Option<bool>;
+    /// The target's cells, just before the loop goes round again.
+    fn next_round(&mut self, _cells: &mut [S]) {}
+}
+
+/// Decide by the value, which is what a run on numbers does.
+pub struct ByValue;
+
+impl<S: Numeric> Decider<S> for ByValue {
+    fn done(&mut self, settled: &S::Bool) -> Option<bool> {
+        S::truth(settled)
+    }
+}
+
 /// Run a program over the given inputs, returning every space it produced.
 ///
-/// `tau` binds the threshold symbol, matching `--tau`.
+/// `tau` binds the threshold symbol, matching `--tau`; a `⇒` is capped at
+/// [`DEFAULT_MAX_SWEEPS`]. Use [`interpret_with`] to set the cap.
 pub fn interpret<S: Numeric>(block: &ToposBlock, inputs: &Env<S>, tau: f64) -> Result<Env<S>> {
+    let options = Options {
+        tau,
+        ..Options::default()
+    };
+    interpret_with(block, inputs, &options, &mut ByValue)
+}
+
+/// As [`interpret`], with every parameter of a run spelled out.
+pub fn interpret_with<S: Numeric>(
+    block: &ToposBlock,
+    inputs: &Env<S>,
+    options: &Options,
+    decider: &mut dyn Decider<S>,
+) -> Result<Env<S>> {
+    let tau = options.tau;
     let mut env: Env<S> = inputs.clone();
 
     // Declared spaces that the caller did not supply start at zero.
@@ -70,24 +128,92 @@ pub fn interpret<S: Numeric>(block: &ToposBlock, inputs: &Env<S>, tau: f64) -> R
     }
 
     for (index, stmt) in block.statements.iter().enumerate() {
-        let Statement::Flow { src, target } = stmt else {
-            continue;
-        };
         let line = block.line_of(index);
-        let value = eval(src, &env, tau, line)?;
-        let name = match target {
-            FlowTarget::Var(n) => n.clone(),
-            FlowTarget::Equilibrium => "OUTPUT".to_string(),
-        };
-        env.insert(name, value);
+        match stmt {
+            Statement::Flow { src, target } => {
+                let value = eval(src, &env, tau, line)?;
+                let name = match target {
+                    FlowTarget::Var(n) => n.clone(),
+                    FlowTarget::Equilibrium => "OUTPUT".to_string(),
+                };
+                env.insert(name, value);
 
-        // `=` ends the pipeline; later statements are not evaluated.
-        if matches!(target, FlowTarget::Equilibrium) {
-            break;
+                // `=` ends the pipeline; later statements are not evaluated.
+                if matches!(target, FlowTarget::Equilibrium) {
+                    break;
+                }
+            }
+            Statement::Iterate { src, target } => {
+                iterate(src, target, &mut env, options, decider, line)?;
+            }
+            _ => {}
         }
     }
 
     Ok(env)
+}
+
+/// `expr ⇒ target`: sweep until no cell moves by more than 𝜏, or the cap is
+/// reached. Every sweep reads the whole previous grid, so this is a Jacobi
+/// iteration; the cap alone guarantees it ends.
+fn iterate<S: Numeric>(
+    src: &Expr,
+    target: &str,
+    env: &mut Env<S>,
+    options: &Options,
+    decider: &mut dyn Decider<S>,
+    line: usize,
+) -> Result<()> {
+    let tau = S::constant(options.tau);
+    let mut sweeps = 0usize;
+    loop {
+        let previous = env
+            .get(target)
+            .ok_or_else(|| HarmonyDisruption::SpaceErr {
+                space_name: target.to_string(),
+                line,
+            })?
+            .clone();
+        let next = eval(src, env, options.tau, line)?;
+        if next.shape != previous.shape {
+            return Err(HarmonyDisruption::DimensionErr {
+                space_a: "⇒ body".to_string(),
+                shape_a: next.shape,
+                space_b: target.to_string(),
+                shape_b: previous.shape,
+                line,
+            });
+        }
+
+        // The largest move of any cell. A NaN move never counts as larger, so
+        // a NaN grid never settles and runs to the cap.
+        let mut largest = S::constant(0.0);
+        for (after, before) in next.cells.iter().zip(&previous.cells) {
+            let moved = after.sub(before).unary(BuiltinOp::Abs);
+            largest = S::select(&moved.compare(&largest, Compare::Gt), &moved, &largest);
+        }
+        env.insert(target.to_string(), next);
+        sweeps += 1;
+
+        // The cap decides on its own, without asking; the tolerance asks.
+        if sweeps >= options.max_sweeps {
+            return Ok(());
+        }
+        let settled = largest.compare(&tau, Compare::Lte);
+        match decider.done(&settled) {
+            Some(true) => return Ok(()),
+            Some(false) => {}
+            None => {
+                return Err(err(
+                    line,
+                    "whether this ⇒ has settled depends on the data, and this run has no way to decide it",
+                ))
+            }
+        }
+        if let Some(grid) = env.get_mut(target) {
+            decider.next_round(&mut grid.cells);
+        }
+    }
 }
 
 fn err(line: usize, detail: impl Into<String>) -> HarmonyDisruption {

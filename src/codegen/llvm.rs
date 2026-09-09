@@ -158,6 +158,12 @@ pub struct LlvmCodeGen {
     pub precision: Precision,
     /// Source line of each statement, copied from the block being lowered.
     statement_lines: Vec<usize>,
+    /// The most sweeps a `⇒` may take, from `--max-iter`. A program that
+    /// iterates cannot be lowered without one: the cap is what makes every
+    /// kernel terminate, and it is part of what the kernel computes.
+    max_sweeps: Option<usize>,
+    /// Whether the block being lowered has a `⇒` at all.
+    iterates: bool,
     /// Spaces some flow writes. Every other space is read from memory the
     /// caller owns, which is what decides whether an entrypoint may run.
     written_spaces: BTreeSet<String>,
@@ -182,6 +188,8 @@ impl LlvmCodeGen {
             simd: true,
             precision: Precision::F64,
             statement_lines: Vec::new(),
+            max_sweeps: None,
+            iterates: false,
             written_spaces: BTreeSet::new(),
             contract_json: None,
             elements: 0,
@@ -208,6 +216,12 @@ impl LlvmCodeGen {
     }
 
     /// Turn vector lowering off and emit only scalar loops.
+    /// Cap every `⇒` at this many sweeps.
+    pub fn with_max_sweeps(mut self, sweeps: usize) -> Self {
+        self.max_sweeps = Some(sweeps);
+        self
+    }
+
     pub fn without_simd(mut self) -> Self {
         self.simd = false;
         self
@@ -228,6 +242,10 @@ impl LlvmCodeGen {
     pub fn generate_llvm_ir(&mut self, block: &ToposBlock) -> Result<String> {
         self.statement_lines = block.lines.clone();
         self.written_spaces = Self::written_spaces(block);
+        self.iterates = block
+            .statements
+            .iter()
+            .any(|s| matches!(s, Statement::Iterate { .. }));
         self.collect_shapes(block);
         for (name, addr) in &self.binding_overrides {
             self.ext_bindings.insert(name.clone(), *addr);
@@ -270,6 +288,12 @@ impl LlvmCodeGen {
         }
         ir.push_str("declare ptr @malloc(i64)\n");
         ir.push_str("declare void @free(ptr)\n\n");
+
+        // What the last call's `⇒` loops did: how many sweeps in all, and
+        // whether every one of them stopped on the tolerance rather than on
+        // the cap. Internal, so two kernels in one process do not share them.
+        ir.push_str("@rho_sweeps = internal global i64 0\n");
+        ir.push_str("@rho_converged = internal global i64 1\n\n");
 
         let (meta_escaped, meta_len) = Self::c_string(&self.generate_metadata_json());
         ir.push_str(&format!(
@@ -395,6 +419,19 @@ impl LlvmCodeGen {
         ir.push_str("define i64 @rho_kernel_element_count() #0 {\n");
         ir.push_str("entry:\n");
         ir.push_str(&format!("  ret i64 {}\n", self.elements));
+        ir.push_str("}\n\n");
+
+        // 7. What the last call's iterations did. A kernel without `⇒`
+        // reports no sweeps and counts as converged.
+        ir.push_str("define i64 @rho_kernel_sweeps() #0 {\n");
+        ir.push_str("entry:\n");
+        ir.push_str("  %sweeps = load i64, ptr @rho_sweeps\n");
+        ir.push_str("  ret i64 %sweeps\n");
+        ir.push_str("}\n\n");
+        ir.push_str("define i64 @rho_kernel_converged() #0 {\n");
+        ir.push_str("entry:\n");
+        ir.push_str("  %converged = load i64, ptr @rho_converged\n");
+        ir.push_str("  ret i64 %converged\n");
         ir.push_str("}\n\n");
 
         // No target-cpu pin: -O3 vectorises for whatever clang is targeting.
@@ -662,6 +699,9 @@ impl LlvmCodeGen {
         bound: &str,
     ) -> Result<()> {
         let mut bufs = self.emit_buffers(ir, provided, heap, bound);
+        // Every call starts its iteration record afresh.
+        ir.push_str("  store i64 0, ptr @rho_sweeps\n");
+        ir.push_str("  store i64 1, ptr @rho_converged\n");
         let mut counter = 0usize;
         self.emit_flows(&block.statements, ir, &mut bufs, entry_label, &mut counter)?;
         for ptr in &bufs.heap {
@@ -691,105 +731,341 @@ impl LlvmCodeGen {
         let mut loop_id = 0usize;
 
         for (index, stmt) in statements.iter().enumerate() {
-            let Statement::Flow { src, target } = stmt else {
-                continue;
-            };
             self.current_line.set(self.statement_lines.get(index).copied().unwrap_or(0));
-
-            let target_ptr = match target {
-                FlowTarget::Var(name) => self.lookup(bufs, name)?,
-                FlowTarget::Equilibrium => self.lookup(bufs, "OUTPUT")?,
-            };
-
-            loop_id += 1;
-
-            // Fold every reduction in this flow into its own buffer first. The
-            // sweep below then reads a plain array, so it stays straight-line.
-            pred = self.emit_fold_prepass(src, ir, bufs, &pred, counter)?;
-
-            let sweep = self.sweep_length(src, target, bufs);
-            let result_shape = self.sweep_shape(src, target);
-            // A stretched read is not contiguous, so it cannot be vector loaded.
-            let plan = if self.needs_broadcast(src, &result_shape, &[]) {
-                Sweep::AllScalar
-            } else {
-                self.plan_sweep(src, &sweep)?
-            };
-            ir.push_str(&format!(
-                "  ; Flow {loop_id}: sweep {sweep} cells{}\n",
-                plan.describe()
-            ));
-
-            match plan {
-                Sweep::AllScalar => {
-                    pred = self.emit_range_loop(
+            match stmt {
+                Statement::Flow { src, target } => {
+                    loop_id += 1;
+                    let target_ptr = match target {
+                        FlowTarget::Var(name) => self.lookup(bufs, name)?,
+                        FlowTarget::Equilibrium => self.lookup(bufs, "OUTPUT")?,
+                    };
+                    pred = self.emit_sweep(
+                        src,
+                        target,
+                        &target_ptr,
                         ir,
+                        bufs,
+                        &pred,
                         &format!("f{loop_id}"),
-                        &pred,
-                        "0",
-                        &sweep,
-                        Mode::Scalar(self.precision),
-                        src,
-                        &target_ptr,
-                        bufs,
+                        &format!("Flow {loop_id}"),
                         counter,
-                        &result_shape,
                     )?;
+                    if matches!(target, FlowTarget::Equilibrium) {
+                        break;
+                    }
                 }
-                Sweep::Split {
-                    vector_start,
-                    vector_end,
-                    width,
-                    total,
-                } => {
-                    pred = self.emit_range_loop(
-                        ir,
-                        &format!("f{loop_id}.head"),
-                        &pred,
-                        "0",
-                        &vector_start.to_string(),
-                        Mode::Scalar(self.precision),
-                        src,
-                        &target_ptr,
-                        bufs,
-                        counter,
-                        &result_shape,
-                    )?;
-                    pred = self.emit_range_loop(
-                        ir,
-                        &format!("f{loop_id}.vec"),
-                        &pred,
-                        &vector_start.to_string(),
-                        &vector_end.to_string(),
-                        Mode::Vector(width, self.precision),
-                        src,
-                        &target_ptr,
-                        bufs,
-                        counter,
-                        &result_shape,
-                    )?;
-                    pred = self.emit_range_loop(
-                        ir,
-                        &format!("f{loop_id}.tail"),
-                        &pred,
-                        &vector_end.to_string(),
-                        &total.to_string(),
-                        Mode::Scalar(self.precision),
-                        src,
-                        &target_ptr,
-                        bufs,
-                        counter,
-                        &result_shape,
-                    )?;
+                Statement::Iterate { src, target } => {
+                    loop_id += 1;
+                    pred = self.emit_iterate(src, target, ir, bufs, &pred, loop_id, counter)?;
                 }
-            }
-
-            if matches!(target, FlowTarget::Equilibrium) {
-                break;
+                _ => {}
             }
         }
 
         Ok(())
+    }
+
+    /// One full sweep of `src` into `target_ptr`: the folds it needs first,
+    /// then a head, a vector body and a tail when the length allows it.
+    /// Returns the block control flow lands on.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_sweep(
+        &self,
+        src: &Expr,
+        target: &FlowTarget,
+        target_ptr: &str,
+        ir: &mut String,
+        bufs: &mut Buffers,
+        pred: &str,
+        label: &str,
+        what: &str,
+        counter: &mut usize,
+    ) -> Result<String> {
+        let mut pred = pred.to_string();
+
+        // Fold every reduction in this flow into its own buffer first. The
+        // sweep below then reads a plain array, so it stays straight-line.
+        pred = self.emit_fold_prepass(src, ir, bufs, &pred, counter)?;
+
+        let sweep = self.sweep_length(src, target, bufs);
+        let result_shape = self.sweep_shape(src, target);
+        // A stretched read is not contiguous, so it cannot be vector loaded.
+        let plan = if self.needs_broadcast(src, &result_shape, &[]) {
+            Sweep::AllScalar
+        } else {
+            self.plan_sweep(src, &sweep)?
+        };
+        ir.push_str(&format!(
+            "  ; {what}: sweep {sweep} cells{}\n",
+            plan.describe()
+        ));
+
+        match plan {
+            Sweep::AllScalar => {
+                pred = self.emit_range_loop(
+                    ir,
+                    label,
+                    &pred,
+                    "0",
+                    &sweep,
+                    Mode::Scalar(self.precision),
+                    src,
+                    target_ptr,
+                    bufs,
+                    counter,
+                    &result_shape,
+                )?;
+            }
+            Sweep::Split {
+                vector_start,
+                vector_end,
+                width,
+                total,
+            } => {
+                pred = self.emit_range_loop(
+                    ir,
+                    &format!("{label}.head"),
+                    &pred,
+                    "0",
+                    &vector_start.to_string(),
+                    Mode::Scalar(self.precision),
+                    src,
+                    target_ptr,
+                    bufs,
+                    counter,
+                    &result_shape,
+                )?;
+                pred = self.emit_range_loop(
+                    ir,
+                    &format!("{label}.vec"),
+                    &pred,
+                    &vector_start.to_string(),
+                    &vector_end.to_string(),
+                    Mode::Vector(width, self.precision),
+                    src,
+                    target_ptr,
+                    bufs,
+                    counter,
+                    &result_shape,
+                )?;
+                pred = self.emit_range_loop(
+                    ir,
+                    &format!("{label}.tail"),
+                    &pred,
+                    &vector_end.to_string(),
+                    &total.to_string(),
+                    Mode::Scalar(self.precision),
+                    src,
+                    target_ptr,
+                    bufs,
+                    counter,
+                    &result_shape,
+                )?;
+            }
+        }
+        Ok(pred)
+    }
+
+    /// `expr ⇒ target`: the sweep of `expr`, repeated until no cell moves by
+    /// more than 𝜏 or the cap is reached.
+    ///
+    /// Each round sweeps into a second buffer, then measures the largest move
+    /// while copying back. So every read inside the sweep sees the finished
+    /// previous round — the rule `→` gives a shift, and what keeps the vector
+    /// path safe here — and the round is a Jacobi step, never a Gauss–Seidel
+    /// one. The buffers the loop needs are allocated once, ahead of it.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_iterate(
+        &self,
+        src: &Expr,
+        target: &str,
+        ir: &mut String,
+        bufs: &mut Buffers,
+        pred: &str,
+        loop_id: usize,
+        counter: &mut usize,
+    ) -> Result<String> {
+        let cap = self.max_sweeps.ok_or_else(|| HarmonyDisruption::LoweringErr {
+            detail: "this program iterates (⇒); say how many sweeps it may take with --max-iter"
+                .to_string(),
+            line: self.current_line.get(),
+        })?;
+        let label = format!("it{loop_id}");
+        let flow_target = FlowTarget::Var(target.to_string());
+        let held = self.lookup(bufs, target)?;
+        let cells = self
+            .space_shapes
+            .get(target)
+            .map(|s| s.iter().product::<usize>())
+            .unwrap_or(self.elements)
+            .max(1);
+        let length = self.sweep_length(src, &flow_target, bufs);
+        let elem = self.precision.llvm_type();
+        let align = self.precision.bytes();
+        let suffix = self.precision.intrinsic_suffix();
+
+        let next = self.emit_scratch(ir, &format!("{label}_next"), cells, &mut bufs.heap);
+        self.reserve_fold_buffers(src, ir, bufs, counter)?;
+
+        ir.push_str(&format!(
+            "  ; Iterate {loop_id}: sweep into [{target}] until no cell moves by more than {}, at most {cap} times\n",
+            self.tau
+        ));
+        ir.push_str(&format!("  br label %{label}.header\n\n"));
+        ir.push_str(&format!("{label}.header:\n"));
+        ir.push_str(&format!(
+            "  %{label}.k = phi i64 [ 0, %{pred} ], [ %{label}.k.next, %{label}.decide ]\n"
+        ));
+        let after_sweep = self.emit_sweep(
+            src,
+            &flow_target,
+            &next,
+            ir,
+            bufs,
+            &format!("{label}.header"),
+            &format!("{label}.sweep"),
+            &format!("Iterate {loop_id} round"),
+            counter,
+        )?;
+
+        // Measure the largest move while copying the round back. A NaN move
+        // never compares greater, so a NaN grid never settles and runs to the
+        // cap — the same rule the reference interpreter follows.
+        ir.push_str(&format!("  br label %{label}.cmp\n\n"));
+        ir.push_str(&format!("{label}.cmp:\n"));
+        ir.push_str(&format!(
+            "  %{label}.i = phi i64 [ 0, %{after_sweep} ], [ %{label}.i.next, %{label}.cmp.body ]\n"
+        ));
+        ir.push_str(&format!(
+            "  %{label}.d = phi {elem} [ {}, %{after_sweep} ], [ %{label}.d.next, %{label}.cmp.body ]\n",
+            self.f64_literal(0.0)
+        ));
+        ir.push_str(&format!("  %{label}.more = icmp ult i64 %{label}.i, {length}\n"));
+        ir.push_str(&format!(
+            "  br i1 %{label}.more, label %{label}.cmp.body, label %{label}.decide\n\n"
+        ));
+        ir.push_str(&format!("{label}.cmp.body:\n"));
+        ir.push_str(&format!(
+            "  %{label}.np = getelementptr inbounds {elem}, ptr {next}, i64 %{label}.i\n"
+        ));
+        ir.push_str(&format!("  %{label}.new = load {elem}, ptr %{label}.np, align {align}\n"));
+        ir.push_str(&format!(
+            "  %{label}.op = getelementptr inbounds {elem}, ptr {held}, i64 %{label}.i\n"
+        ));
+        ir.push_str(&format!("  %{label}.old = load {elem}, ptr %{label}.op, align {align}\n"));
+        ir.push_str(&format!(
+            "  %{label}.diff = fsub {elem} %{label}.new, %{label}.old\n"
+        ));
+        ir.push_str(&format!(
+            "  %{label}.mag = call {elem} @llvm.fabs.{suffix}({elem} %{label}.diff)\n"
+        ));
+        ir.push_str(&format!(
+            "  %{label}.grew = fcmp ogt {elem} %{label}.mag, %{label}.d\n"
+        ));
+        ir.push_str(&format!(
+            "  %{label}.d.next = select i1 %{label}.grew, {elem} %{label}.mag, {elem} %{label}.d\n"
+        ));
+        ir.push_str(&format!(
+            "  store {elem} %{label}.new, ptr %{label}.op, align {align}\n"
+        ));
+        ir.push_str(&format!("  %{label}.i.next = add i64 %{label}.i, 1\n"));
+        ir.push_str(&format!("  br label %{label}.cmp\n\n"));
+
+        // The cap decides on its own; the tolerance is the one decision in a
+        // kernel that depends on the data.
+        ir.push_str(&format!("{label}.decide:\n"));
+        ir.push_str(&format!("  %{label}.k.next = add i64 %{label}.k, 1\n"));
+        ir.push_str(&format!(
+            "  %{label}.capped = icmp uge i64 %{label}.k.next, {cap}\n"
+        ));
+        ir.push_str(&format!(
+            "  %{label}.settled = fcmp ole {elem} %{label}.d, {}\n",
+            self.f64_literal(self.tau)
+        ));
+        ir.push_str(&format!(
+            "  %{label}.done = or i1 %{label}.settled, %{label}.capped\n"
+        ));
+        ir.push_str(&format!(
+            "  br i1 %{label}.done, label %{label}.end, label %{label}.header\n\n"
+        ));
+
+        // Record what happened: the sweeps taken, and whether the loop left
+        // on the tolerance. Stopping at the cap counts as not converged even
+        // if that last sweep happened to settle — the kernel did not check.
+        ir.push_str(&format!("{label}.end:\n"));
+        ir.push_str(&format!("  %{label}.s0 = load i64, ptr @rho_sweeps\n"));
+        ir.push_str(&format!("  %{label}.s1 = add i64 %{label}.s0, %{label}.k.next\n"));
+        ir.push_str(&format!("  store i64 %{label}.s1, ptr @rho_sweeps\n"));
+        ir.push_str(&format!("  %{label}.c0 = load i64, ptr @rho_converged\n"));
+        ir.push_str(&format!(
+            "  %{label}.c1 = select i1 %{label}.capped, i64 0, i64 %{label}.c0\n"
+        ));
+        ir.push_str(&format!("  store i64 %{label}.c1, ptr @rho_converged\n"));
+        Ok(format!("{label}.end"))
+    }
+
+    /// Allocate the buffer every fold and scan in `expr` will write, so a loop
+    /// around the expression allocates once rather than on every round.
+    fn reserve_fold_buffers(
+        &self,
+        expr: &Expr,
+        ir: &mut String,
+        bufs: &mut Buffers,
+        counter: &mut usize,
+    ) -> Result<()> {
+        match expr {
+            Expr::Var(_) | Expr::Number(_) => {}
+            Expr::AuditTrace(inner)
+            | Expr::Shift { operand: inner, .. }
+            | Expr::Builtin { operand: inner, .. }
+            | Expr::Lift { operand: inner, .. } => {
+                self.reserve_fold_buffers(inner, ir, bufs, counter)?;
+            }
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                self.reserve_fold_buffers(lhs, ir, bufs, counter)?;
+                self.reserve_fold_buffers(rhs, ir, bufs, counter)?;
+            }
+            Expr::Reduce { axis, operand, .. } | Expr::Scan { axis, operand, .. } => {
+                self.reserve_fold_buffers(operand, ir, bufs, counter)?;
+                let running = matches!(expr, Expr::Scan { .. });
+                let cells = self.fold_cells(*axis, operand, running)?;
+                *counter += 1;
+                let buffer = self.emit_scratch(
+                    ir,
+                    &format!("fold{}_buf", *counter),
+                    cells,
+                    &mut bufs.heap,
+                );
+                bufs.folds.insert(expr as *const Expr as usize, buffer);
+            }
+        }
+        Ok(())
+    }
+
+    /// How many cells a fold (or, `running`, a scan) of `operand` along `axis`
+    /// writes.
+    fn fold_cells(&self, axis: Option<usize>, operand: &Expr, running: bool) -> Result<usize> {
+        let shape = Self::expr_shape(operand, &self.space_shapes).ok_or_else(|| {
+            HarmonyDisruption::LoweringErr {
+                line: self.current_line.get(),
+                detail: "a fold needs an operand with a known shape".to_string(),
+            }
+        })?;
+        let a = axis.unwrap_or_else(|| crate::ast::default_axis(&shape));
+        if a >= shape.len() {
+            return Err(HarmonyDisruption::LoweringErr {
+                line: self.current_line.get(),
+                detail: format!("axis {a} is past the end of {shape:?}"),
+            });
+        }
+        let extent = shape[a].max(1);
+        let inner: usize = shape[a + 1..].iter().product::<usize>().max(1);
+        let outer: usize = shape[..a].iter().product::<usize>().max(1);
+        Ok(if running {
+            (outer * extent * inner).max(1)
+        } else {
+            (outer * inner).max(1)
+        })
     }
 
     /// Lower every fold in `expr` into its own buffer, innermost first, so a
@@ -875,7 +1151,12 @@ impl LlvmCodeGen {
         *counter += 1;
         let id = *counter;
         let label = format!("fold{id}");
-        let buffer = self.emit_scratch(ir, &format!("{label}_buf"), out_cells, &mut bufs.heap);
+        let key = node as *const Expr as usize;
+        let buffer = match bufs.folds.get(&key) {
+            // Reserved ahead of a `⇒` loop, so the loop allocates once.
+            Some(reserved) => reserved.clone(),
+            None => self.emit_scratch(ir, &format!("{label}_buf"), out_cells, &mut bufs.heap),
+        };
 
         let elem = self.precision.llvm_type();
         let align = self.precision.bytes();
@@ -1064,6 +1345,7 @@ impl LlvmCodeGen {
                     target: FlowTarget::Equilibrium,
                     ..
                 } => Some("OUTPUT".to_string()),
+                Statement::Iterate { target, .. } => Some(target.clone()),
                 _ => None,
             })
             .collect()
@@ -1841,13 +2123,23 @@ impl LlvmCodeGen {
             Some(json) => format!(",\"contract\":{json}"),
             None => String::new(),
         };
+        // A kernel that iterates says how far it may go and when it stops,
+        // since both are part of what it computes.
+        let iteration = match (self.iterates, self.max_sweeps) {
+            (true, Some(cap)) => format!(
+                ",\"iteration\":{{\"max_sweeps\":{cap},\"tolerance\":{}}}",
+                self.tau
+            ),
+            _ => String::new(),
+        };
         format!(
-            "{{\"precision\":\"{}\",\"elements\":{},\"spaces\":[{}],\"bindings\":[{}]{}}}",
+            "{{\"precision\":\"{}\",\"elements\":{},\"spaces\":[{}],\"bindings\":[{}]{}{}}}",
             self.precision,
             self.elements,
             spaces.join(","),
             bindings.join(","),
-            contract
+            contract,
+            iteration
         )
     }
 

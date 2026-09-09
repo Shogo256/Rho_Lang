@@ -41,6 +41,12 @@ struct Args {
     #[arg(long)]
     f32: bool,
 
+    /// The most sweeps a `⇒` may take before it stops regardless of 𝜏.
+    /// Required by a program that iterates: the cap is what makes the kernel
+    /// terminate, and it is part of what the kernel computes.
+    #[arg(long, value_name = "N")]
+    max_iter: Option<usize>,
+
     /// Emit only scalar loops, skipping vector lowering
     #[arg(long)]
     no_simd: bool,
@@ -131,6 +137,26 @@ fn run(args: &Args) -> anyhow::Result<()> {
     } else {
         println!("  └─ Passed with {open_questions} unproven obligation(s)");
     }
+    // Convergence is reported on its own: a loop that is not shown to
+    // converge still ends, at its cap, so nothing unsafe follows.
+    for (finding, claim) in report.iterations.iter().zip(&report.contract.iterations) {
+        let range = format!(
+            "[{}, {}]",
+            fmt_bound(claim.invariant.lo),
+            fmt_bound(claim.invariant.hi)
+        );
+        match (&finding.verdict, claim.factor) {
+            (Verdict::Proved, Some(c)) => println!(
+                "  └─ [proved]   ⇒ {} converges: each sweep contracts by {c} (∞-norm), iterates stay in {range}",
+                claim.target
+            ),
+            (Verdict::Unproven(why), _) => println!(
+                "  └─ [open]     ⇒ {} convergence not shown — {why}; iterates stay in {range}",
+                claim.target
+            ),
+            (other, _) => println!("  └─ [{other:?}] {}", finding.subject),
+        }
+    }
 
     let contract = &report.contract;
     println!(
@@ -160,6 +186,18 @@ fn run(args: &Args) -> anyhow::Result<()> {
         .with_contract(report.contract.to_json());
     if args.no_simd {
         codegen = codegen.without_simd();
+    }
+    let iterates = block
+        .statements
+        .iter()
+        .any(|s| matches!(s, rho_lang::ast::Statement::Iterate { .. }));
+    match args.max_iter {
+        Some(0) => anyhow::bail!("--max-iter must be at least 1: a ⇒ always sweeps once"),
+        Some(cap) => codegen = codegen.with_max_sweeps(cap),
+        None if iterates => anyhow::bail!(
+            "this program iterates (⇒); say how many sweeps it may take with --max-iter N"
+        ),
+        None => {}
     }
     for entry in &args.bind {
         let (name, addr) = entry.split_once('=').ok_or_else(|| {

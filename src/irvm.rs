@@ -169,10 +169,34 @@ pub fn parse_module(ir: &str) -> Vec<Function> {
     functions
 }
 
+/// What a run does at the one branch in a kernel that depends on data: the
+/// exit of a `⇒` loop. On numbers the flag simply says. On symbols the caller
+/// chooses, and may rewrite the machine's buffers before the loop goes round
+/// again — which is how a proof gets to speak about an arbitrary iterate.
+pub trait Decider<S: Numeric> {
+    /// Whether to leave the loop, given "no cell moved by more than 𝜏".
+    /// `None` means the run cannot tell, which is reported as an error.
+    fn done(&mut self, settled: &S::Bool) -> Option<bool>;
+    /// The machine's buffers, just before the loop goes round again.
+    fn next_round(&mut self, _buffers: &mut [Vec<S>]) {}
+}
+
+/// Decide by the value, which is what a run on numbers does.
+pub struct ByValue;
+
+impl<S: Numeric> Decider<S> for ByValue {
+    fn done(&mut self, settled: &S::Bool) -> Option<bool> {
+        S::truth(settled)
+    }
+}
+
 /// The state one function body runs against.
 pub struct Machine<S: Numeric = f64> {
     /// Element-addressed storage, one entry per buffer.
     buffers: Vec<Vec<S>>,
+    /// Module-level integers: the sweep counters a kernel keeps in globals.
+    /// Absent means zero, which is what the module initialises them to.
+    globals: BTreeMap<String, i64>,
     /// Buffers reached through `inttoptr`, keyed by the address in the source.
     external: BTreeMap<i64, usize>,
     /// Tables of pointers, one per `void **` argument.
@@ -188,6 +212,7 @@ impl<S: Numeric> Machine<S> {
             buffers: Vec::new(),
             external: BTreeMap::new(),
             tables: Vec::new(),
+            globals: BTreeMap::new(),
             names: BTreeMap::new(),
             budget: 20_000_000,
         }
@@ -213,6 +238,11 @@ impl<S: Numeric> Machine<S> {
 
     pub fn buffer(&self, handle: usize) -> &[S] {
         &self.buffers[handle]
+    }
+
+    /// A module-level integer, such as `@rho_sweeps`, after a run.
+    pub fn global(&self, name: &str) -> i64 {
+        self.globals.get(name).copied().unwrap_or(0)
     }
 
     fn value(&self, token: &str) -> Value<S> {
@@ -243,8 +273,20 @@ impl<S: Numeric> Machine<S> {
             .unwrap_or_else(|| S::constant(0.0))
     }
 
-    /// Run one function to completion.
+    /// Run one function to completion, deciding any data-dependent branch by
+    /// value.
     pub fn run(&mut self, function: &Function, arguments: &[Value<S>]) -> Result<(), String> {
+        self.run_with(function, arguments, &mut ByValue)
+    }
+
+    /// Run one function to completion, with `decider` answering the branches
+    /// that depend on data.
+    pub fn run_with(
+        &mut self,
+        function: &Function,
+        arguments: &[Value<S>],
+        decider: &mut dyn Decider<S>,
+    ) -> Result<(), String> {
         for (name, value) in function.params.iter().zip(arguments) {
             self.names.insert(name.clone(), value.clone());
         }
@@ -265,7 +307,7 @@ impl<S: Numeric> Machine<S> {
 
             for instruction in &block.instructions {
                 self.budget -= 1;
-                match self.step(instruction, &previous)? {
+                match self.step(instruction, &previous, decider)? {
                     Flow::Next => {}
                     Flow::Jump(target) => {
                         next = Some(target);
@@ -287,7 +329,12 @@ impl<S: Numeric> Machine<S> {
         }
     }
 
-    fn step(&mut self, instruction: &str, previous: &str) -> Result<Flow, String> {
+    fn step(
+        &mut self,
+        instruction: &str,
+        previous: &str,
+        decider: &mut dyn Decider<S>,
+    ) -> Result<Flow, String> {
         // Terminators first: they decide where control goes next.
         if instruction == "ret void" {
             return Ok(Flow::Return);
@@ -298,7 +345,26 @@ impl<S: Numeric> Machine<S> {
             }
             let parts = split_fields(rest);
             let condition = parts[0].trim_start_matches("i1 ").trim();
-            let taken = self.value(condition).concrete();
+            let taken = match self.value(condition) {
+                // Loop bounds and null checks: integer, and always known.
+                Value::I(v) => v != 0,
+                // The exit of a `⇒`: known on numbers, chosen on symbols.
+                Value::B(flag) => match S::truth(&flag).or_else(|| decider.done(&flag)) {
+                    Some(done) => {
+                        if !done {
+                            decider.next_round(&mut self.buffers);
+                        }
+                        done
+                    }
+                    None => {
+                        return Err(
+                            "a branch depends on a value and this run has no way to decide it"
+                                .to_string(),
+                        )
+                    }
+                },
+                other => return Err(format!("branch on a non-flag: {other:?}")),
+            };
             let target = if taken { parts[1] } else { parts[2] };
             return Ok(Flow::Jump(
                 target.trim_start_matches("label ").trim().to_string(),
@@ -336,6 +402,12 @@ impl<S: Numeric> Machine<S> {
             .and_then(|f| f.strip_prefix("ptr "))
             .ok_or_else(|| format!("malformed store: {rest}"))?
             .trim();
+        // A module-level integer: the sweep counters.
+        if let Some(global) = dest.strip_prefix('@') {
+            let (_, token) = split_typed(value_part);
+            self.globals.insert(global.to_string(), self.value(token).i());
+            return Ok(());
+        }
         let Value::P(handle, offset) = self.value(dest) else {
             return Err(format!("store to a non-pointer: {dest}"));
         };
@@ -466,6 +538,10 @@ impl<S: Numeric> Machine<S> {
                     .and_then(|s| s.split(',').next())
                     .ok_or_else(|| format!("malformed load: {body}"))?
                     .trim();
+                // A module-level integer: the sweep counters.
+                if let Some(global) = source.strip_prefix('@') {
+                    return Ok(Value::I(self.global(global)));
+                }
                 // A load of a pointer reads a slot of a table, not a cell.
                 if ty == "ptr" {
                     let Value::T(handle, offset) = self.value(source) else {
@@ -630,6 +706,17 @@ impl<S: Numeric> Machine<S> {
                 // came from a value.
                 Ok(match (&x, &y) {
                     (Value::I(p), Value::I(q)) => Value::I(((*p != 0) || (*q != 0)) as i64),
+                    // A `⇒` exit is "settled or capped": the cap is an integer
+                    // test and known, the tolerance a flag that may not be. A
+                    // known true settles it; a known false leaves the flag as
+                    // it is, so a symbolic run sees the tolerance test itself.
+                    (Value::I(p), Value::B(flag)) | (Value::B(flag), Value::I(p)) => {
+                        if *p != 0 {
+                            Value::I(1)
+                        } else {
+                            Value::B(flag.clone())
+                        }
+                    }
                     _ => Value::B(S::or(&x.b(), &y.b())),
                 })
             }

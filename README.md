@@ -26,6 +26,8 @@ Working prototype. What runs today:
 - Multi-dimensional shifts `▷` / `▽`, per axis, zero-padded at each axis's boundary
 - Folds `◇+` `◇×` `◇>` `◇<` that collapse an axis, so sums, means, dot products
   and norms are one line each
+- `□` lifting and broadcasting, so an outer product — and a matrix product — is
+  one flow
 - Explicit `<4 x double>` vector lowering, verified bit-identical to the scalar path
 - Zero-copy binding: compile a kernel against a buffer the host already owns
 - Emits a native shared library (`.so`) with a documented C ABI
@@ -176,6 +178,15 @@ Passing `NULL` as the output pointer makes the kernel write in place. Passing
 
 ```rho
 {
+    /* a matrix product, contracted in one flow */
+    A:◯ □ 2 3 1
+    B:◯ □ 1 3 4
+    ◇+1 (A × B) → =
+}
+```
+
+```rho
+{
     /* the mean and the L2 norm of a vector */
     INPUT:◯ □ 1024 1
     ((◇+ INPUT) / 1024.0) → MEAN
@@ -223,6 +234,7 @@ smooth input drives it to zero and the kernel returns infinities.
 | LLVM lowering, one sweep per `→` | ✅ implemented |
 | Multi-dimensional indexing and per-axis shifts | ✅ implemented |
 | Folds (`◇`) collapsing an axis | ✅ implemented — scalar inner loop, no scan yet |
+| Lifting (`□`) and broadcasting | ✅ implemented — no implicit rank promotion |
 | Explicit `<4 x double>` vector lowering | ✅ implemented — see the note below |
 | Zero-copy binding (`&[0x…]`, `--bind`) | ✅ implemented |
 | `!` constraint solver | ✅ interval arithmetic; Z3 with `--features z3-solver`. Models binary64 rounding, not ℝ |

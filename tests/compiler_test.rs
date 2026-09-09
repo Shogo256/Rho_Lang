@@ -962,8 +962,8 @@ fn test_unbound_input_makes_the_zero_copy_entrypoint_inert() {
         .and_then(|s| s.split("\n}").next())
         .expect("exec entrypoint");
     assert!(
-        exec.contains("has no & binding"),
-        "unbound INPUT should make the entrypoint inert:\n{exec}"
+        exec.contains("[INPUT] is unbound"),
+        "an unbound source space should make the entrypoint inert:\n{exec}"
     );
 }
 
@@ -1284,4 +1284,170 @@ fn test_fold_shrinks_the_declared_shape() {
     // The sweep that writes OUTPUT covers 3 cells, not 12.
     assert!(ir.contains("sweep 3 cells"), "{ir}");
     assert!(ir.contains("over axis 1 of [3, 4] -> 3 cells"), "{ir}");
+}
+
+// --------------------------------------------------------------------------
+// Lifting and broadcasting. `□aX` inserts a length-1 axis; an element-wise
+// operation stretches such an axis against a longer one. Together with a fold
+// this is what makes a contraction — and so a matrix product — expressible.
+// --------------------------------------------------------------------------
+
+/// Run a kernel whose spaces are bound to caller memory, and return OUTPUT.
+fn run_bound(name: &str, source: &str, inputs: &[(&str, &[f64])], out_len: usize) -> Vec<f64> {
+    let block = parse_rho_program(source).unwrap();
+    let mut buffers: Vec<Vec<f64>> = inputs.iter().map(|(_, data)| data.to_vec()).collect();
+    let mut output = vec![0.0f64; out_len];
+
+    let mut codegen = LlvmCodeGen::new(name);
+    for ((space, _), buffer) in inputs.iter().zip(buffers.iter_mut()) {
+        codegen = codegen.bind(space, buffer.as_mut_ptr() as u64);
+    }
+    codegen = codegen.bind("OUTPUT", output.as_mut_ptr() as u64);
+
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    let so_path = format!("target/{name}.so");
+    assert!(codegen.compile_to_so(&ir, &so_path).is_ok(), "{name} should link:\n{ir}");
+
+    let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
+    let func: libloading::Symbol<unsafe extern "C" fn()> =
+        unsafe { lib.get(b"rho_kernel_exec").unwrap() };
+    unsafe { func() };
+    output
+}
+
+#[test]
+fn test_matrix_multiply_in_one_flow() {
+    // A is [2,3] viewed as [2,3,1] and B is [3,4] viewed as [1,3,4]; they
+    // stretch to [2,3,4], and folding the shared axis contracts them to [2,4].
+    let source = r#"{
+        A:◯ □ 2 3 1
+        B:◯ □ 1 3 4
+        ◇+1 (A × B) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b = [1.0, 0.0, 2.0, 1.0, 0.0, 1.0, 1.0, 2.0, 3.0, 1.0, 0.0, 1.0];
+
+    let out = run_bound("matmul", source, &[("A", &a), ("B", &b)], 8);
+    assert_eq!(out, vec![10.0, 5.0, 4.0, 8.0, 22.0, 11.0, 13.0, 20.0]);
+}
+
+#[test]
+fn test_matrix_multiply_agrees_with_a_reference() {
+    for (m, k, n) in [(1, 1, 1), (3, 3, 3), (4, 2, 5), (5, 7, 3)] {
+        let source = format!(
+            "{{\n    A:◯ □ {m} {k} 1\n    B:◯ □ 1 {k} {n}\n    ◇+1 (A × B) → OUTPUT\n    OUTPUT → =\n}}"
+        );
+        let a: Vec<f64> = (0..m * k).map(|i| (i as f64 * 0.75) - 2.0).collect();
+        let b: Vec<f64> = (0..k * n).map(|i| 1.5 - (i as f64 * 0.25)).collect();
+
+        let out = run_bound(&format!("matmul_{m}_{k}_{n}"), &source, &[("A", &a), ("B", &b)], m * n);
+
+        let mut expected = Vec::with_capacity(m * n);
+        for i in 0..m {
+            for j in 0..n {
+                expected.push((0..k).map(|p| a[i * k + p] * b[p * n + j]).sum::<f64>());
+            }
+        }
+        assert_eq!(out, expected, "{m}x{k} times {k}x{n}");
+    }
+}
+
+#[test]
+fn test_lift_makes_an_outer_product() {
+    // [4] and [3] lifted to [4,1] and [1,3] stretch to [4,3].
+    let source = r#"{
+        A:◯ □ 4
+        B:◯ □ 3
+        ((□1A) × (□0B)) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let a = [1.0, 2.0, 3.0, 4.0];
+    let b = [10.0, 20.0, 30.0];
+
+    let out = run_bound("outer", source, &[("A", &a), ("B", &b)], 12);
+    assert_eq!(
+        out,
+        vec![
+            10.0, 20.0, 30.0, //
+            20.0, 40.0, 60.0, //
+            30.0, 60.0, 90.0, //
+            40.0, 80.0, 120.0,
+        ]
+    );
+}
+
+#[test]
+fn test_broadcast_stretches_a_unit_axis() {
+    // A column [3,1] plus a row [1,4] fills a [3,4] grid.
+    let source = r#"{
+        COL:◯ □ 3 1
+        ROW:◯ □ 1 4
+        (COL + ROW) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let col = [1.0, 2.0, 3.0];
+    let row = [10.0, 20.0, 30.0, 40.0];
+
+    let out = run_bound("broadcast", source, &[("COL", &col), ("ROW", &row)], 12);
+    assert_eq!(
+        out,
+        vec![
+            11.0, 21.0, 31.0, 41.0, //
+            12.0, 22.0, 32.0, 42.0, //
+            13.0, 23.0, 33.0, 43.0,
+        ]
+    );
+}
+
+#[test]
+fn test_shapes_that_cannot_broadcast_are_rejected() {
+    // Ranks must match, and a mismatched axis must be 1 on one side.
+    for (a, b) in [("3 4", "5 4"), ("3 4", "4")] {
+        let source = format!(
+            "{{\n    A:◯ □ {a}\n    B:◯ □ {b}\n    (A + B) → OUTPUT\n    OUTPUT → =\n}}"
+        );
+        assert!(
+            parse_rho_program(&source).is_err(),
+            "shapes [{a}] and [{b}] should not broadcast"
+        );
+    }
+}
+
+#[test]
+fn test_zero_copy_entrypoint_needs_every_source_bound() {
+    // Two inputs and no INPUT space at all: the gate is whether the spaces the
+    // kernel reads are bound, not whether one of them happens to be called
+    // INPUT.
+    let source = r#"{
+        A:◯ □ 4
+        B:◯ □ 4
+        (A + B) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+
+    let ir = LlvmCodeGen::new("half_bound")
+        .bind("A", 0x1000)
+        .generate_llvm_ir(&block)
+        .unwrap();
+    let exec = ir
+        .split("define void @rho_kernel_exec()")
+        .nth(1)
+        .and_then(|s| s.split("\n}").next())
+        .unwrap();
+    assert!(exec.contains("[B] is unbound"), "{exec}");
+
+    let ir = LlvmCodeGen::new("all_bound")
+        .bind("A", 0x1000)
+        .bind("B", 0x2000)
+        .generate_llvm_ir(&block)
+        .unwrap();
+    let exec = ir
+        .split("define void @rho_kernel_exec()")
+        .nth(1)
+        .and_then(|s| s.split("\n}").next())
+        .unwrap();
+    assert!(!exec.contains("is unbound"), "{exec}");
+    assert!(exec.contains("inttoptr i64 8192"), "B should be read from its binding");
 }

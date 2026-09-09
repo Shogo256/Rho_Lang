@@ -58,6 +58,8 @@ pub fn normalize_ascii_aliases(input: &str) -> String {
     input
         // <> before << and >>, so a fold is not mistaken for two shifts.
         .replace("<>", "◇")
+        // [] never appears in an address binding, which is always &[0x...].
+        .replace("[]", "□")
         .replace("->", "→")
         .replace("=>", "→")
         .replace(">>", "▷")
@@ -266,6 +268,19 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         }
     }
 
+    // Lift: □2X views X with a length-1 axis inserted at position 2.
+    if expr_str.starts_with('□') && expr_str.chars().count() > 1 {
+        let rest = &expr_str['□'.len_utf8()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        let operand_str = rest[digits.len()..].trim();
+        if !digits.is_empty() && !operand_str.is_empty() {
+            return Ok(Expr::Lift {
+                axis: digits.parse().unwrap_or(0),
+                operand: Box::new(parse_expr(operand_str)?),
+            });
+        }
+    }
+
     // Reduction: ◇+X folds along an axis, ◇+0X pins the axis.
     if expr_str.starts_with('◇') && expr_str.chars().count() > 2 {
         let rest = &expr_str['◇'.len_utf8()..];
@@ -434,6 +449,7 @@ fn check_expr_spaces(expr: &Expr, declared: &HashSet<String>, line: usize) -> Re
         }
         Expr::Shift { operand: inner, .. }
         | Expr::Reduce { operand: inner, .. }
+        | Expr::Lift { operand: inner, .. }
         | Expr::AuditTrace(inner) => {
             check_expr_spaces(inner, declared, line)?;
         }
@@ -487,6 +503,10 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
                 let a = axis.unwrap_or_else(|| default_axis(&inner));
                 (a < inner.len()).then(|| shape_without_axis(&inner, a))
             }
+            Expr::Lift { axis, operand } => {
+                let inner = get_expr_shape(operand, shapes)?;
+                shape_with_unit_axis(&inner, *axis)
+            }
             Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
                 get_expr_shape(inner, shapes)
             }
@@ -494,13 +514,9 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
                 let l_shape = get_expr_shape(lhs, shapes);
                 let r_shape = get_expr_shape(rhs, shapes);
                 match (l_shape, r_shape) {
-                    (Some(l), Some(r)) => {
-                        if l == r {
-                            Some(l)
-                        } else {
-                            None
-                        }
-                    }
+                    // A length-1 axis stretches, so the operands need not match
+                    // exactly — only broadcast against one another.
+                    (Some(l), Some(r)) => broadcast_shapes(&l, &r),
                     (Some(l), None) => Some(l),
                     (None, Some(r)) => Some(r),
                     (None, None) => None,
@@ -510,7 +526,51 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
         }
     }
 
-    // 2. Validate shapes across flows
+    // 2. Operands that cannot stretch against one another are an error, not an
+    // unknown shape. Reporting it here names the line rather than letting the
+    // mismatch surface as a silently skipped check.
+    fn check_broadcast(
+        expr: &Expr,
+        shapes: &HashMap<String, Vec<usize>>,
+        line: usize,
+    ) -> Result<()> {
+        match expr {
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                check_broadcast(lhs, shapes, line)?;
+                check_broadcast(rhs, shapes, line)?;
+                if let (Some(l), Some(r)) =
+                    (get_expr_shape(lhs, shapes), get_expr_shape(rhs, shapes))
+                {
+                    if broadcast_shapes(&l, &r).is_none() {
+                        return Err(HarmonyDisruption::DimensionErr {
+                            space_a: format!("{}", crate::symbolic::ExprGlyphs(lhs)),
+                            shape_a: l,
+                            space_b: format!("{}", crate::symbolic::ExprGlyphs(rhs)),
+                            shape_b: r,
+                            line,
+                        });
+                    }
+                }
+            }
+            Expr::Shift { operand: inner, .. }
+            | Expr::Reduce { operand: inner, .. }
+            | Expr::Lift { operand: inner, .. }
+            | Expr::AuditTrace(inner) => check_broadcast(inner, shapes, line)?,
+            Expr::Var(_) | Expr::Number(_) => {}
+        }
+        Ok(())
+    }
+
+    for (index, stmt) in block.statements.iter().enumerate() {
+        match stmt {
+            Statement::Flow { src, .. } | Statement::Constraint(src) => {
+                check_broadcast(src, &space_shapes, block.line_of(index))?
+            }
+            _ => {}
+        }
+    }
+
+    // 3. Validate shapes across flows
     for (index, stmt) in block.statements.iter().enumerate() {
         if let Statement::Flow { src, target } = stmt {
             let src_shape = get_expr_shape(src, &space_shapes);

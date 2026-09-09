@@ -117,6 +117,16 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+    /// `□2X` — view X with a length-1 axis inserted at that position.
+    ///
+    /// A length-1 axis costs nothing and stores nothing; it exists so an
+    /// element-wise operation can stretch it against a longer axis. `□1A × □0B`
+    /// on vectors is an outer product, and lifting both operands of a matrix
+    /// product lines their shared axis up so a fold can contract it.
+    Lift {
+        axis: usize,
+        operand: Box<Expr>,
+    },
     /// `◇+0X` — fold the cells along one axis, collapsing it.
     /// The result has the operand's shape with that axis removed.
     Reduce {
@@ -184,6 +194,50 @@ impl ToposBlock {
             .map(|i| self.line_of(i))
             .unwrap_or(0)
     }
+}
+
+/// The shape with a length-1 axis inserted at `axis`.
+pub fn shape_with_unit_axis(shape: &[usize], axis: usize) -> Option<Vec<usize>> {
+    if axis > shape.len() {
+        return None;
+    }
+    let mut out = shape.to_vec();
+    out.insert(axis, 1);
+    Some(out)
+}
+
+/// The shape an element-wise operation produces from two operands.
+///
+/// Ranks must match: a length-1 axis stretches against a longer one, and
+/// anything else is a mismatch. Requiring equal rank keeps the rule something a
+/// reader can check by eye, and `□` is how a shape gains the axes it needs.
+pub fn broadcast_shapes(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
+    if a.len() != b.len() {
+        return None;
+    }
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| {
+            if x == y {
+                Some(x)
+            } else if x == 1 {
+                Some(y)
+            } else if y == 1 {
+                Some(x)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Row-major strides for a shape.
+pub fn strides_of(shape: &[usize]) -> Vec<usize> {
+    let mut strides = vec![1usize; shape.len()];
+    for i in (0..shape.len().saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * shape[i + 1].max(1);
+    }
+    strides
 }
 
 /// The shape left after folding away `axis`.

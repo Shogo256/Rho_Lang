@@ -31,6 +31,7 @@ punctuation.
 | `▽` | Negative Shift | Soroban Shift (左) | Reads the following cell along an axis, 0 at the edge | ✅ |
 | `△` | Space Glyph | — | Usable as a space identifier | ✅ |
 | `◇` | Fold | Dasseki (垜積) | Collapses an axis, see §3.5 | ✅ |
+| `□` | Lift | Hojin (方陣) | In an expression, inserts a length-1 axis, see §3.6 | ✅ |
 | `+` | Addition | Superposition | Element-wise addition | ✅ |
 | `-` | Subtraction | Difference | Element-wise subtraction | ✅ |
 | `×` / `*` | Multiplication | Scaling | Element-wise product | ✅ |
@@ -145,7 +146,44 @@ result exists before the fold that consumes it.
 iterations, and splitting it would change the order of the additions and so the
 result. `◇` also does not yet have a scan (running total) counterpart.
 
+### 3.6 Lifting and broadcasting (`□`) ✅
+
+`□aX` views `X` with a length-1 axis inserted at position `a`. The axis stores
+nothing; it exists so an element-wise operation can stretch it.
+
+Two operands combine when their ranks match and each axis pair is either equal
+or has a 1 on one side. The result takes the longer of each pair. Requiring
+equal rank keeps the rule checkable by eye, and `□` is how a shape gains the
+axes it needs.
+
+```rho
+(□1A) × (□0B)      /* [4] and [3] -> [4,1] and [1,3] -> [4,3]: an outer product */
+COL + ROW          /* [3,1] and [1,4] -> [3,4]                                   */
+```
+
+Together with a fold this gives a contraction, and so a matrix product:
+
+```rho
+A:◯ □ 2 3 1
+B:◯ □ 1 3 4
+◇+1 (A × B) → OUTPUT      /* [2,3,4] folded on axis 1 -> [2,4] */
+```
+
+The intermediate `[2,3,4]` is never materialised: the fold evaluates the product
+at each index as it walks the contracted axis, so the work is exactly the
+`M·N·K` multiply-adds the product requires.
+
+A stretched read is not contiguous, so a flow that broadcasts is lowered scalar
+rather than vectorised.
+
+📋 Ranks are not promoted implicitly, and there is no reshape that moves cells
+between axes — `□` only inserts axes of length 1.
+
 ### 3.4 Zero-Copy Pointer (`&`) ✅
+
+Any space may be bound, not just `INPUT` and `OUTPUT`, which is what lets a
+kernel take more than one input — a matrix product needs two. The zero-copy
+entrypoint runs once every space no flow writes has an address.
 
 `&[0xADDR]:NAME:◯ □ ...` binds a space to an address. `rhoc --bind NAME=0x...`
 overrides the literal, so a host can compile a kernel against the address of a

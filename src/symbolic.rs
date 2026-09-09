@@ -104,7 +104,6 @@ struct Builder<'a> {
     defs: &'a [(String, Expr)],
     shapes: &'a BTreeMap<String, Vec<usize>>,
     fallback_shape: Vec<usize>,
-    elements: usize,
     tau: f64,
     folds: usize,
 }
@@ -113,7 +112,6 @@ impl Builder<'_> {
     fn shape_of(&self, name: &str) -> Vec<usize> {
         self.shapes
             .get(name)
-            .filter(|s| s.iter().product::<usize>() == self.elements)
             .cloned()
             .unwrap_or_else(|| self.fallback_shape.clone())
     }
@@ -129,7 +127,9 @@ impl Builder<'_> {
                 Some((idx, def)) => self.build(&def, idx, offset),
                 None => Sym::Free(format!("{name}@{offset}")),
             },
-            Expr::AuditTrace(inner) => self.build(inner, before, offset),
+            Expr::AuditTrace(inner) | Expr::Lift { operand: inner, .. } => {
+                self.build(inner, before, offset)
+            }
             Expr::Shift { dir, axis, operand } => {
                 let Some(name) = place_name(operand) else {
                     return Sym::Free(format!("shift@{offset}"));
@@ -226,7 +226,6 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
         .cloned()
         .or_else(|| shapes.values().next().cloned())
         .unwrap_or_else(|| vec![4]);
-    let elements = fallback_shape.iter().product::<usize>().max(1);
 
     // Flow definitions in order, and where each constraint sits among them.
     let mut defs: Vec<(String, Expr)> = Vec::new();
@@ -257,7 +256,6 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
         defs: &defs_snapshot,
         shapes: &shapes,
         fallback_shape,
-        elements,
         tau,
         folds: 0,
     };
@@ -324,6 +322,7 @@ fn collect_divisions(
         }
         Expr::Shift { operand: inner, .. }
         | Expr::Reduce { operand: inner, .. }
+        | Expr::Lift { operand: inner, .. }
         | Expr::AuditTrace(inner) => {
             collect_divisions(inner, at, line, builder, out)
         }
@@ -361,6 +360,7 @@ impl fmt::Display for ExprGlyphs<'_> {
             Expr::Number(v) => write!(f, "{v}"),
             Expr::Var(name) => write!(f, "{name}"),
             Expr::AuditTrace(inner) => write!(f, "$ {}", ExprGlyphs(inner)),
+            Expr::Lift { axis, operand } => write!(f, "□{axis}{}", ExprGlyphs(operand)),
             Expr::Shift { dir, axis, operand } => match axis {
                 Some(a) => write!(f, "{dir}{a}{}", ExprGlyphs(operand)),
                 None => write!(f, "{dir}{}", ExprGlyphs(operand)),

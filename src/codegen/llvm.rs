@@ -232,43 +232,50 @@ impl LlvmCodeGen {
             "@.rho_meta_str = private unnamed_addr constant [{meta_len} x i8] c\"{meta_escaped}\", align 1\n\n"
         ));
 
+
         // 1. Static entrypoint: void @rho_kernel_exec()
         let elements = self.elements.to_string();
         ir.push_str("define void @rho_kernel_exec() #0 {\n");
         ir.push_str("entry:\n");
-        match self.ext_bindings.get("INPUT").copied() {
-            Some(in_addr) => {
-                ir.push_str(&format!("  ; Zero-copy binding for [INPUT] at {in_addr:#X}\n"));
-                ir.push_str(&format!("  %INPUT_ext = inttoptr i64 {in_addr} to ptr\n"));
-                // An unbound OUTPUT means the grid is transformed in place,
-                // matching what a null output pointer does in the C ABI.
-                let out_sym = match self.ext_bindings.get("OUTPUT").copied() {
-                    Some(out_addr) => {
-                        ir.push_str(&format!(
-                            "  ; Zero-copy binding for [OUTPUT] at {out_addr:#X}\n"
-                        ));
-                        ir.push_str(&format!("  %OUTPUT_ext = inttoptr i64 {out_addr} to ptr\n"));
-                        "%OUTPUT_ext".to_string()
-                    }
-                    None => "%INPUT_ext".to_string(),
-                };
-                self.emit_body(
-                    block,
-                    &mut ir,
-                    "%INPUT_ext",
-                    &out_sym,
-                    "entry",
-                    Vec::new(),
-                    &elements,
-                )?;
+
+        // Every space a flow never writes is read from memory the caller owns,
+        // so the entrypoint is only meaningful once all of them are bound. A
+        // kernel with two inputs and no INPUT at all is perfectly ordinary.
+        let sources = self.source_spaces(block);
+        let unbound: Vec<&String> = sources
+            .iter()
+            .filter(|name| !self.ext_bindings.contains_key(*name))
+            .collect();
+
+        if unbound.is_empty() && !self.ext_bindings.is_empty() {
+            let mut heap = Vec::new();
+            let in_sym = match self.ext_bindings.get("INPUT").copied() {
+                Some(addr) => {
+                    ir.push_str(&format!("  ; Zero-copy binding for [INPUT] at {addr:#X}\n"));
+                    ir.push_str("  %INPUT_ext = inttoptr i64 ".to_string().as_str());
+                    ir.push_str(&format!("{addr} to ptr\n"));
+                    "%INPUT_ext".to_string()
+                }
+                None => self.emit_scratch(&mut ir, "INPUT_local", self.elements, &mut heap),
+            };
+            // An unbound OUTPUT means the grid is transformed in place.
+            let out_sym = match self.ext_bindings.get("OUTPUT").copied() {
+                Some(addr) => {
+                    ir.push_str(&format!("  ; Zero-copy binding for [OUTPUT] at {addr:#X}\n"));
+                    ir.push_str(&format!("  %OUTPUT_ext = inttoptr i64 {addr} to ptr\n"));
+                    "%OUTPUT_ext".to_string()
+                }
+                None if self.ext_bindings.contains_key("INPUT") => in_sym.clone(),
+                None => self.emit_scratch(&mut ir, "OUTPUT_local", self.elements, &mut heap),
+            };
+            self.emit_body(block, &mut ir, &in_sym, &out_sym, "entry", heap, &elements)?;
+        } else {
+            ir.push_str("  ; Not every space this kernel reads has an & binding:\n");
+            for name in &unbound {
+                ir.push_str(&format!("  ;   [{name}] is unbound\n"));
             }
-            None => {
-                // Without an address there is no memory to read; inventing a
-                // local buffer here would just compute over uninitialised bytes.
-                ir.push_str("  ; [INPUT] has no & binding, so there is nothing to read.\n");
-                ir.push_str("  ; Use rho_kernel_exec_with_args, or compile with --bind INPUT=0x...\n");
-                ir.push_str("  ret void\n");
-            }
+            ir.push_str("  ; Use rho_kernel_exec_with_args, or compile with --bind NAME=0x...\n");
+            ir.push_str("  ret void\n");
         }
         ir.push_str("}\n\n");
 
@@ -389,13 +396,22 @@ impl LlvmCodeGen {
             Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
                 Self::expr_shape(inner, shapes)
             }
+            Expr::Lift { axis, operand } => {
+                let inner = Self::expr_shape(operand, shapes)?;
+                crate::ast::shape_with_unit_axis(&inner, *axis)
+            }
             Expr::Reduce { axis, operand, .. } => {
                 let inner = Self::expr_shape(operand, shapes)?;
                 let a = axis.unwrap_or_else(|| crate::ast::default_axis(&inner));
                 (a < inner.len()).then(|| crate::ast::shape_without_axis(&inner, a))
             }
             Expr::BinaryOp { lhs, rhs, .. } => {
-                Self::expr_shape(lhs, shapes).or_else(|| Self::expr_shape(rhs, shapes))
+                match (Self::expr_shape(lhs, shapes), Self::expr_shape(rhs, shapes)) {
+                    (Some(l), Some(r)) => crate::ast::broadcast_shapes(&l, &r),
+                    (Some(l), None) => Some(l),
+                    (None, Some(r)) => Some(r),
+                    (None, None) => None,
+                }
             }
             Expr::Number(_) => None,
         }
@@ -455,8 +471,22 @@ impl LlvmCodeGen {
             if name == "INPUT" || name == "OUTPUT" {
                 continue;
             }
+            let sanitized = self.sanitize_ident(name);
+
+            // A space bound to an address is the caller's memory, not ours.
+            // Only INPUT and OUTPUT arrive as parameters; every other space
+            // reaches the kernel through its binding, which is what lets a
+            // kernel take more than one input.
+            if let Some(addr) = self.ext_bindings.get(name) {
+                let sym = format!("%{sanitized}_ext");
+                ir.push_str(&format!("  ; Zero-copy binding for [{name}] at {addr:#X}\n"));
+                ir.push_str(&format!("  {sym} = inttoptr i64 {addr} to ptr\n"));
+                map.insert(name.clone(), sym);
+                continue;
+            }
+
             let count = shape.iter().product::<usize>().max(1);
-            let label = format!("{}_buf", self.sanitize_ident(name));
+            let label = format!("{sanitized}_buf");
             let sym = self.emit_scratch(ir, &label, count, &mut heap);
             map.insert(name.clone(), sym);
         }
@@ -529,7 +559,13 @@ impl LlvmCodeGen {
             pred = self.emit_fold_prepass(src, ir, bufs, &pred, counter)?;
 
             let sweep = self.sweep_length(src, target, bufs);
-            let plan = self.plan_sweep(src, &sweep)?;
+            let result_shape = self.sweep_shape(src, target);
+            // A stretched read is not contiguous, so it cannot be vector loaded.
+            let plan = if self.needs_broadcast(src, &result_shape, &[]) {
+                Sweep::AllScalar
+            } else {
+                self.plan_sweep(src, &sweep)?
+            };
             ir.push_str(&format!(
                 "  ; Flow {loop_id}: sweep {sweep} cells{}\n",
                 plan.describe()
@@ -548,6 +584,7 @@ impl LlvmCodeGen {
                         &target_ptr,
                         bufs,
                         counter,
+                        &result_shape,
                     )?;
                 }
                 Sweep::Split {
@@ -567,6 +604,7 @@ impl LlvmCodeGen {
                         &target_ptr,
                         bufs,
                         counter,
+                        &result_shape,
                     )?;
                     pred = self.emit_range_loop(
                         ir,
@@ -579,6 +617,7 @@ impl LlvmCodeGen {
                         &target_ptr,
                         bufs,
                         counter,
+                        &result_shape,
                     )?;
                     pred = self.emit_range_loop(
                         ir,
@@ -591,6 +630,7 @@ impl LlvmCodeGen {
                         &target_ptr,
                         bufs,
                         counter,
+                        &result_shape,
                     )?;
                 }
             }
@@ -617,7 +657,9 @@ impl LlvmCodeGen {
         let mut block = pred.to_string();
         match expr {
             Expr::Var(_) | Expr::Number(_) => {}
-            Expr::AuditTrace(inner) | Expr::Shift { operand: inner, .. } => {
+            Expr::AuditTrace(inner)
+            | Expr::Shift { operand: inner, .. }
+            | Expr::Lift { operand: inner, .. } => {
                 block = self.emit_fold_prepass(inner, ir, bufs, &block, counter)?;
             }
             Expr::BinaryOp { lhs, rhs, .. } => {
@@ -733,6 +775,8 @@ impl LlvmCodeGen {
             &format!("%{label}.at"),
             counter,
             Mode::Scalar,
+            &shape,
+            &[],
         )?;
         match op {
             FoldOp::Sum => ir.push_str(&format!(
@@ -785,6 +829,7 @@ impl LlvmCodeGen {
         target_ptr: &str,
         bufs: &Buffers,
         counter: &mut usize,
+        result_shape: &[usize],
     ) -> Result<String> {
         // A statically empty range needs no loop at all.
         if let (Ok(a), Ok(b)) = (lo.parse::<u64>(), hi.parse::<u64>()) {
@@ -810,7 +855,7 @@ impl LlvmCodeGen {
         ir.push_str(&format!("  br i1 {cond}, label %{body}, label %{end}\n\n"));
 
         ir.push_str(&format!("{body}:\n"));
-        let value = self.emit_expr(src, ir, bufs, &idx, counter, mode)?;
+        let value = self.emit_expr(src, ir, bufs, &idx, counter, mode, result_shape, &[])?;
         let gep = Self::fresh(counter);
         ir.push_str(&format!(
             "  {gep} = getelementptr inbounds double, ptr {target_ptr}, i64 {idx}\n"
@@ -824,6 +869,46 @@ impl LlvmCodeGen {
 
         ir.push_str(&format!("{end}:\n"));
         Ok(end)
+    }
+
+    /// Declared spaces that no flow ever writes: the kernel's inputs.
+    fn source_spaces(&self, block: &ToposBlock) -> Vec<String> {
+        let written: Vec<String> = block
+            .statements
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Statement::Flow {
+                    target: FlowTarget::Var(name),
+                    ..
+                } => Some(name.clone()),
+                Statement::Flow {
+                    target: FlowTarget::Equilibrium,
+                    ..
+                } => Some("OUTPUT".to_string()),
+                _ => None,
+            })
+            .collect();
+        block
+            .statements
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Statement::SpaceDef(d) => Some(d.name.clone()),
+                Statement::ExtBind(b) => Some(b.space.name.clone()),
+                _ => None,
+            })
+            .filter(|name| !written.contains(name))
+            .collect()
+    }
+
+    /// The shape this flow writes into.
+    fn sweep_shape(&self, src: &Expr, target: &FlowTarget) -> Vec<usize> {
+        let name = match target {
+            FlowTarget::Var(n) => n.clone(),
+            FlowTarget::Equilibrium => "OUTPUT".to_string(),
+        };
+        Self::expr_shape(src, &self.space_shapes)
+            .or_else(|| self.space_shapes.get(&name).cloned())
+            .unwrap_or_else(|| vec![self.elements])
     }
 
     /// How many cells this flow writes: the length of what it flows into,
@@ -886,6 +971,7 @@ impl LlvmCodeGen {
             // A fold is precomputed into its own buffer before the sweep, so
             // it contributes no reach to the sweep itself.
             Expr::Reduce { .. } => 0,
+            Expr::Lift { operand, .. } => self.max_shift_stride(operand)?,
             Expr::Shift { axis, operand, .. } => {
                 let inner = self.max_shift_stride(operand)?;
                 let Some(name) = Self::place_name(operand) else {
@@ -915,12 +1001,109 @@ impl LlvmCodeGen {
         })
     }
 
+    /// A shape with the enclosing lifts' unit axes inserted. The lifts arrive
+    /// outermost-first, so they are applied in reverse to land where written.
+    fn lifted_shape(shape: &[usize], lifts: &[usize]) -> Vec<usize> {
+        let mut view = shape.to_vec();
+        for &axis in lifts.iter().rev() {
+            match crate::ast::shape_with_unit_axis(&view, axis) {
+                Some(next) => view = next,
+                None => return view,
+            }
+        }
+        view
+    }
+
+    /// Translate an index into `result_shape` into an index into `source`.
+    ///
+    /// They agree except where `source` has a length-1 axis stretched against a
+    /// longer one; those axes contribute nothing, which is exactly what makes a
+    /// value repeat along them. Identical shapes need no arithmetic at all.
+    fn emit_index_map(
+        &self,
+        ir: &mut String,
+        idx: &str,
+        source: &[usize],
+        result_shape: &[usize],
+        counter: &mut usize,
+    ) -> Result<String> {
+        if source == result_shape || result_shape.is_empty() || source.len() != result_shape.len() {
+            return Ok(idx.to_string());
+        }
+
+        let src_strides = crate::ast::strides_of(source);
+        let res_strides = crate::ast::strides_of(result_shape);
+
+        let mut terms: Vec<String> = Vec::new();
+        for axis in 0..result_shape.len() {
+            // A stretched axis holds the same value for every position along it.
+            if source[axis] <= 1 {
+                continue;
+            }
+            let coord = Self::fresh(counter);
+            let scaled = Self::fresh(counter);
+            if res_strides[axis] == 1 {
+                ir.push_str(&format!(
+                    "  {coord} = urem i64 {idx}, {}\n",
+                    result_shape[axis]
+                ));
+            } else {
+                let div = Self::fresh(counter);
+                ir.push_str(&format!("  {div} = udiv i64 {idx}, {}\n", res_strides[axis]));
+                ir.push_str(&format!(
+                    "  {coord} = urem i64 {div}, {}\n",
+                    result_shape[axis]
+                ));
+            }
+            ir.push_str(&format!(
+                "  {scaled} = mul i64 {coord}, {}\n",
+                src_strides[axis]
+            ));
+            terms.push(scaled);
+        }
+
+        if terms.is_empty() {
+            return Ok("0".to_string());
+        }
+        let mut acc = terms[0].clone();
+        for term in &terms[1..] {
+            let next = Self::fresh(counter);
+            ir.push_str(&format!("  {next} = add i64 {acc}, {term}\n"));
+            acc = next;
+        }
+        Ok(acc)
+    }
+
+    /// Whether any read in this expression is stretched, which rules out the
+    /// contiguous vector loads the sweep would otherwise use.
+    fn needs_broadcast(&self, expr: &Expr, result_shape: &[usize], lifts: &[usize]) -> bool {
+        match expr {
+            Expr::Number(_) => false,
+            Expr::Var(name) => Self::lifted_shape(&self.shape_for(name), lifts) != result_shape,
+            Expr::AuditTrace(inner) | Expr::Shift { operand: inner, .. } => {
+                self.needs_broadcast(inner, result_shape, lifts)
+            }
+            Expr::Lift { axis, operand } => {
+                let mut nested = lifts.to_vec();
+                nested.push(*axis);
+                self.needs_broadcast(operand, result_shape, &nested)
+            }
+            // A fold is read from its own buffer, which already has the result shape.
+            Expr::Reduce { .. } => false,
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                self.needs_broadcast(lhs, result_shape, lifts)
+                    || self.needs_broadcast(rhs, result_shape, lifts)
+            }
+        }
+    }
+
     /// The shape a space is traversed with; falls back to the grid when a
     /// declared shape does not cover the sweep.
     fn shape_for(&self, name: &str) -> Vec<usize> {
+        // Shapes stopped being uniform when folds arrived, so a space's own
+        // shape is authoritative even when its length differs from the grid's.
         self.space_shapes
             .get(name)
-            .filter(|s| s.iter().product::<usize>() == self.elements)
             .cloned()
             .or_else(|| Self::primary_shape(&self.space_shapes))
             .unwrap_or_else(|| vec![self.elements])
@@ -937,6 +1120,8 @@ impl LlvmCodeGen {
         idx: &str,
         counter: &mut usize,
         mode: Mode,
+        result_shape: &[usize],
+        lifts: &[usize],
     ) -> Result<String> {
         let ty = mode.ty();
         match expr {
@@ -946,16 +1131,29 @@ impl LlvmCodeGen {
 
             Expr::Var(name) => {
                 let ptr = self.lookup(bufs, name)?;
+                let view = Self::lifted_shape(&self.shape_for(name), lifts);
+                let read_at = self.emit_index_map(ir, idx, &view, result_shape, counter)?;
                 let gep = Self::fresh(counter);
                 let val = Self::fresh(counter);
                 ir.push_str(&format!(
-                    "  {gep} = getelementptr inbounds double, ptr {ptr}, i64 {idx}\n"
+                    "  {gep} = getelementptr inbounds double, ptr {ptr}, i64 {read_at}\n"
                 ));
                 ir.push_str(&format!("  {val} = load {ty}, ptr {gep}, align 8\n"));
                 Ok(val)
             }
 
-            Expr::AuditTrace(inner) => self.emit_expr(inner, ir, bufs, idx, counter, mode),
+            Expr::AuditTrace(inner) => {
+                self.emit_expr(inner, ir, bufs, idx, counter, mode, result_shape, lifts)
+            }
+
+            // A lift stores nothing. It records that the operand is viewed with
+            // an extra length-1 axis, which the read below folds into its index
+            // mapping.
+            Expr::Lift { axis, operand } => {
+                let mut nested = lifts.to_vec();
+                nested.push(*axis);
+                self.emit_expr(operand, ir, bufs, idx, counter, mode, result_shape, &nested)
+            }
 
             Expr::Shift { dir, axis, operand } => {
                 self.emit_shift(operand, *dir, *axis, ir, bufs, idx, counter, mode)
@@ -983,8 +1181,8 @@ impl LlvmCodeGen {
             }
 
             Expr::BinaryOp { op, lhs, rhs } => {
-                let l = self.emit_expr(lhs, ir, bufs, idx, counter, mode)?;
-                let r = self.emit_expr(rhs, ir, bufs, idx, counter, mode)?;
+                let l = self.emit_expr(lhs, ir, bufs, idx, counter, mode, result_shape, lifts)?;
+                let r = self.emit_expr(rhs, ir, bufs, idx, counter, mode, result_shape, lifts)?;
                 let out = Self::fresh(counter);
 
                 match op {

@@ -1,17 +1,11 @@
 //! The value a program is evaluated over.
 //!
-//! Both evaluators — the reference interpreter and the reader for the emitted
-//! IR — are written against this trait rather than against `f64` directly. That
-//! lets the same, already differential-tested code run twice: once on numbers,
-//! to compare answers, and once on symbols, to compare *functions*.
-//!
-//! Only the data is abstracted. Indices, addresses and control flow stay
-//! concrete, because nothing `rhoc` emits ever branches on a value.
+//! The reference interpreter is written against this trait rather than against
+//! `f64` directly, so the same code runs at both widths a kernel can be
+//! compiled at and is compared against the kernel at each.
 
 use crate::ast::BuiltinOp;
-use std::cell::RefCell;
 use std::fmt;
-use std::rc::Rc;
 
 /// The comparisons the language and the IR both need.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +15,7 @@ pub enum Compare {
     Gte,
     Lte,
     Eq,
-    /// What a non-zero test lowers to: `fcmp one`.
+    /// What a non-zero test means: `!=`, true for NaN.
     Ne,
 }
 
@@ -45,12 +39,9 @@ pub trait Numeric: Clone + fmt::Debug {
     fn compare(&self, other: &Self, how: Compare) -> Self::Bool;
     fn select(condition: &Self::Bool, when_true: &Self, when_false: &Self) -> Self;
 
-    fn boolean(value: bool) -> Self::Bool;
-    fn or(a: &Self::Bool, b: &Self::Bool) -> Self::Bool;
-    /// The flag's value when it is known — which it always is on numbers and
-    /// never is on symbols, short of a constant. The exit of a `⇒` loop is
-    /// the one decision in the language that asks.
-    fn truth(flag: &Self::Bool) -> Option<bool>;
+    /// The flag's value. The exit of a `⇒` loop is the one decision in the
+    /// language that asks.
+    fn truth(flag: &Self::Bool) -> bool;
 }
 
 impl Numeric for f64 {
@@ -111,14 +102,8 @@ impl Numeric for f64 {
             *when_false
         }
     }
-    fn boolean(value: bool) -> bool {
-        value
-    }
-    fn or(a: &bool, b: &bool) -> bool {
-        *a || *b
-    }
-    fn truth(flag: &bool) -> Option<bool> {
-        Some(*flag)
+    fn truth(flag: &bool) -> bool {
+        *flag
     }
 }
 
@@ -239,183 +224,8 @@ impl Numeric for f32 {
             *when_false
         }
     }
-    fn boolean(value: bool) -> bool {
-        value
-    }
-    fn or(a: &bool, b: &bool) -> bool {
-        *a || *b
-    }
-    fn truth(flag: &bool) -> Option<bool> {
-        Some(*flag)
-    }
-}
-
-// ------------------------------------------------------------------ symbols
-
-/// A value built from the inputs rather than computed from them.
-#[derive(Debug)]
-pub enum Node {
-    /// Cell `index` of the caller's input.
-    Input(usize),
-    Const(f64),
-    Add(Term, Term),
-    Sub(Term, Term),
-    Mul(Term, Term),
-    Div(Term, Term),
-    /// A power with an exponent that is not a whole number. Left uninterpreted:
-    /// both sides apply the same function to the same arguments, so equivalence
-    /// still follows, and no solver has to reason about real exponentiation.
-    Power(Term, Term),
-    Select(Predicate, Term, Term),
-    /// A named function. Left uninterpreted for the solver: both sides apply
-    /// the same one to the same argument, so equivalence follows without
-    /// anyone having to axiomatise a transcendental.
-    Unary(BuiltinOp, Term),
-}
-
-#[derive(Debug)]
-pub enum BoolNode {
-    Const(bool),
-    Compare(Compare, Term, Term),
-    Or(Predicate, Predicate),
-}
-
-/// A shared subexpression. Sharing matters: an unrolled sweep reuses the same
-/// values many times, and walking them again for each use would not finish.
-#[derive(Debug, Clone)]
-pub struct Term(pub Rc<Node>);
-
-#[derive(Debug, Clone)]
-pub struct Predicate(pub Rc<BoolNode>);
-
-impl Term {
-    fn of(node: Node) -> Term {
-        Term(Rc::new(node))
-    }
-
-    /// A stable identity for memoising a walk over the shared graph.
-    pub fn id(&self) -> usize {
-        Rc::as_ptr(&self.0) as usize
-    }
-
-    pub fn input(index: usize) -> Term {
-        Term::of(Node::Input(index))
-    }
-
-    /// How many distinct nodes this term is built from.
-    pub fn size(&self) -> usize {
-        let mut seen = std::collections::BTreeSet::new();
-        let mut stack = vec![self.clone()];
-        while let Some(term) = stack.pop() {
-            if !seen.insert(term.id()) {
-                continue;
-            }
-            match &*term.0 {
-                Node::Input(_) | Node::Const(_) => {}
-                Node::Add(a, b)
-                | Node::Sub(a, b)
-                | Node::Mul(a, b)
-                | Node::Div(a, b)
-                | Node::Power(a, b) => {
-                    stack.push(a.clone());
-                    stack.push(b.clone());
-                }
-                Node::Select(p, a, b) => {
-                    stack.push(a.clone());
-                    stack.push(b.clone());
-                    collect_predicate(p, &mut stack);
-                }
-                Node::Unary(_, a) => stack.push(a.clone()),
-            }
-        }
-        seen.len()
-    }
-}
-
-fn collect_predicate(predicate: &Predicate, stack: &mut Vec<Term>) {
-    match &*predicate.0 {
-        BoolNode::Const(_) => {}
-        BoolNode::Compare(_, a, b) => {
-            stack.push(a.clone());
-            stack.push(b.clone());
-        }
-        BoolNode::Or(a, b) => {
-            collect_predicate(a, stack);
-            collect_predicate(b, stack);
-        }
-    }
-}
-
-thread_local! {
-    /// Constants are shared so that the many zeros and ones an unrolled sweep
-    /// produces do not each become a separate node.
-    static CONSTANTS: RefCell<std::collections::BTreeMap<u64, Term>> =
-        const { RefCell::new(std::collections::BTreeMap::new()) };
-}
-
-impl Numeric for Term {
-    type Bool = Predicate;
-
-    fn constant(value: f64) -> Term {
-        CONSTANTS.with(|cache| {
-            cache
-                .borrow_mut()
-                .entry(value.to_bits())
-                .or_insert_with(|| Term::of(Node::Const(value)))
-                .clone()
-        })
-    }
-
-    fn as_constant(&self) -> Option<f64> {
-        match &*self.0 {
-            Node::Const(v) => Some(*v),
-            _ => None,
-        }
-    }
-
-    fn add(&self, other: &Term) -> Term {
-        Term::of(Node::Add(self.clone(), other.clone()))
-    }
-    fn sub(&self, other: &Term) -> Term {
-        Term::of(Node::Sub(self.clone(), other.clone()))
-    }
-    fn mul(&self, other: &Term) -> Term {
-        Term::of(Node::Mul(self.clone(), other.clone()))
-    }
-    fn div(&self, other: &Term) -> Term {
-        Term::of(Node::Div(self.clone(), other.clone()))
-    }
-    fn power(&self, other: &Term) -> Term {
-        Term::of(Node::Power(self.clone(), other.clone()))
-    }
-    fn unary(&self, op: BuiltinOp) -> Term {
-        Term::of(Node::Unary(op, self.clone()))
-    }
-
-    fn compare(&self, other: &Term, how: Compare) -> Predicate {
-        Predicate(Rc::new(BoolNode::Compare(how, self.clone(), other.clone())))
-    }
-
-    fn select(condition: &Predicate, when_true: &Term, when_false: &Term) -> Term {
-        Term::of(Node::Select(
-            condition.clone(),
-            when_true.clone(),
-            when_false.clone(),
-        ))
-    }
-
-    fn boolean(value: bool) -> Predicate {
-        Predicate(Rc::new(BoolNode::Const(value)))
-    }
-
-    fn or(a: &Predicate, b: &Predicate) -> Predicate {
-        Predicate(Rc::new(BoolNode::Or(a.clone(), b.clone())))
-    }
-    fn truth(flag: &Predicate) -> Option<bool> {
-        match &*flag.0 {
-            BoolNode::Const(v) => Some(*v),
-            _ => None,
-        }
+    fn truth(flag: &bool) -> bool {
+        *flag
     }
 }
 

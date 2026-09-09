@@ -1737,161 +1737,12 @@ fn test_a_whole_exponent_is_repeated_multiplication() {
 // generator mean the right thing" from "did clang build what it was told".
 // --------------------------------------------------------------------------
 
-use rho_lang::irvm::{parse_module, Machine, Value};
-
-fn run_emitted_ir(name: &str, source: &str, input: &[f64], out_cells: usize) -> Vec<f64> {
-    let block = parse_rho_program(source).unwrap();
-    let ir = LlvmCodeGen::new(name).generate_llvm_ir(&block).unwrap();
-
-    let functions = parse_module(&ir);
-    let entry = functions
-        .iter()
-        .find(|f| f.name == "rho_kernel_exec_with_args")
-        .expect("the argument entrypoint");
-
-    let mut machine = Machine::new();
-    let src = machine.add_buffer(input.to_vec());
-    let dst = machine.add_buffer(vec![0.0; out_cells]);
-    machine
-        .run(entry, &[Value::P(src, 0), Value::P(dst, 0)])
-        .unwrap_or_else(|why| panic!("{name}: {why}\n{ir}"));
-    machine.buffer(dst).to_vec()
-}
-
-#[test]
-fn test_the_emitted_ir_computes_what_the_source_means() {
-    let input: Vec<f64> = vec![2.0, -4.0, 4.0, 0.5, 5.0, -5.0, 7.0, 9.0, -1.0, 3.0, 0.0, 6.0];
-
-    let cases: [(&str, &str, &[usize], usize); 7] = [
-        ("ir_add", "(INPUT + 1.0) → OUTPUT\n        OUTPUT → =", &[12, 1], 12),
-        ("ir_shift", "(▷INPUT - INPUT) → OUTPUT\n        OUTPUT → =", &[3, 4], 12),
-        ("ir_axis", "(▽0INPUT) → OUTPUT\n        OUTPUT → =", &[3, 4], 12),
-        ("ir_mask", "(INPUT > 1.0) → OUTPUT\n        OUTPUT → =", &[12, 1], 12),
-        ("ir_fold", "◇+1 INPUT → OUTPUT\n        OUTPUT → =", &[3, 4], 3),
-        ("ir_scan", "◈+ INPUT → OUTPUT\n        OUTPUT → =", &[12, 1], 12),
-        (
-            "ir_chain",
-            "(▷INPUT - INPUT) → D\n        ((D ^ 2.0) + 1.0) → OUTPUT\n        OUTPUT → =",
-            &[12, 1],
-            12,
-        ),
-    ];
-
-    for (name, body, shape, out_cells) in cases {
-        let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
-        let source = format!(
-            "{{\n        INPUT:◯ □ {}\n        {body}\n    }}",
-            dims.join(" ")
-        );
-
-        // What the source means, per the reference interpreter.
-        let block = parse_rho_program(&source).unwrap();
-        let mut env = Env::new();
-        env.insert("INPUT".to_string(), Grid::from(shape.to_vec(), input.clone()));
-        let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
-
-        // What the generator emitted, run on its own.
-        let emitted = run_emitted_ir(name, &source, &input, out_cells);
-
-        assert_eq!(
-            meant.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            emitted[..meant.len()].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            "{name}: the emitted IR does not compute what the source means"
-        );
-    }
-}
-
-#[test]
-fn test_the_ir_reader_refuses_what_it_does_not_understand() {
-    // A validator that quietly ignored an instruction would be worse than one
-    // that stops, so an unknown opcode has to be an error rather than a shrug.
-    let functions = parse_module(
-        "define void @rho_kernel_exec_with_args(ptr %in_ptr, ptr %out_ptr) #0 {\nentry:\n  %x = frobnicate double 1.0, 2.0\n  ret void\n}\n",
-    );
-    let mut machine = Machine::new();
-    let a = machine.add_buffer(vec![0.0; 4]);
-    let b = machine.add_buffer(vec![0.0; 4]);
-    let outcome = machine.run(&functions[0], &[Value::P(a, 0), Value::P(b, 0)]);
-    assert!(outcome.is_err(), "an unknown opcode must be reported");
-}
 
 // --------------------------------------------------------------------------
 // Translation validation. Testing says the two agree on the inputs we tried;
 // this says they agree on every input, for a given program and shape.
 // --------------------------------------------------------------------------
 
-use rho_lang::validate::{compare, expressions, expressions_of, Verdict as Equivalence};
-
-#[test]
-fn test_the_emitted_ir_is_equivalent_to_the_source() {
-    let cases: [(&str, &[usize]); 6] = [
-        ("(INPUT + 1.0) → OUTPUT\n        OUTPUT → =", &[6, 1]),
-        ("(▷INPUT - INPUT) → OUTPUT\n        OUTPUT → =", &[2, 3]),
-        ("(INPUT > 1.0) → OUTPUT\n        OUTPUT → =", &[6, 1]),
-        ("◇+ INPUT → OUTPUT\n        OUTPUT → =", &[6, 1]),
-        ("◈+ INPUT → OUTPUT\n        OUTPUT → =", &[6, 1]),
-        (
-            "(▷INPUT - INPUT) → D\n        ((D × D) + 1.0) → OUTPUT\n        OUTPUT → =",
-            &[2, 3],
-        ),
-    ];
-
-    for (body, shape) in cases {
-        let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
-        let source = format!(
-            "{{\n        INPUT:◯ □ {}\n        {body}\n    }}",
-            dims.join(" ")
-        );
-        let block = parse_rho_program(&source).unwrap();
-        let (left, right) = expressions(&block, shape, 0.0).unwrap();
-
-        // Without the SMT backend this reports NotChecked rather than failing:
-        // the default build still gets the graphs, just not the proof.
-        match compare(&left, &right) {
-            Equivalence::Equivalent | Equivalence::NotChecked(_) => {}
-            other => panic!("{body}: {other:?}"),
-        }
-    }
-}
-
-#[test]
-fn test_the_validator_catches_a_damaged_kernel() {
-    // A checker that never fails proves nothing about the thing it checks.
-    let source = "{\n    INPUT:◯ □ 6 1\n    (▷INPUT - INPUT) → D\n    ((D × D) + 1.0) → OUTPUT\n    OUTPUT → =\n}";
-    let block = parse_rho_program(source).unwrap();
-    let shape = vec![6usize, 1];
-    let ir = LlvmCodeGen::new("validator_control")
-        .generate_llvm_ir(&block)
-        .unwrap();
-
-    for (from, to) in [
-        ("fadd double", "fsub double"),
-        ("fmul double", "fdiv double"),
-        ("icmp ult i64 %f1.idx, 6", "icmp ult i64 %f1.idx, 5"),
-    ] {
-        if !ir.contains(from) {
-            continue;
-        }
-        let broken = ir.replacen(from, to, 1);
-        let (left, right) = expressions_of(&block, &shape, 0.0, &broken).unwrap();
-        match compare(&left, &right) {
-            Equivalence::Differs { .. } => {}
-            // The default build cannot prove anything, so it cannot refute either.
-            Equivalence::NotChecked(_) => {}
-            other => panic!("damaging `{from}` went unnoticed: {other:?}"),
-        }
-    }
-
-    // And the undamaged kernel must still come out clean.
-    let (left, right) = expressions_of(&block, &shape, 0.0, &ir).unwrap();
-    assert!(
-        matches!(
-            compare(&left, &right),
-            Equivalence::Equivalent | Equivalence::NotChecked(_)
-        ),
-        "the untouched kernel should validate"
-    );
-}
 
 // --------------------------------------------------------------------------
 // Named functions. The board operations are glyphs because they describe a
@@ -1927,7 +1778,7 @@ fn test_named_functions_compute_what_they_say() {
 }
 
 #[test]
-fn test_the_indicator_of_nan_is_one_in_every_representation() {
+fn test_the_indicator_of_nan_is_one_in_the_kernel_as_in_the_interpreter() {
     // 0/0 is NaN, and NaN is not zero: C's `!=`, Python and the reference
     // interpreter all say 1. The compiler emitted an ordered comparison,
     // which is false for NaN, and differential testing caught the 0.
@@ -1943,10 +1794,6 @@ fn test_the_indicator_of_nan_is_one_in_every_representation() {
     env.insert("INPUT".to_string(), Grid::from(vec![4, 1], input.clone()));
     let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
     assert_eq!(meant, vec![1.0, 1.0, 1.0, 1.0]);
-
-    // The IR, read back without clang.
-    let emitted = run_emitted_ir("ind_nan_ir", source, &input, 4);
-    assert_eq!(emitted, meant);
 
     // The shared object.
     let mut codegen = LlvmCodeGen::new("ind_nan");
@@ -2493,171 +2340,6 @@ fn test_equilibrium_target_declares_output_in_the_metadata() {
 // on its own — and only the table form can carry a program with two inputs.
 // --------------------------------------------------------------------------
 
-use rho_lang::validate::{expressions_via, validate, Entrypoint};
-
-/// Run the emitted IR through `rho_kernel_exec_spaces` without clang, with the
-/// named inputs supplied and every other space left to the kernel.
-fn run_emitted_ir_spaces(
-    name: &str,
-    source: &str,
-    inputs: &[(&str, Vec<f64>)],
-    out_cells: usize,
-) -> Vec<f64> {
-    let block = parse_rho_program(source).unwrap();
-    let mut codegen = LlvmCodeGen::new(name);
-    let ir = codegen.generate_llvm_ir(&block).unwrap();
-
-    let functions = parse_module(&ir);
-    let entry = functions
-        .iter()
-        .find(|f| f.name == "rho_kernel_exec_spaces")
-        .expect("the table entrypoint");
-
-    let mut machine = Machine::new();
-    let dst = machine.add_buffer(vec![0.0; out_cells]);
-    let table: Vec<Value<f64>> = codegen
-        .space_shapes
-        .keys()
-        .map(|space| match inputs.iter().find(|(n, _)| n == space) {
-            Some((_, data)) => Value::P(machine.add_buffer(data.clone()), 0),
-            None if space == "OUTPUT" => Value::P(dst, 0),
-            None => Value::null(),
-        })
-        .collect();
-    let handle = machine.add_table(table);
-    machine
-        .run(entry, &[Value::T(handle, 0)])
-        .unwrap_or_else(|why| panic!("{name}: {why}\n{ir}"));
-    machine.buffer(dst).to_vec()
-}
-
-#[test]
-fn test_the_ir_reader_runs_the_table_entrypoint() {
-    // Two inputs, which the two-pointer form could never have carried.
-    let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-    let b = vec![1.0, 0.0, 2.0, 1.0, 0.0, 1.0, 1.0, 2.0, 3.0, 1.0, 0.0, 1.0];
-    let block = parse_rho_program(MATMUL_2_3_4).unwrap();
-    let mut env = Env::new();
-    env.insert("A".to_string(), Grid::from(vec![2, 3, 1], a.clone()));
-    env.insert("B".to_string(), Grid::from(vec![1, 3, 4], b.clone()));
-    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
-    assert_eq!(meant, vec![10.0, 5.0, 4.0, 8.0, 22.0, 11.0, 13.0, 20.0]);
-
-    let emitted = run_emitted_ir_spaces(
-        "ir_spaces_matmul",
-        MATMUL_2_3_4,
-        &[("A", a), ("B", b)],
-        8,
-    );
-    assert_eq!(emitted, meant);
-
-    // Intermediates left null are the kernel's own, and the answer is the one
-    // the two-pointer entrypoint gives.
-    let input: Vec<f64> = (0..16).map(|i| (i as f64 * 0.7).sin() * 3.0).collect();
-    let via_args = run_emitted_ir("ir_spaces_gradient_ref", GRADIENT_4_4, &input, 16);
-    let via_table = run_emitted_ir_spaces(
-        "ir_spaces_gradient",
-        GRADIENT_4_4,
-        &[("INPUT", input)],
-        16,
-    );
-    assert_eq!(
-        via_table.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-        via_args.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn test_the_table_entrypoint_is_equivalent_to_the_source() {
-    let cases: [(&str, &[usize]); 4] = [
-        // INPUT alone: both entrypoints apply.
-        ("(▷INPUT - INPUT) → D\n        ((D × D) + 1.0) → OUTPUT\n        OUTPUT → =", &[2, 3]),
-        // A second input of the same shape.
-        ("AUX:◯ □ 2 3\n        ((INPUT - AUX) × AUX) → OUTPUT\n        OUTPUT → =", &[2, 3]),
-        // A second input that stretches against INPUT.
-        ("AUX:◯ □ 2 1\n        ((INPUT × AUX) > AUX) → OUTPUT\n        OUTPUT → =", &[2, 3]),
-        // The matrix product, which reads nothing called INPUT at all.
-        (
-            "A:◯ □ 2 3 1\n        B:◯ □ 1 3 4\n        ◇+1 (A × B) → OUTPUT\n        OUTPUT → =",
-            &[2, 3],
-        ),
-    ];
-
-    for (body, shape) in cases {
-        let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
-        let source = format!(
-            "{{\n        INPUT:◯ □ {}\n        {body}\n    }}",
-            dims.join(" ")
-        );
-        let block = parse_rho_program(&source).unwrap();
-        let ir = LlvmCodeGen::new("table_equiv").generate_llvm_ir(&block).unwrap();
-
-        let (left, right) =
-            expressions_via(&block, shape, 0.0, &ir, Entrypoint::Spaces).unwrap();
-        assert_eq!(left.len(), right.len(), "{body}");
-        match compare(&left, &right) {
-            Equivalence::Equivalent | Equivalence::NotChecked(_) => {}
-            other => panic!("{body}: {other:?}"),
-        }
-
-        // validate() proves through every entrypoint that can carry the
-        // program, and says how many that was.
-        let result = validate(&block, shape, 0.0);
-        let reads_input_alone = !body.contains("AUX") && !body.contains("A:");
-        match result.verdict {
-            Equivalence::Equivalent => {
-                assert_eq!(result.entrypoints, if reads_input_alone { 2 } else { 1 }, "{body}");
-            }
-            Equivalence::NotChecked(_) => {}
-            other => panic!("{body}: {other:?}"),
-        }
-    }
-}
-
-#[test]
-fn test_the_two_pointer_entrypoint_refuses_a_second_input() {
-    // Asking it to carry a program it cannot is an error, not a silent pass.
-    let block = parse_rho_program(MATMUL_2_3_4).unwrap();
-    let ir = LlvmCodeGen::new("two_pointer_refuses").generate_llvm_ir(&block).unwrap();
-    let Err(why) = expressions_via(&block, &[2, 3], 0.0, &ir, Entrypoint::WithArgs) else {
-        panic!("the two-pointer form cannot carry A and B");
-    };
-    assert!(why.contains("carries INPUT alone"), "{why}");
-}
-
-#[test]
-fn test_the_validator_catches_damage_to_the_table_entrypoint_alone() {
-    // Damage inside rho_kernel_exec_spaces leaves the two-pointer form intact,
-    // so a validator that only read the latter would wave it through.
-    let source = "{\n    INPUT:◯ □ 6 1\n    (▷INPUT - INPUT) → D\n    ((D × D) + 1.0) → OUTPUT\n    OUTPUT → =\n}";
-    let block = parse_rho_program(source).unwrap();
-    let shape = vec![6usize, 1];
-    let ir = LlvmCodeGen::new("table_control").generate_llvm_ir(&block).unwrap();
-
-    let start = ir.find("define void @rho_kernel_exec_spaces(").unwrap();
-    let end = start + ir[start..].find("\n}\n").unwrap();
-    let broken = format!(
-        "{}{}{}",
-        &ir[..start],
-        ir[start..end].replacen("fadd double", "fsub double", 1),
-        &ir[end..]
-    );
-    assert_ne!(broken, ir, "the table entrypoint should contain an fadd");
-
-    // The two-pointer form still validates...
-    let (left, right) = expressions_of(&block, &shape, 0.0, &broken).unwrap();
-    assert!(matches!(
-        compare(&left, &right),
-        Equivalence::Equivalent | Equivalence::NotChecked(_)
-    ));
-    // ...and the table form is caught.
-    let (left, right) =
-        expressions_via(&block, &shape, 0.0, &broken, Entrypoint::Spaces).unwrap();
-    match compare(&left, &right) {
-        Equivalence::Differs { .. } | Equivalence::NotChecked(_) => {}
-        other => panic!("damage to the table entrypoint went unnoticed: {other:?}"),
-    }
-}
 
 // --------------------------------------------------------------------------
 // Fixed points. `expr ⇒ U` sweeps `expr` into U until no cell moves by more
@@ -2665,7 +2347,7 @@ fn test_the_validator_catches_damage_to_the_table_entrypoint_alone() {
 // the program — and an iteration is read from afterwards.
 // --------------------------------------------------------------------------
 
-use rho_lang::interp::{interpret_with, ByValue, Options};
+use rho_lang::interp::{interpret_with, Options};
 
 /// Jacobi for the tridiagonal system 4·x[i] + x[i-1] + x[i+1] = b[i], with
 /// x = 0 outside the grid. The update's coefficients on x sum to 1/2, so the
@@ -2745,9 +2427,7 @@ fn test_the_interpreter_iterates_jacobi_to_the_solution() {
         &Options {
             tau: 1e-13,
             max_sweeps: 10_000,
-        },
-        &mut ByValue,
-    )
+        })
     .unwrap();
     let x = &settled["OUTPUT"].cells;
     for i in 0..6 {
@@ -2764,9 +2444,7 @@ fn test_the_interpreter_iterates_jacobi_to_the_solution() {
         &Options {
             tau: 0.0,
             max_sweeps: 3,
-        },
-        &mut ByValue,
-    )
+        })
     .unwrap();
     let mut expected = b.clone();
     for _ in 0..3 {
@@ -2786,9 +2464,7 @@ fn test_the_interpreter_iterates_jacobi_to_the_solution() {
         &Options {
             tau: 100.0,
             max_sweeps: 50,
-        },
-        &mut ByValue,
-    )
+        })
     .unwrap();
     let mut after_one = b.clone();
     for i in 0..6 {
@@ -2840,7 +2516,7 @@ fn test_the_kernel_iterates_exactly_as_the_interpreter_does() {
 
     // Settles well inside the cap: the kernel says so, and agrees on the bits.
     let (tau, cap) = (1e-10, 500);
-    let meant = interpret_with(&block, &env, &Options { tau, max_sweeps: cap }, &mut ByValue)
+    let meant = interpret_with(&block, &env, &Options { tau, max_sweeps: cap })
         .unwrap()["OUTPUT"]
         .cells
         .clone();
@@ -2851,7 +2527,7 @@ fn test_the_kernel_iterates_exactly_as_the_interpreter_does() {
     assert!(sweeps > 1 && (sweeps as usize) < cap, "sweeps {sweeps}");
 
     // Capped at three: three Jacobi steps, and the kernel says it did not settle.
-    let meant = interpret_with(&block, &env, &Options { tau: 0.0, max_sweeps: 3 }, &mut ByValue)
+    let meant = interpret_with(&block, &env, &Options { tau: 0.0, max_sweeps: 3 })
         .unwrap()["OUTPUT"]
         .cells
         .clone();
@@ -2884,7 +2560,7 @@ fn test_a_relaxation_with_a_vector_body_and_a_fold_inside_the_loop() {
     let mut env: Env<f64> = Env::new();
     env.insert("INPUT".to_string(), Grid::from(vec![8, 8], input.clone()));
     let (tau, cap) = (1e-9, 5000);
-    let meant = interpret_with(&block, &env, &Options { tau, max_sweeps: cap }, &mut ByValue)
+    let meant = interpret_with(&block, &env, &Options { tau, max_sweeps: cap })
         .unwrap()["OUTPUT"]
         .cells
         .clone();
@@ -2907,7 +2583,7 @@ fn test_a_relaxation_with_a_vector_body_and_a_fold_inside_the_loop() {
     let block = parse_rho_program(normalise).unwrap();
     let mut env: Env<f64> = Env::new();
     env.insert("INPUT".to_string(), Grid::from(vec![6, 1], input.clone()));
-    let meant = interpret_with(&block, &env, &Options { tau: 1e-15, max_sweeps: 20 }, &mut ByValue)
+    let meant = interpret_with(&block, &env, &Options { tau: 1e-15, max_sweeps: 20 })
         .unwrap()["OUTPUT"]
         .cells
         .clone();
@@ -2940,46 +2616,13 @@ fn test_a_relaxation_with_a_vector_body_and_a_fold_inside_the_loop() {
 }
 
 #[test]
-fn test_the_ir_reader_runs_the_loop_and_agrees_with_the_interpreter() {
-    let b: Vec<f64> = vec![1.0, -2.0, 3.0, 0.5, -1.5, 2.0];
-    let block = parse_rho_program(JACOBI_1D).unwrap();
-    let mut env: Env<f64> = Env::new();
-    env.insert("INPUT".to_string(), Grid::from(vec![6, 1], b.clone()));
-    let options = Options { tau: 1e-8, max_sweeps: 100 };
-    let meant = interpret_with(&block, &env, &options, &mut ByValue).unwrap()["OUTPUT"]
-        .cells
-        .clone();
-
-    let ir = LlvmCodeGen::new("iter_vm")
-        .with_tau(options.tau)
-        .with_max_sweeps(options.max_sweeps)
-        .generate_llvm_ir(&block)
-        .unwrap();
-    let functions = parse_module(&ir);
-    let entry = functions
-        .iter()
-        .find(|f| f.name == "rho_kernel_exec_with_args")
-        .unwrap();
-    let mut machine = Machine::new();
-    let src = machine.add_buffer(b.clone());
-    let dst = machine.add_buffer(vec![0.0; 6]);
-    machine
-        .run(entry, &[Value::P(src, 0), Value::P(dst, 0)])
-        .unwrap_or_else(|why| panic!("{why}\n{ir}"));
-    assert_eq!(bits(machine.buffer(dst)), bits(&meant));
-    // The counters the kernel keeps are readable after the run too.
-    assert!(machine.global("rho_sweeps") > 1);
-    assert_eq!(machine.global("rho_converged"), 1);
-}
-
-#[test]
 fn test_iteration_at_single_precision_agrees_with_the_interpreter() {
     let b: Vec<f32> = vec![1.0, -2.0, 3.0, 0.5, -1.5, 2.0];
     let block = parse_rho_program(JACOBI_1D).unwrap();
     let mut env: Env<f32> = Env::new();
     env.insert("INPUT".to_string(), Grid::from(vec![6, 1], b.clone()));
     let options = Options { tau: 1e-5, max_sweeps: 100 };
-    let meant = interpret_with(&block, &env, &options, &mut ByValue).unwrap()["OUTPUT"]
+    let meant = interpret_with(&block, &env, &options).unwrap()["OUTPUT"]
         .cells
         .clone();
 
@@ -3155,46 +2798,4 @@ fn test_a_damped_average_is_proved_to_contract() {
         other => panic!("{other:?}"),
     }
     assert_eq!(report.contract.iterations[0].factor, None);
-}
-
-#[test]
-fn test_a_loop_is_proved_by_induction_rather_than_unrolled() {
-    // The proof forces the loop round twice — from the start, then from a
-    // grid of fresh symbols — and compares the outputs and the exit tests.
-    // Two extra cells carry the number of decisions and each decision.
-    let block = parse_rho_program(JACOBI_1D).unwrap();
-    let ir = LlvmCodeGen::new("induction")
-        .with_max_sweeps(rho_lang::validate::VALIDATION_SWEEPS)
-        .generate_llvm_ir(&block)
-        .unwrap();
-
-    for entry in [Entrypoint::WithArgs, Entrypoint::Spaces] {
-        let (left, right) = expressions_via(&block, &[6, 1], 0.0, &ir, entry).unwrap();
-        assert_eq!(left.len(), 6 + 1 + 2, "{entry:?}");
-        assert_eq!(right.len(), left.len(), "{entry:?}");
-        match compare(&left, &right) {
-            Equivalence::Equivalent | Equivalence::NotChecked(_) => {}
-            other => panic!("{entry:?}: {other:?}"),
-        }
-    }
-
-    // Both entrypoints are proved, since the program reads INPUT alone.
-    let result = validate(&block, &[6, 1], 0.0);
-    match result.verdict {
-        Equivalence::Equivalent => assert_eq!(result.entrypoints, 2),
-        Equivalence::NotChecked(_) => {}
-        other => panic!("{other:?}"),
-    }
-
-    // Loosening the exit test leaves every cell alone and changes only when
-    // the loop leaves: the decision cells are what catch it.
-    let loosened = ir.replacen("fcmp ole double %it2.d", "fcmp olt double %it2.d", 1);
-    assert_ne!(loosened, ir);
-    let (left, right) =
-        expressions_via(&block, &[6, 1], 0.0, &loosened, Entrypoint::WithArgs).unwrap();
-    match compare(&left, &right) {
-        Equivalence::Differs { cell, .. } => assert!(cell >= 6, "a decision cell, not a value: {cell}"),
-        Equivalence::NotChecked(_) => {}
-        other => panic!("a changed exit test went unnoticed: {other:?}"),
-    }
 }

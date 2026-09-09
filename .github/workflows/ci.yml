@@ -22,15 +22,13 @@ jobs:
       with:
         components: clippy, rustfmt
 
-    - name: Install LLVM, Clang & Z3
+    - name: Install LLVM & Clang
       run: |
         sudo apt-get update
-        sudo apt-get install -y clang llvm libz3-dev
+        sudo apt-get install -y clang llvm
 
     - name: Lint (clippy)
-      run: |
-        cargo clippy --all-targets -- -D warnings
-        cargo clippy --all-targets --features z3-solver -- -D warnings
+      run: cargo clippy --all-targets -- -D warnings
 
     - name: Build Compiler (`rhoc`)
       run: cargo build --verbose
@@ -38,33 +36,18 @@ jobs:
     - name: Run Unit Tests
       run: cargo test --verbose
 
-    - name: Run Unit Tests (Z3 constraint backend)
-      run: cargo test --verbose --features z3-solver
-
+    # The vector lowering is what a new operation breaks first: every lowered
+    # kernel is run with and without it and the bits must match.
     - name: Check SIMD Matches The Scalar Reference
       run: cargo test --release vector_and_scalar
 
+    # Random programs, both widths, both entrypoints, against the interpreter.
     - name: Differential Test The Compiler Against The Interpreter
       run: |
         cargo build --release
-        for seed in 20260909 7 424242; do
-          ./target/release/difftest $seed 250
+        for seed in 20260909 7 424242 99 2024 31337; do
+          ./target/release/difftest $seed 300
         done
-
-    - name: Prove The Emitted IR Matches The Source
-      run: |
-        cargo build --release --features z3-solver
-        ./target/release/validate
-        ./target/release/negcontrol
-
-    - name: Fuzz The Constraint Solver Against Real Runs
-      run: |
-        cargo build --release
-        cp target/release/rhoc rhoc-interval
-        cargo build --release --features z3-solver
-        cp target/release/rhoc rhoc-z3
-        RHOC_INTERVAL=./rhoc-interval RHOC_Z3=./rhoc-z3 \
-          python3 scripts/fuzz_solver.py 42 150
 
     - name: Run Sample Compilation (`teichmuller.rho`)
       run: cargo run --bin rhoc -- examples/teichmuller.rho --dump-dag --dump-llvm

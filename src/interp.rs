@@ -72,27 +72,6 @@ impl Default for Options {
     }
 }
 
-/// What a run does at the one decision in the language that depends on data:
-/// whether a `⇒` loop has settled. On numbers the flag simply says. On symbols
-/// the caller has to choose, and may replace the loop's cells before the next
-/// round — which is how a proof gets to speak about an arbitrary iterate.
-pub trait Decider<S: Numeric> {
-    /// Whether to stop, given "no cell moved by more than 𝜏". `None` means
-    /// the run cannot tell, which the interpreter reports as an error.
-    fn done(&mut self, settled: &S::Bool) -> Option<bool>;
-    /// The target's cells, just before the loop goes round again.
-    fn next_round(&mut self, _cells: &mut [S]) {}
-}
-
-/// Decide by the value, which is what a run on numbers does.
-pub struct ByValue;
-
-impl<S: Numeric> Decider<S> for ByValue {
-    fn done(&mut self, settled: &S::Bool) -> Option<bool> {
-        S::truth(settled)
-    }
-}
-
 /// Run a program over the given inputs, returning every space it produced.
 ///
 /// `tau` binds the threshold symbol, matching `--tau`; a `⇒` is capped at
@@ -102,7 +81,7 @@ pub fn interpret<S: Numeric>(block: &ToposBlock, inputs: &Env<S>, tau: f64) -> R
         tau,
         ..Options::default()
     };
-    interpret_with(block, inputs, &options, &mut ByValue)
+    interpret_with(block, inputs, &options)
 }
 
 /// As [`interpret`], with every parameter of a run spelled out.
@@ -110,7 +89,6 @@ pub fn interpret_with<S: Numeric>(
     block: &ToposBlock,
     inputs: &Env<S>,
     options: &Options,
-    decider: &mut dyn Decider<S>,
 ) -> Result<Env<S>> {
     let tau = options.tau;
     let mut env: Env<S> = inputs.clone();
@@ -144,7 +122,7 @@ pub fn interpret_with<S: Numeric>(
                 }
             }
             Statement::Iterate { src, target } => {
-                iterate(src, target, &mut env, options, decider, line)?;
+                iterate(src, target, &mut env, options, line)?;
             }
             _ => {}
         }
@@ -161,7 +139,6 @@ fn iterate<S: Numeric>(
     target: &str,
     env: &mut Env<S>,
     options: &Options,
-    decider: &mut dyn Decider<S>,
     line: usize,
 ) -> Result<()> {
     let tau = S::constant(options.tau);
@@ -195,23 +172,12 @@ fn iterate<S: Numeric>(
         env.insert(target.to_string(), next);
         sweeps += 1;
 
-        // The cap decides on its own, without asking; the tolerance asks.
+        // The cap decides first, then the tolerance.
         if sweeps >= options.max_sweeps {
             return Ok(());
         }
-        let settled = largest.compare(&tau, Compare::Lte);
-        match decider.done(&settled) {
-            Some(true) => return Ok(()),
-            Some(false) => {}
-            None => {
-                return Err(err(
-                    line,
-                    "whether this ⇒ has settled depends on the data, and this run has no way to decide it",
-                ))
-            }
-        }
-        if let Some(grid) = env.get_mut(target) {
-            decider.next_round(&mut grid.cells);
+        if S::truth(&largest.compare(&tau, Compare::Lte)) {
+            return Ok(());
         }
     }
 }

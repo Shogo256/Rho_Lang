@@ -1,24 +1,17 @@
-//! Static verification of `!` constraints.
+//! Static checking of `!` constraints.
 //!
-//! Two backends answer the same question — "can this constraint fail for some
-//! input?" — with different precision:
-//!
-//! * the default one evaluates the expanded program in interval arithmetic,
-//!   which needs no dependencies and soundly over-approximates every value;
-//! * `--features z3-solver` discharges the same obligations with SMT, so it
-//!   proves and refutes cases intervals have to leave open.
-//!
-//! Both only reject a program when a violation is certain, and report anything
-//! they cannot settle as unproven rather than failing the build.
+//! The expanded program is evaluated in interval arithmetic, which needs no
+//! dependencies and soundly over-approximates every value. A program is
+//! rejected only when a violation is certain; anything the intervals cannot
+//! settle is reported as unproven rather than failing the build. Its claims
+//! are checked against real runs by `difftest`, which compiles random programs
+//! and compares what the kernel produced with what was claimed.
 
 use crate::ast::*;
 use crate::error::{HarmonyDisruption, Result};
 use crate::numeric::Precision;
 use crate::symbolic::{expand, Cmp, Domain, Iteration, Sym};
 use std::collections::{BTreeMap, BTreeSet};
-
-#[cfg(feature = "z3-solver")]
-mod smt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -162,16 +155,6 @@ impl ConstraintSolver {
         PRECISION.with(|p| p.set(precision));
         let expansion = expand(block, tau);
 
-        #[cfg(feature = "z3-solver")]
-        {
-            let mut report = smt::analyze(&expansion);
-            // Convergence is an interval argument whichever backend runs.
-            report.iterations = expansion.iterations.iter().map(check_convergence).collect();
-            report.contract = build_contract(report.backend, &expansion, &report);
-            report
-        }
-
-        #[cfg(not(feature = "z3-solver"))]
         {
             let constraints = expansion
                 .obligations
@@ -823,7 +806,7 @@ pub fn check_interval(cmp: Cmp, lhs: &Sym, rhs: &Sym) -> Verdict {
             Verdict::Violated(format!("the two sides cannot be equal; {range}"))
         }
         _ => Verdict::Unproven(format!(
-            "intervals leave it open; {range}. Build with --features z3-solver for an exact answer"
+            "intervals leave it open; {range}"
         )),
     }
 }

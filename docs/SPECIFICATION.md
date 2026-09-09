@@ -367,10 +367,38 @@ tests an integer comparison, and every floating-point decision goes through
 `select`. So the program unrolls with concrete indices and only the values are
 in question.
 
-📋 This is the empirical half of translation validation: 1,291 random programs
-currently agree on every cell. Proving the equivalence for *all* inputs at a
-given shape — handing both sides to Z3 rather than to a random generator — is
-the remaining step, and the machinery is now in place for it.
+### Proving it, not only testing it
+
+Both evaluators are written against a `Numeric` trait rather than against `f64`.
+Running them on symbols instead of numbers therefore costs nothing but a type
+parameter — and it is the same code the differential testing exercises on
+numbers, so a bug in one instantiation is a bug in both.
+
+`cargo run --release --features z3-solver --bin validate` builds an expression
+graph per output cell from each side and asks the solver the negation: *is there
+an input for which some cell differs?* `unsat` is the proof.
+
+```
+proved   [3 4] (▷INPUT - INPUT) → OUTPUT   (36 / 44 nodes)
+proved   [3 4] ◈+ INPUT → OUTPUT           (72 / 72 nodes)
+checked 40: proved 40, unsettled 0, differing 0
+```
+
+The node counts differ where the vector path takes a longer route to the same
+answer — which is the point: the SIMD lowering is *proved* equal to the source,
+not merely observed to agree.
+
+`--bin negcontrol` is the other half of trusting this. A checker that never
+fails proves nothing about the thing it checks, so it damages the emitted IR in
+five small ways a careless generator might plausibly produce — an add that
+became a subtract, a sweep that stops a cell early, a flipped boundary test —
+and insists the validator notices each one. It does, and the undamaged kernel
+still comes out equivalent.
+
+📋 The proof is per program and per shape, not for all shapes at once. Terms
+that no solver reasons about exactly — a power with a fractional exponent —
+enter as an uninterpreted function, which is sound for equivalence because both
+sides apply the same one, but says nothing about the function itself.
 
 ### Two decisions the differential testing forced
 

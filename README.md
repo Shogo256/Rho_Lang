@@ -38,6 +38,9 @@ Working prototype. What runs today:
 - A reference interpreter written from the specification, and a reader that runs
   the emitted IR without clang, so the source, the IR and the `.so` are compared
   against each other on every push
+- Translation validation: the emitted IR is *proved* to compute what the source
+  means, for every input at a given shape, with a negative control that damages
+  the IR to show the check has teeth
 
 See [Implementation Status](#implementation-status) for what is designed but not
 yet built. The implementation is deliberately a small verifiable core, not a
@@ -246,7 +249,7 @@ smooth input drives it to zero and the kernel returns infinities.
 | Proven contract embedded in the artifact | ✅ implemented |
 | Diagnostics with source lines | ✅ implemented |
 | Reference interpreter + differential testing | ✅ implemented |
-| IR read back and validated against the source | ✅ implemented — empirical, not yet proved |
+| IR proved equivalent to the source, per shape | ✅ implemented — `--features z3-solver` |
 | C ABI, JSON metadata, Python FFI | ✅ implemented |
 | AVX-512 / NEON width selection, GPU backends | 📋 planned — the vector width is fixed at four lanes |
 | Tiling and cache blocking | 📋 planned — a sweep is one linear pass |

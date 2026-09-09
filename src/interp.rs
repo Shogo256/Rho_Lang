@@ -12,28 +12,29 @@
 
 use crate::ast::*;
 use crate::error::{HarmonyDisruption, Result};
+use crate::numeric::{integer_power, Compare, Numeric};
 use std::collections::BTreeMap;
 
 /// One space's contents, with the shape that gives its cells meaning.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Grid {
+pub struct Grid<S = f64> {
     pub shape: Vec<usize>,
-    pub cells: Vec<f64>,
+    pub cells: Vec<S>,
 }
 
-impl Grid {
-    pub fn zeros(shape: Vec<usize>) -> Grid {
+impl<S: Numeric> Grid<S> {
+    pub fn zeros(shape: Vec<usize>) -> Grid<S> {
         let len = shape.iter().product::<usize>().max(1);
         Grid {
             shape,
-            cells: vec![0.0; len],
+            cells: vec![S::constant(0.0); len],
         }
     }
 
-    pub fn from(shape: Vec<usize>, cells: Vec<f64>) -> Grid {
+    pub fn from(shape: Vec<usize>, cells: Vec<S>) -> Grid<S> {
         let len = shape.iter().product::<usize>().max(1);
         let mut cells = cells;
-        cells.resize(len, 0.0);
+        cells.resize(len, S::constant(0.0));
         Grid { shape, cells }
     }
 
@@ -48,13 +49,13 @@ impl Grid {
 }
 
 /// Every space the program has produced so far.
-pub type Env = BTreeMap<String, Grid>;
+pub type Env<S = f64> = BTreeMap<String, Grid<S>>;
 
 /// Run a program over the given inputs, returning every space it produced.
 ///
 /// `tau` binds the threshold symbol, matching `--tau`.
-pub fn interpret(block: &ToposBlock, inputs: &Env, tau: f64) -> Result<Env> {
-    let mut env: Env = inputs.clone();
+pub fn interpret<S: Numeric>(block: &ToposBlock, inputs: &Env<S>, tau: f64) -> Result<Env<S>> {
+    let mut env: Env<S> = inputs.clone();
 
     // Declared spaces that the caller did not supply start at zero.
     for stmt in &block.statements {
@@ -97,7 +98,7 @@ fn err(line: usize, detail: impl Into<String>) -> HarmonyDisruption {
 }
 
 /// The shape an expression produces, which is also the shape it is evaluated at.
-fn shape_of(expr: &Expr, env: &Env, line: usize) -> Result<Option<Vec<usize>>> {
+fn shape_of<S: Numeric>(expr: &Expr, env: &Env<S>, line: usize) -> Result<Option<Vec<usize>>> {
     Ok(match expr {
         Expr::Number(_) => None,
         Expr::Var(name) if is_tau(name) => None,
@@ -150,12 +151,12 @@ fn shape_of(expr: &Expr, env: &Env, line: usize) -> Result<Option<Vec<usize>>> {
 }
 
 /// Evaluate an expression to a whole grid.
-fn eval(expr: &Expr, env: &Env, tau: f64, line: usize) -> Result<Grid> {
+fn eval<S: Numeric>(expr: &Expr, env: &Env<S>, tau: f64, line: usize) -> Result<Grid<S>> {
     let shape = shape_of(expr, env, line)?
         .ok_or_else(|| err(line, "an expression with no space in it has no shape"))?;
     let cells = (0..shape.iter().product::<usize>().max(1))
         .map(|i| eval_cell(expr, env, tau, line, &shape, i, &[]))
-        .collect::<Result<Vec<f64>>>()?;
+        .collect::<Result<Vec<S>>>()?;
     Ok(Grid { shape, cells })
 }
 
@@ -164,18 +165,18 @@ fn eval(expr: &Expr, env: &Env, tau: f64, line: usize) -> Result<Grid> {
 /// `at_shape` is the shape being walked and `index` a cell of it; `lifts`
 /// records the unit axes the enclosing `□`s inserted, which is what lets a
 /// shorter operand stretch.
-fn eval_cell(
+fn eval_cell<S: Numeric>(
     expr: &Expr,
-    env: &Env,
+    env: &Env<S>,
     tau: f64,
     line: usize,
     at_shape: &[usize],
     index: usize,
     lifts: &[usize],
-) -> Result<f64> {
+) -> Result<S> {
     match expr {
-        Expr::Number(v) => Ok(*v),
-        Expr::Var(name) if is_tau(name) => Ok(tau),
+        Expr::Number(v) => Ok(S::constant(*v)),
+        Expr::Var(name) if is_tau(name) => Ok(S::constant(tau)),
 
         Expr::Var(name) => {
             let grid = env.get(name).ok_or_else(|| HarmonyDisruption::SpaceErr {
@@ -184,7 +185,11 @@ fn eval_cell(
             })?;
             let view = lifted(&grid.shape, lifts);
             let mapped = map_index(&view, at_shape, index);
-            Ok(grid.cells.get(mapped).copied().unwrap_or(0.0))
+            Ok(grid
+                .cells
+                .get(mapped)
+                .cloned()
+                .unwrap_or_else(|| S::constant(0.0)))
         }
 
         Expr::AuditTrace(inner) => eval_cell(inner, env, tau, line, at_shape, index, lifts),
@@ -206,20 +211,20 @@ fn eval_cell(
             let (stride, extent) = axis_geometry(&inner_shape, Some(a))
                 .ok_or_else(|| err(line, format!("axis {a} is past the end of {inner_shape:?}")))?;
             if extent <= 1 {
-                return Ok(0.0);
+                return Ok(S::constant(0.0));
             }
 
             let position = (mapped / stride) % extent;
             let neighbour = match dir {
                 ShiftDir::Positive => {
                     if position == 0 {
-                        return Ok(0.0);
+                        return Ok(S::constant(0.0));
                     }
                     mapped - stride
                 }
                 ShiftDir::Negative => {
                     if position + 1 == extent {
-                        return Ok(0.0);
+                        return Ok(S::constant(0.0));
                     }
                     mapped + stride
                 }
@@ -268,60 +273,36 @@ fn eval_cell(
         Expr::BinaryOp { op, lhs, rhs } => {
             let l = eval_cell(lhs, env, tau, line, at_shape, index, lifts)?;
             let r = eval_cell(rhs, env, tau, line, at_shape, index, lifts)?;
+            let zero = S::constant(0.0);
+            // A comparison masks: the left value passes where it holds.
+            let mask = |how: Compare| S::select(&l.compare(&r, how), &l, &zero);
             Ok(match op {
-                BinaryOpKind::Add => l + r,
-                BinaryOpKind::Sub => l - r,
-                BinaryOpKind::Mul => l * r,
-                BinaryOpKind::Div => l / r,
-                // A whole-number exponent is repeated multiplication, matching
-                // what the compiler emits. powf goes through a maths library
-                // whose rounding of a square differs by an ulp.
-                BinaryOpKind::Pow => integer_power(l, r),
-                // A comparison masks: the left value passes where it holds.
-                BinaryOpKind::Gt => pass(l > r, l),
-                BinaryOpKind::Lt => pass(l < r, l),
-                BinaryOpKind::Gte => pass(l >= r, l),
-                BinaryOpKind::Lte => pass(l <= r, l),
-                BinaryOpKind::Eq => pass(l == r, l),
+                BinaryOpKind::Add => l.add(&r),
+                BinaryOpKind::Sub => l.sub(&r),
+                BinaryOpKind::Mul => l.mul(&r),
+                BinaryOpKind::Div => l.div(&r),
+                BinaryOpKind::Pow => integer_power(&l, &r),
+                BinaryOpKind::Gt => mask(Compare::Gt),
+                BinaryOpKind::Lt => mask(Compare::Lt),
+                BinaryOpKind::Gte => mask(Compare::Gte),
+                BinaryOpKind::Lte => mask(Compare::Lte),
+                BinaryOpKind::Eq => mask(Compare::Eq),
             })
         }
     }
 }
 
-/// `x^n` as repeated multiplication when `n` is a small whole number.
-fn integer_power(base: f64, exponent: f64) -> f64 {
-    if exponent != exponent.trunc() || exponent.abs() > 64.0 {
-        return base.powf(exponent);
-    }
-    let n = exponent as i32;
-    let mut acc = 1.0f64;
-    for _ in 0..n.abs() {
-        acc *= base;
-    }
-    if n < 0 {
-        1.0 / acc
-    } else {
-        acc
-    }
-}
 
-fn pass(holds: bool, value: f64) -> f64 {
-    if holds {
-        value
-    } else {
-        0.0
-    }
-}
 
 /// Evaluate an expression at one cell of its own shape.
-fn eval_at(
+fn eval_at<S: Numeric>(
     expr: &Expr,
-    env: &Env,
+    env: &Env<S>,
     tau: f64,
     line: usize,
     shape: &[usize],
     index: usize,
-) -> Result<f64> {
+) -> Result<S> {
     eval_cell(expr, env, tau, line, shape, index, &[])
 }
 
@@ -347,41 +328,29 @@ fn flat_of_line(shape: &[usize], axis: usize, index: usize) -> usize {
 /// Fold the line starting at `line_start`, stopping after `upto` steps when a
 /// scan asked for a running answer.
 #[allow(clippy::too_many_arguments)]
-fn fold_line(
+fn fold_line<S: Numeric>(
     op: &FoldOp,
     operand: &Expr,
-    env: &Env,
+    env: &Env<S>,
     tau: f64,
     line: usize,
     shape: &[usize],
     axis: usize,
     line_start: usize,
     upto: Option<usize>,
-) -> Result<f64> {
+) -> Result<S> {
     let (stride, extent) = axis_geometry(shape, Some(axis))
         .ok_or_else(|| err(line, format!("axis {axis} is past the end of {shape:?}")))?;
     let last = upto.map(|p| p + 1).unwrap_or(extent);
 
-    let mut acc = op.identity();
+    let mut acc = S::constant(op.identity());
     for step in 0..last.min(extent) {
         let value = eval_at(operand, env, tau, line, shape, line_start + step * stride)?;
         acc = match op {
-            FoldOp::Sum => acc + value,
-            FoldOp::Product => acc * value,
-            FoldOp::Max => {
-                if value > acc {
-                    value
-                } else {
-                    acc
-                }
-            }
-            FoldOp::Min => {
-                if value < acc {
-                    value
-                } else {
-                    acc
-                }
-            }
+            FoldOp::Sum => acc.add(&value),
+            FoldOp::Product => acc.mul(&value),
+            FoldOp::Max => S::select(&value.compare(&acc, Compare::Gt), &value, &acc),
+            FoldOp::Min => S::select(&value.compare(&acc, Compare::Lt), &value, &acc),
         };
     }
     Ok(acc)

@@ -16,24 +16,31 @@
 //! whole program unrolls with concrete indices, and only the values are in
 //! question.
 
+use crate::numeric::{Compare, Numeric};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    F(f64),
+/// A value in flight. Only the floating-point parts are abstract: indices,
+/// addresses and control flow stay concrete, because nothing `rhoc` emits ever
+/// branches on data.
+#[derive(Debug, Clone)]
+pub enum Value<S = f64>
+where
+    S: Numeric,
+{
+    F(S),
     I(i64),
-    B(bool),
+    B(S::Bool),
     /// A buffer and an element offset into it.
     P(usize, i64),
-    VF(Vec<f64>),
+    VF(Vec<S>),
     VI(Vec<i64>),
-    VB(Vec<bool>),
+    VB(Vec<S::Bool>),
 }
 
-impl Value {
-    fn f(&self) -> f64 {
+impl<S: Numeric> Value<S> {
+    fn f(&self) -> S {
         match self {
-            Value::F(v) => *v,
+            Value::F(v) => v.clone(),
             other => panic!("expected a double, found {other:?}"),
         }
     }
@@ -43,16 +50,25 @@ impl Value {
             other => panic!("expected an i64, found {other:?}"),
         }
     }
-    fn b(&self) -> bool {
+    fn b(&self) -> S::Bool {
         match self {
-            Value::B(v) => *v,
+            Value::B(v) => v.clone(),
             other => panic!("expected an i1, found {other:?}"),
         }
     }
-    fn vf(&self) -> Vec<f64> {
+    /// A concrete condition. Only loop bounds and the null check reach here,
+    /// and both are integer comparisons, so a symbolic run never needs it.
+    fn concrete(&self) -> bool {
+        match self {
+            Value::B(_) => panic!("control flow depended on a value"),
+            Value::I(v) => *v != 0,
+            other => panic!("expected a concrete condition, found {other:?}"),
+        }
+    }
+    fn vf(&self) -> Vec<S> {
         match self {
             Value::VF(v) => v.clone(),
-            Value::F(v) => vec![*v],
+            Value::F(v) => vec![v.clone()],
             other => panic!("expected a double vector, found {other:?}"),
         }
     }
@@ -147,18 +163,18 @@ pub fn parse_module(ir: &str) -> Vec<Function> {
 }
 
 /// The state one function body runs against.
-pub struct Machine {
+pub struct Machine<S: Numeric = f64> {
     /// Element-addressed storage, one entry per buffer.
-    buffers: Vec<Vec<f64>>,
+    buffers: Vec<Vec<S>>,
     /// Buffers reached through `inttoptr`, keyed by the address in the source.
     external: BTreeMap<i64, usize>,
-    names: BTreeMap<String, Value>,
+    names: BTreeMap<String, Value<S>>,
     /// A stop so a generator bug cannot hang the validator.
     budget: usize,
 }
 
-impl Machine {
-    pub fn new() -> Machine {
+impl<S: Numeric> Machine<S> {
+    pub fn new() -> Machine<S> {
         Machine {
             buffers: Vec::new(),
             external: BTreeMap::new(),
@@ -169,7 +185,7 @@ impl Machine {
 
     /// Register a buffer the caller owns, returning the handle to bind to a
     /// parameter or an address.
-    pub fn add_buffer(&mut self, cells: Vec<f64>) -> usize {
+    pub fn add_buffer(&mut self, cells: Vec<S>) -> usize {
         self.buffers.push(cells);
         self.buffers.len() - 1
     }
@@ -178,40 +194,40 @@ impl Machine {
         self.external.insert(address, buffer);
     }
 
-    pub fn buffer(&self, handle: usize) -> &[f64] {
+    pub fn buffer(&self, handle: usize) -> &[S] {
         &self.buffers[handle]
     }
 
-    fn value(&self, token: &str) -> Value {
+    fn value(&self, token: &str) -> Value<S> {
         self.try_value(token)
             .unwrap_or_else(|why| panic!("{why}"))
     }
 
-    fn try_value(&self, token: &str) -> Result<Value, String> {
+    fn try_value(&self, token: &str) -> Result<Value<S>, String> {
         if let Some(v) = self.names.get(token) {
             return Ok(v.clone());
         }
         parse_literal(token).ok_or_else(|| format!("unknown operand `{token}`"))
     }
 
-    fn store(&mut self, handle: usize, offset: i64, value: f64) {
+    fn store(&mut self, handle: usize, offset: i64, value: S) {
         let buffer = &mut self.buffers[handle];
         let index = offset.max(0) as usize;
         if index >= buffer.len() {
-            buffer.resize(index + 1, 0.0);
+            buffer.resize(index + 1, S::constant(0.0));
         }
         buffer[index] = value;
     }
 
-    fn read(&self, handle: usize, offset: i64) -> f64 {
+    fn read(&self, handle: usize, offset: i64) -> S {
         self.buffers[handle]
             .get(offset.max(0) as usize)
-            .copied()
-            .unwrap_or(0.0)
+            .cloned()
+            .unwrap_or_else(|| S::constant(0.0))
     }
 
     /// Run one function to completion.
-    pub fn run(&mut self, function: &Function, arguments: &[Value]) -> Result<(), String> {
+    pub fn run(&mut self, function: &Function, arguments: &[Value<S>]) -> Result<(), String> {
         for (name, value) in function.params.iter().zip(arguments) {
             self.names.insert(name.clone(), value.clone());
         }
@@ -265,7 +281,7 @@ impl Machine {
             }
             let parts = split_fields(rest);
             let condition = parts[0].trim_start_matches("i1 ").trim();
-            let taken = self.value(condition).b();
+            let taken = self.value(condition).concrete();
             let target = if taken { parts[1] } else { parts[2] };
             return Ok(Flow::Jump(
                 target.trim_start_matches("label ").trim().to_string(),
@@ -311,7 +327,7 @@ impl Machine {
         let value = self.value(token);
         if ty.starts_with('<') {
             for (lane, v) in value.vf().iter().enumerate() {
-                self.store(handle, offset + lane as i64, *v);
+                self.store(handle, offset + lane as i64, v.clone());
             }
         } else {
             self.store(handle, offset, value.f());
@@ -319,7 +335,7 @@ impl Machine {
         Ok(())
     }
 
-    fn evaluate(&mut self, body: &str, previous: &str) -> Result<Value, String> {
+    fn evaluate(&mut self, body: &str, previous: &str) -> Result<Value<S>, String> {
         let opcode = body.split_whitespace().next().unwrap_or("");
 
         match opcode {
@@ -330,7 +346,7 @@ impl Machine {
                     .and_then(|s| s.split_whitespace().next())
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(0);
-                Ok(Value::P(self.add_buffer(vec![0.0; count]), 0))
+                Ok(Value::P(self.add_buffer(vec![S::constant(0.0); count]), 0))
             }
 
             "call" => {
@@ -341,7 +357,7 @@ impl Machine {
                         .and_then(|s| s.trim_end_matches(')').trim().parse::<i64>().ok())
                         .unwrap_or(0);
                     let cells = (bytes / 8).max(0) as usize;
-                    return Ok(Value::P(self.add_buffer(vec![0.0; cells]), 0));
+                    return Ok(Value::P(self.add_buffer(vec![S::constant(0.0); cells]), 0));
                 }
                 if body.contains("@llvm.pow") {
                     let args = call_arguments(body);
@@ -352,11 +368,11 @@ impl Machine {
                             base.vf()
                                 .iter()
                                 .zip(exponent.vf())
-                                .map(|(b, e)| b.powf(e))
+                                .map(|(b, e)| crate::numeric::integer_power(b, &e))
                                 .collect(),
                         )
                     } else {
-                        Value::F(base.f().powf(exponent.f()))
+                        Value::F(crate::numeric::integer_power(&base.f(), &exponent.f()))
                     });
                 }
                 Err(format!("unsupported call: {body}"))
@@ -439,13 +455,17 @@ impl Machine {
             "select" => {
                 let parts: Vec<&str> = split_fields(&body["select ".len()..]);
                 let condition = self.value(split_typed(parts[0]).1);
+                let concrete_flag = matches!(condition, Value::I(_));
                 let (then_ty, then_token) = split_typed(parts[1]);
                 let then_value = self.value(then_token);
                 let else_value = self.value(split_typed(parts[2]).1);
                 Ok(if vector_width(then_ty).is_some() {
-                    let flags = match condition {
-                        Value::VB(f) => f,
-                        Value::B(b) => vec![b; then_value.vf().len()],
+                    let lanes = then_value.vf().len();
+                    let flags: Vec<S::Bool> = match &condition {
+                        Value::VB(f) => f.clone(),
+                        Value::B(b) => vec![b.clone(); lanes],
+                        Value::VI(f) => f.iter().map(|v| S::boolean(*v != 0)).collect(),
+                        Value::I(v) => vec![S::boolean(*v != 0); lanes],
                         other => return Err(format!("select on {other:?}")),
                     };
                     Value::VF(
@@ -453,28 +473,32 @@ impl Machine {
                             .iter()
                             .zip(then_value.vf())
                             .zip(else_value.vf())
-                            .map(|((c, a), b)| if *c { a } else { b })
+                            .map(|((c, a), b)| S::select(c, &a, &b))
                             .collect(),
                     )
                 } else if matches!(then_value, Value::P(..)) {
                     // `out_effective` picks a buffer when the caller passed none.
-                    if condition.b() {
+                    if condition.concrete() {
                         then_value
                     } else {
                         else_value
                     }
                 } else if matches!(then_value, Value::I(_)) {
-                    Value::I(if condition.b() {
+                    // An index select is decided concretely; a shift's clamp
+                    // reaches here.
+                    Value::I(if condition.concrete() {
                         then_value.i()
                     } else {
                         else_value.i()
                     })
-                } else {
-                    Value::F(if condition.b() {
+                } else if concrete_flag {
+                    Value::F(if condition.concrete() {
                         then_value.f()
                     } else {
                         else_value.f()
                     })
+                } else {
+                    Value::F(S::select(&condition.b(), &then_value.f(), &else_value.f()))
                 })
             }
 
@@ -505,16 +529,16 @@ impl Machine {
             "fadd" | "fsub" | "fmul" | "fdiv" => {
                 let (ty, a, b) = binary_operands(body, opcode);
                 let (x, y) = (self.value(&a), self.value(&b));
-                let apply = |p: f64, q: f64| match opcode {
-                    "fadd" => p + q,
-                    "fsub" => p - q,
-                    "fmul" => p * q,
-                    _ => p / q,
+                let apply = |p: &S, q: &S| match opcode {
+                    "fadd" => p.add(q),
+                    "fsub" => p.sub(q),
+                    "fmul" => p.mul(q),
+                    _ => p.div(q),
                 };
                 Ok(if vector_width(&ty).is_some() {
-                    Value::VF(x.vf().iter().zip(y.vf()).map(|(p, q)| apply(*p, q)).collect())
+                    Value::VF(x.vf().iter().zip(y.vf()).map(|(p, q)| apply(p, &q)).collect())
                 } else {
-                    Value::F(apply(x.f(), y.f()))
+                    Value::F(apply(&x.f(), &y.f()))
                 })
             }
 
@@ -549,7 +573,15 @@ impl Machine {
 
             "or" => {
                 let (_, a, b) = binary_operands(body, opcode);
-                Ok(Value::B(self.value(&a).b() || self.value(&b).b()))
+                let (x, y) = (self.value(&a), self.value(&b));
+                // Both operands come from integer comparisons in every kernel
+                // rhoc emits, so the result stays concrete and can steer a
+                // branch or an index. The abstract case is kept for a flag that
+                // came from a value.
+                Ok(match (&x, &y) {
+                    (Value::I(p), Value::I(q)) => Value::I(((*p != 0) || (*q != 0)) as i64),
+                    _ => Value::B(S::or(&x.b(), &y.b())),
+                })
             }
 
             "fcmp" | "icmp" => {
@@ -564,29 +596,36 @@ impl Machine {
                 let (x, y) = (self.value(&a), self.value(&b));
 
                 if opcode == "fcmp" {
-                    let apply = |p: f64, q: f64| match predicate.as_str() {
-                        "ogt" => p > q,
-                        "olt" => p < q,
-                        "oge" => p >= q,
-                        "ole" => p <= q,
-                        "oeq" => p == q,
-                        other => panic!("unsupported fcmp {other}"),
+                    let how = match predicate.as_str() {
+                        "ogt" => Compare::Gt,
+                        "olt" => Compare::Lt,
+                        "oge" => Compare::Gte,
+                        "ole" => Compare::Lte,
+                        "oeq" => Compare::Eq,
+                        other => return Err(format!("unsupported fcmp {other}")),
                     };
                     Ok(if vector_width(&ty).is_some() {
-                        Value::VB(x.vf().iter().zip(y.vf()).map(|(p, q)| apply(*p, q)).collect())
+                        Value::VB(
+                            x.vf()
+                                .iter()
+                                .zip(y.vf())
+                                .map(|(p, q)| p.compare(&q, how))
+                                .collect(),
+                        )
                     } else {
-                        Value::B(apply(x.f(), y.f()))
+                        Value::B(x.f().compare(&y.f(), how))
                     })
                 } else {
                     // Pointer comparisons only ever test for null, and the
                     // machine always passes buffers it owns.
                     if a.trim() == "null" || b.trim() == "null" {
-                        let null = |v: &Value| matches!(v, Value::P(h, _) if *h == usize::MAX);
+                        let null = |v: &Value<S>| matches!(v, Value::P(h, _) if *h == usize::MAX);
                         let equal = null(&x) == null(&y);
-                        return Ok(Value::B(match predicate.as_str() {
+                        let outcome = match predicate.as_str() {
                             "eq" => equal,
                             _ => !equal,
-                        }));
+                        };
+                        return Ok(Value::I(outcome as i64));
                     }
                     let apply = |p: i64, q: i64| match predicate.as_str() {
                         "ult" => (p as u64) < (q as u64),
@@ -597,10 +636,18 @@ impl Machine {
                         "ne" => p != q,
                         other => panic!("unsupported icmp {other}"),
                     };
+                    // An integer comparison is what `br` tests, so it stays a
+                    // concrete flag rather than an abstract one.
                     Ok(if vector_width(&ty).is_some() {
-                        Value::VB(x.vi().iter().zip(y.vi()).map(|(p, q)| apply(*p, q)).collect())
+                        Value::VI(
+                            x.vi()
+                                .iter()
+                                .zip(y.vi())
+                                .map(|(p, q)| apply(*p, q) as i64)
+                                .collect(),
+                        )
                     } else {
-                        Value::B(apply(x.i(), y.i()))
+                        Value::I(apply(x.i(), y.i()) as i64)
                     })
                 }
             }
@@ -610,7 +657,7 @@ impl Machine {
     }
 }
 
-impl Default for Machine {
+impl<S: Numeric> Default for Machine<S> {
     fn default() -> Self {
         Machine::new()
     }
@@ -698,11 +745,11 @@ fn call_arguments(body: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_literal(token: &str) -> Option<Value> {
+fn parse_literal<S: Numeric>(token: &str) -> Option<Value<S>> {
     let token = token.trim();
 
     if token == "zeroinitializer" {
-        return Some(Value::VF(vec![0.0; 4]));
+        return Some(Value::VF(vec![S::constant(0.0); 4]));
     }
     if token == "poison" || token == "undef" {
         return Some(Value::VI(vec![0; 4]));
@@ -712,10 +759,10 @@ fn parse_literal(token: &str) -> Option<Value> {
         return Some(Value::P(usize::MAX, 0));
     }
     if token == "true" {
-        return Some(Value::B(true));
+        return Some(Value::I(1));
     }
     if token == "false" {
-        return Some(Value::B(false));
+        return Some(Value::I(0));
     }
 
     // A vector literal: `<double 0x..., double 0x...>`
@@ -725,7 +772,7 @@ fn parse_literal(token: &str) -> Option<Value> {
             return Some(Value::VF(
                 parts
                     .iter()
-                    .filter_map(|p| parse_double(split_typed(p).1))
+                    .filter_map(|p| parse_double(split_typed(p).1).map(S::constant))
                     .collect(),
             ));
         }
@@ -738,7 +785,7 @@ fn parse_literal(token: &str) -> Option<Value> {
     }
 
     if let Some(v) = parse_double(token) {
-        return Some(Value::F(v));
+        return Some(Value::F(S::constant(v)));
     }
     token.parse::<i64>().ok().map(Value::I)
 }

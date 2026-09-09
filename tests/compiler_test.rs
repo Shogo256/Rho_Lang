@@ -1814,3 +1814,81 @@ fn test_the_ir_reader_refuses_what_it_does_not_understand() {
     let outcome = machine.run(&functions[0], &[Value::P(a, 0), Value::P(b, 0)]);
     assert!(outcome.is_err(), "an unknown opcode must be reported");
 }
+
+// --------------------------------------------------------------------------
+// Translation validation. Testing says the two agree on the inputs we tried;
+// this says they agree on every input, for a given program and shape.
+// --------------------------------------------------------------------------
+
+use rho_lang::validate::{compare, expressions, expressions_of, Verdict as Equivalence};
+
+#[test]
+fn test_the_emitted_ir_is_equivalent_to_the_source() {
+    let cases: [(&str, &[usize]); 6] = [
+        ("(INPUT + 1.0) → OUTPUT\n        OUTPUT → =", &[6, 1]),
+        ("(▷INPUT - INPUT) → OUTPUT\n        OUTPUT → =", &[2, 3]),
+        ("(INPUT > 1.0) → OUTPUT\n        OUTPUT → =", &[6, 1]),
+        ("◇+ INPUT → OUTPUT\n        OUTPUT → =", &[6, 1]),
+        ("◈+ INPUT → OUTPUT\n        OUTPUT → =", &[6, 1]),
+        (
+            "(▷INPUT - INPUT) → D\n        ((D × D) + 1.0) → OUTPUT\n        OUTPUT → =",
+            &[2, 3],
+        ),
+    ];
+
+    for (body, shape) in cases {
+        let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+        let source = format!(
+            "{{\n        INPUT:◯ □ {}\n        {body}\n    }}",
+            dims.join(" ")
+        );
+        let block = parse_rho_program(&source).unwrap();
+        let (left, right) = expressions(&block, shape, 0.0).unwrap();
+
+        // Without the SMT backend this reports NotChecked rather than failing:
+        // the default build still gets the graphs, just not the proof.
+        match compare(&left, &right) {
+            Equivalence::Equivalent | Equivalence::NotChecked(_) => {}
+            other => panic!("{body}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_the_validator_catches_a_damaged_kernel() {
+    // A checker that never fails proves nothing about the thing it checks.
+    let source = "{\n    INPUT:◯ □ 6 1\n    (▷INPUT - INPUT) → D\n    ((D × D) + 1.0) → OUTPUT\n    OUTPUT → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let shape = vec![6usize, 1];
+    let ir = LlvmCodeGen::new("validator_control")
+        .generate_llvm_ir(&block)
+        .unwrap();
+
+    for (from, to) in [
+        ("fadd double", "fsub double"),
+        ("fmul double", "fdiv double"),
+        ("icmp ult i64 %f1.idx, 6", "icmp ult i64 %f1.idx, 5"),
+    ] {
+        if !ir.contains(from) {
+            continue;
+        }
+        let broken = ir.replacen(from, to, 1);
+        let (left, right) = expressions_of(&block, &shape, 0.0, &broken).unwrap();
+        match compare(&left, &right) {
+            Equivalence::Differs { .. } => {}
+            // The default build cannot prove anything, so it cannot refute either.
+            Equivalence::NotChecked(_) => {}
+            other => panic!("damaging `{from}` went unnoticed: {other:?}"),
+        }
+    }
+
+    // And the undamaged kernel must still come out clean.
+    let (left, right) = expressions_of(&block, &shape, 0.0, &ir).unwrap();
+    assert!(
+        matches!(
+            compare(&left, &right),
+            Equivalence::Equivalent | Equivalence::NotChecked(_)
+        ),
+        "the untouched kernel should validate"
+    );
+}

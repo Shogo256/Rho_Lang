@@ -51,6 +51,12 @@ jobs:
           ./target/release/difftest $seed 250
         done
 
+    - name: Prove The Emitted IR Matches The Source
+      run: |
+        cargo build --release --features z3-solver
+        ./target/release/validate
+        ./target/release/negcontrol
+
     - name: Fuzz The Constraint Solver Against Real Runs
       run: |
         cargo build --release

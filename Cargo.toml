@@ -12,6 +12,14 @@ path = "src/main.rs"
 name = "difftest"
 path = "src/bin/difftest.rs"
 
+[[bin]]
+name = "validate"
+path = "src/bin/validate.rs"
+
+[[bin]]
+name = "negcontrol"
+path = "src/bin/negcontrol.rs"
+
 [dependencies]
 nom = "7.1"
 thiserror = "2.0"

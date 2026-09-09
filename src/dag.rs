@@ -112,7 +112,9 @@ fn extract_dependencies(expr: &Expr) -> Vec<String> {
                 deps.push(name.clone());
             }
         }
-        Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
+        Expr::Shift { operand: inner, .. }
+        | Expr::Reduce { operand: inner, .. }
+        | Expr::AuditTrace(inner) => {
             deps.extend(extract_dependencies(inner));
         }
         Expr::BinaryOp { lhs, rhs, .. } => {

@@ -1148,3 +1148,140 @@ fn test_division_by_a_square_plus_one_is_proved_safe() {
     assert_eq!(report.constraints[0].verdict, Verdict::Proved);
     assert_eq!(report.contract.output_range.lo, 0.0);
 }
+
+// --------------------------------------------------------------------------
+// Reduction. A fold collapses an axis, so for the first time a flow's output
+// has a different shape from its input.
+// --------------------------------------------------------------------------
+
+#[test]
+fn test_fold_sums_an_axis() {
+    let source = r#"{
+        INPUT:◯ □ 8 1
+        ◇+ INPUT → OUTPUT
+        OUTPUT → =
+    }"#;
+    let out = run_kernel("fold_sum", source, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    assert_eq!(out[0], 36.0);
+}
+
+#[test]
+fn test_fold_over_a_product_is_a_dot_product() {
+    // Not expressible before: it needs the fold to see a computed operand.
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        ◇+ (INPUT × INPUT) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let out = run_kernel("fold_dot", source, &[1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(out[0], 30.0);
+}
+
+#[test]
+fn test_fold_collapses_the_chosen_axis() {
+    // A 3x4 grid: axis 1 sums each row, axis 0 sums each column.
+    let grid: Vec<f64> = vec![
+        1.0, 2.0, 3.0, 4.0, //
+        10.0, 20.0, 30.0, 40.0, //
+        100.0, 200.0, 300.0, 400.0,
+    ];
+
+    let rows = run_kernel(
+        "fold_rows",
+        "{\n        INPUT:◯ □ 3 4\n        ◇+1 INPUT → OUTPUT\n        OUTPUT → =\n    }",
+        &grid,
+    );
+    assert_eq!(&rows[..3], &[10.0, 100.0, 1000.0]);
+
+    let cols = run_kernel(
+        "fold_cols",
+        "{\n        INPUT:◯ □ 3 4\n        ◇+0 INPUT → OUTPUT\n        OUTPUT → =\n    }",
+        &grid,
+    );
+    assert_eq!(&cols[..4], &[111.0, 222.0, 333.0, 444.0]);
+}
+
+#[test]
+fn test_fold_operators_max_min_and_product() {
+    let data = [5.0, 3.0, -2.0, 8.0, 1.0, 4.0];
+    for (name, glyph, expected) in [
+        ("fold_max", "◇>", 8.0),
+        ("fold_min", "◇<", -2.0),
+        ("fold_prod", "◇×", -960.0),
+    ] {
+        let source = format!(
+            "{{\n        INPUT:◯ □ 6 1\n        {glyph} INPUT → OUTPUT\n        OUTPUT → =\n    }}"
+        );
+        let out = run_kernel(name, &source, &data);
+        assert_eq!(out[0], expected, "{name}");
+    }
+}
+
+#[test]
+fn test_nested_folds_reduce_the_whole_grid() {
+    // The inner fold must be lowered before the outer one reads it.
+    let source = r#"{
+        INPUT:◯ □ 3 4
+        ◇+0 (◇+1 INPUT) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let grid: Vec<f64> = (1..=12).map(|i| i as f64).collect();
+    let out = run_kernel("fold_nested", source, &grid);
+    assert_eq!(out[0], 78.0, "1..12 sums to 78");
+}
+
+#[test]
+fn test_fold_composes_with_arithmetic_and_shifts() {
+    // Mean of the forward differences.
+    let source = r#"{
+        INPUT:◯ □ 8 1
+        (▽INPUT - INPUT) → D
+        ((◇+ D) / 8.0) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let input: Vec<f64> = (0..8).map(|i| i as f64).collect();
+    let out = run_kernel("fold_with_shift", source, &input);
+    // D = [1,1,1,1,1,1,1,-7]; the sum is 0, so the mean is 0.
+    assert_eq!(out[0], 0.0);
+}
+
+#[test]
+fn test_ascii_alias_for_the_fold_glyph() {
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        <>+ INPUT -> OUTPUT
+        OUTPUT -> =
+    }"#;
+    let out = run_kernel("fold_ascii", source, &[10.0, 20.0, 30.0, 40.0]);
+    assert_eq!(out[0], 100.0);
+}
+
+#[test]
+fn test_a_non_associative_fold_is_rejected() {
+    // Folding with - or / has no order-independent meaning.
+    for glyph in ["◇-", "◇/"] {
+        let source = format!(
+            "{{\n        INPUT:◯ □ 4 1\n        {glyph} INPUT → OUTPUT\n        OUTPUT → =\n    }}"
+        );
+        assert!(
+            parse_rho_program(&source).is_err(),
+            "{glyph} should not parse as a fold"
+        );
+    }
+}
+
+#[test]
+fn test_fold_shrinks_the_declared_shape() {
+    let source = r#"{
+        INPUT:◯ □ 3 4
+        ◇+1 INPUT → OUTPUT
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let mut codegen = LlvmCodeGen::new("fold_shape");
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+
+    // The sweep that writes OUTPUT covers 3 cells, not 12.
+    assert!(ir.contains("sweep 3 cells"), "{ir}");
+    assert!(ir.contains("over axis 1 of [3, 4] -> 3 cells"), "{ir}");
+}

@@ -7,7 +7,7 @@ pub fn validate_symbols(input: &str) -> Result<()> {
     let code_only = remove_comments(input);
 
     let allowed_unicode: HashSet<char> = [
-        '◯', '□', '▷', '▽', '△', '+', '-', '×', '*', '/', '^', '→', '<', '>', '=', ':', '{', '}', '$', '&', '!',
+        '◯', '□', '▷', '▽', '△', '◇', '+', '-', '×', '*', '/', '^', '→', '<', '>', '=', ':', '{', '}', '$', '&', '!',
         '(', ')', '[', ']', ';', ',', '.', ' ', '\t', '\r', '\n', '_', '𝜏', 'τ'
     ].iter().cloned().collect();
 
@@ -56,6 +56,8 @@ pub fn check_forbidden_keywords(input: &str) -> Result<()> {
 /// Normalize ASCII symbol aliases to Unicode RHO topological symbols
 pub fn normalize_ascii_aliases(input: &str) -> String {
     input
+        // <> before << and >>, so a fold is not mistaken for two shifts.
+        .replace("<>", "◇")
         .replace("->", "→")
         .replace("=>", "→")
         .replace(">>", "▷")
@@ -264,6 +266,41 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         }
     }
 
+    // Reduction: ◇+X folds along an axis, ◇+0X pins the axis.
+    if expr_str.starts_with('◇') && expr_str.chars().count() > 2 {
+        let rest = &expr_str['◇'.len_utf8()..];
+        let mut chars = rest.chars();
+        let op_char = chars.next().unwrap();
+        let op = match op_char {
+            '+' => BinaryOpKind::Add,
+            '×' | '*' => BinaryOpKind::Mul,
+            '>' => BinaryOpKind::Gt,
+            '<' => BinaryOpKind::Lt,
+            other => {
+                return Err(HarmonyDisruption::GlyphErr {
+                    symbol: format!("◇{other}"),
+                    line: 0,
+                    column: 0,
+                })
+            }
+        };
+        let fold = FoldOp::from_op(&op).ok_or_else(|| HarmonyDisruption::GlyphErr {
+            symbol: format!("◇{op_char}"),
+            line: 0,
+            column: 0,
+        })?;
+        let after_op = &rest[op_char.len_utf8()..];
+        let digits: String = after_op.chars().take_while(char::is_ascii_digit).collect();
+        let operand_str = after_op[digits.len()..].trim();
+        if !operand_str.is_empty() {
+            return Ok(Expr::Reduce {
+                op: fold,
+                axis: if digits.is_empty() { None } else { digits.parse().ok() },
+                operand: Box::new(parse_expr(operand_str)?),
+            });
+        }
+    }
+
     // Unary shift operators ▷, ▽, optionally pinned to an axis: ▷0X, ▽1X.
     // Bare ▷X shifts along the last (contiguous) axis.
     for (glyph, dir) in [('▷', ShiftDir::Positive), ('▽', ShiftDir::Negative)] {
@@ -316,6 +353,11 @@ fn find_binary_op_position(s: &str, op: &str) -> Option<usize> {
         } else if c == '(' {
             depth -= 1;
         } else if depth == 0 && s.as_bytes()[i..].starts_with(op_bytes) {
+            // The operator right after ◇ names the fold, so it is part of the
+            // glyph rather than a binary operator splitting the expression.
+            if s[..i].chars().next_back() == Some('◇') {
+                continue;
+            }
             let lhs = s[..i].trim();
             let rhs = s[i + op_bytes.len()..].trim();
             if !lhs.is_empty() && !rhs.is_empty() {
@@ -390,7 +432,9 @@ fn check_expr_spaces(expr: &Expr, declared: &HashSet<String>, line: usize) -> Re
                 });
             }
         }
-        Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
+        Expr::Shift { operand: inner, .. }
+        | Expr::Reduce { operand: inner, .. }
+        | Expr::AuditTrace(inner) => {
             check_expr_spaces(inner, declared, line)?;
         }
         Expr::BinaryOp { lhs, rhs, .. } => {
@@ -438,6 +482,11 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
     fn get_expr_shape(expr: &Expr, shapes: &HashMap<String, Vec<usize>>) -> Option<Vec<usize>> {
         match expr {
             Expr::Var(name) => shapes.get(name).cloned(),
+            Expr::Reduce { axis, operand, .. } => {
+                let inner = get_expr_shape(operand, shapes)?;
+                let a = axis.unwrap_or_else(|| default_axis(&inner));
+                (a < inner.len()).then(|| shape_without_axis(&inner, a))
+            }
             Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
                 get_expr_shape(inner, shapes)
             }

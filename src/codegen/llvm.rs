@@ -115,6 +115,10 @@ impl Sweep {
 /// Buffers visible to a kernel body: space name -> LLVM pointer symbol.
 struct Buffers {
     map: BTreeMap<String, String>,
+    /// Buffer holding each precomputed fold, keyed by the AST node that asked
+    /// for it. Folds are lowered before the sweep that reads them, which keeps
+    /// the sweep body straight-line and lets it stay vectorised.
+    folds: BTreeMap<usize, String>,
     heap: Vec<String>,
     /// Cells this body sweeps: a literal, or an i64 symbol for a bounded call.
     bound: String,
@@ -385,6 +389,11 @@ impl LlvmCodeGen {
             Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
                 Self::expr_shape(inner, shapes)
             }
+            Expr::Reduce { axis, operand, .. } => {
+                let inner = Self::expr_shape(operand, shapes)?;
+                let a = axis.unwrap_or_else(|| crate::ast::default_axis(&inner));
+                (a < inner.len()).then(|| crate::ast::shape_without_axis(&inner, a))
+            }
             Expr::BinaryOp { lhs, rhs, .. } => {
                 Self::expr_shape(lhs, shapes).or_else(|| Self::expr_shape(rhs, shapes))
             }
@@ -446,7 +455,7 @@ impl LlvmCodeGen {
             if name == "INPUT" || name == "OUTPUT" {
                 continue;
             }
-            let count = shape.iter().product::<usize>().max(self.elements);
+            let count = shape.iter().product::<usize>().max(1);
             let label = format!("{}_buf", self.sanitize_ident(name));
             let sym = self.emit_scratch(ir, &label, count, &mut heap);
             map.insert(name.clone(), sym);
@@ -454,6 +463,7 @@ impl LlvmCodeGen {
 
         Buffers {
             map,
+            folds: BTreeMap::new(),
             heap,
             bound: bound.to_string(),
         }
@@ -472,9 +482,9 @@ impl LlvmCodeGen {
         heap: Vec<String>,
         bound: &str,
     ) -> Result<()> {
-        let bufs = self.emit_buffers(ir, in_sym, out_sym, heap, bound);
+        let mut bufs = self.emit_buffers(ir, in_sym, out_sym, heap, bound);
         let mut counter = 0usize;
-        self.emit_flows(&block.statements, ir, &bufs, entry_label, &mut counter)?;
+        self.emit_flows(&block.statements, ir, &mut bufs, entry_label, &mut counter)?;
         for ptr in &bufs.heap {
             ir.push_str(&format!("  call void @free(ptr {ptr})\n"));
         }
@@ -494,7 +504,7 @@ impl LlvmCodeGen {
         &self,
         statements: &[Statement],
         ir: &mut String,
-        bufs: &Buffers,
+        bufs: &mut Buffers,
         entry_label: &str,
         counter: &mut usize,
     ) -> Result<()> {
@@ -513,10 +523,15 @@ impl LlvmCodeGen {
             };
 
             loop_id += 1;
-            let plan = self.plan_sweep(src, bufs)?;
+
+            // Fold every reduction in this flow into its own buffer first. The
+            // sweep below then reads a plain array, so it stays straight-line.
+            pred = self.emit_fold_prepass(src, ir, bufs, &pred, loop_id, counter)?;
+
+            let sweep = self.sweep_length(src, target, bufs);
+            let plan = self.plan_sweep(src, &sweep)?;
             ir.push_str(&format!(
-                "  ; Flow {loop_id}: sweep {} cells{}\n",
-                bufs.bound,
+                "  ; Flow {loop_id}: sweep {sweep} cells{}\n",
                 plan.describe()
             ));
 
@@ -527,7 +542,7 @@ impl LlvmCodeGen {
                         &format!("f{loop_id}"),
                         &pred,
                         "0",
-                        &bufs.bound.clone(),
+                        &sweep,
                         Mode::Scalar,
                         src,
                         &target_ptr,
@@ -588,6 +603,174 @@ impl LlvmCodeGen {
         Ok(())
     }
 
+    /// Lower every fold in `expr` into its own buffer, innermost first, so a
+    /// nested fold's result exists before the fold that consumes it.
+    /// Returns the block control flow lands on.
+    fn emit_fold_prepass(
+        &self,
+        expr: &Expr,
+        ir: &mut String,
+        bufs: &mut Buffers,
+        pred: &str,
+        loop_id: usize,
+        counter: &mut usize,
+    ) -> Result<String> {
+        let mut block = pred.to_string();
+        match expr {
+            Expr::Var(_) | Expr::Number(_) => {}
+            Expr::AuditTrace(inner) | Expr::Shift { operand: inner, .. } => {
+                block = self.emit_fold_prepass(inner, ir, bufs, &block, loop_id, counter)?;
+            }
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                block = self.emit_fold_prepass(lhs, ir, bufs, &block, loop_id, counter)?;
+                block = self.emit_fold_prepass(rhs, ir, bufs, &block, loop_id, counter)?;
+            }
+            Expr::Reduce { op, axis, operand } => {
+                block = self.emit_fold_prepass(operand, ir, bufs, &block, loop_id, counter)?;
+                block = self.emit_fold(expr, *op, *axis, operand, ir, bufs, &block, counter)?;
+            }
+        }
+        Ok(block)
+    }
+
+    /// One fold: an outer loop over the cells that survive, and an inner loop
+    /// walking the axis being collapsed.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_fold(
+        &self,
+        node: &Expr,
+        op: FoldOp,
+        axis: Option<usize>,
+        operand: &Expr,
+        ir: &mut String,
+        bufs: &mut Buffers,
+        pred: &str,
+        counter: &mut usize,
+    ) -> Result<String> {
+        let shape = Self::expr_shape(operand, &self.space_shapes).ok_or_else(|| {
+            HarmonyDisruption::LoweringErr {
+                line: self.current_line.get(),
+                detail: format!("{op} needs an operand with a known shape"),
+            }
+        })?;
+        let a = axis.unwrap_or_else(|| crate::ast::default_axis(&shape));
+        if a >= shape.len() {
+            return Err(HarmonyDisruption::LoweringErr {
+                line: self.current_line.get(),
+                detail: format!(
+                    "axis {a} is out of range for a rank-{} space (shape {shape:?})",
+                    shape.len()
+                ),
+            });
+        }
+
+        let extent = shape[a].max(1);
+        let inner: usize = shape[a + 1..].iter().product::<usize>().max(1);
+        let outer: usize = shape[..a].iter().product::<usize>().max(1);
+        let out_cells = (outer * inner).max(1);
+
+        *counter += 1;
+        let id = *counter;
+        let label = format!("fold{id}");
+        let buffer = self.emit_scratch(ir, &format!("{label}_buf"), out_cells, &mut bufs.heap);
+
+        ir.push_str(&format!(
+            "  ; {op} over axis {a} of {shape:?} -> {out_cells} cells\n"
+        ));
+        ir.push_str(&format!("  br label %{label}.header\n\n"));
+
+        // Outer loop: one iteration per surviving cell.
+        ir.push_str(&format!("{label}.header:\n"));
+        ir.push_str(&format!(
+            "  %{label}.j = phi i64 [ 0, %{pred} ], [ %{label}.j.next, %{label}.tail ]\n"
+        ));
+        ir.push_str(&format!(
+            "  %{label}.go = icmp ult i64 %{label}.j, {out_cells}\n"
+        ));
+        ir.push_str(&format!(
+            "  br i1 %{label}.go, label %{label}.body, label %{label}.end\n\n"
+        ));
+
+        // Map the surviving index back to where its axis starts.
+        ir.push_str(&format!("{label}.body:\n"));
+        ir.push_str(&format!("  %{label}.o = udiv i64 %{label}.j, {inner}\n"));
+        ir.push_str(&format!("  %{label}.t = urem i64 %{label}.j, {inner}\n"));
+        ir.push_str(&format!(
+            "  %{label}.block = mul i64 %{label}.o, {}\n",
+            extent * inner
+        ));
+        ir.push_str(&format!(
+            "  %{label}.base = add i64 %{label}.block, %{label}.t\n"
+        ));
+        ir.push_str(&format!("  br label %{label}.inner\n\n"));
+
+        // Inner loop: walk the axis, folding as it goes.
+        ir.push_str(&format!("{label}.inner:\n"));
+        ir.push_str(&format!(
+            "  %{label}.m = phi i64 [ 0, %{label}.body ], [ %{label}.m.next, %{label}.step ]\n"
+        ));
+        ir.push_str(&format!(
+            "  %{label}.acc = phi double [ {}, %{label}.body ], [ %{label}.acc.next, %{label}.step ]\n",
+            Self::f64_literal(op.identity())
+        ));
+        ir.push_str(&format!(
+            "  %{label}.more = icmp ult i64 %{label}.m, {extent}\n"
+        ));
+        ir.push_str(&format!(
+            "  br i1 %{label}.more, label %{label}.step, label %{label}.tail\n\n"
+        ));
+
+        ir.push_str(&format!("{label}.step:\n"));
+        ir.push_str(&format!(
+            "  %{label}.off = mul i64 %{label}.m, {inner}\n"
+        ));
+        ir.push_str(&format!(
+            "  %{label}.at = add i64 %{label}.base, %{label}.off\n"
+        ));
+        let element = self.emit_expr(
+            operand,
+            ir,
+            bufs,
+            &format!("%{label}.at"),
+            counter,
+            Mode::Scalar,
+        )?;
+        match op {
+            FoldOp::Sum => ir.push_str(&format!(
+                "  %{label}.acc.next = fadd double %{label}.acc, {element}\n"
+            )),
+            FoldOp::Product => ir.push_str(&format!(
+                "  %{label}.acc.next = fmul double %{label}.acc, {element}\n"
+            )),
+            FoldOp::Max | FoldOp::Min => {
+                let pred_op = if matches!(op, FoldOp::Max) { "ogt" } else { "olt" };
+                ir.push_str(&format!(
+                    "  %{label}.win = fcmp {pred_op} double {element}, %{label}.acc\n"
+                ));
+                ir.push_str(&format!(
+                    "  %{label}.acc.next = select i1 %{label}.win, double {element}, double %{label}.acc\n"
+                ));
+            }
+        }
+        ir.push_str(&format!("  %{label}.m.next = add i64 %{label}.m, 1\n"));
+        ir.push_str(&format!("  br label %{label}.inner\n\n"));
+
+        ir.push_str(&format!("{label}.tail:\n"));
+        ir.push_str(&format!(
+            "  %{label}.slot = getelementptr inbounds double, ptr {buffer}, i64 %{label}.j\n"
+        ));
+        ir.push_str(&format!(
+            "  store double %{label}.acc, ptr %{label}.slot, align 8\n"
+        ));
+        ir.push_str(&format!("  %{label}.j.next = add i64 %{label}.j, 1\n"));
+        ir.push_str(&format!("  br label %{label}.header\n\n"));
+
+        ir.push_str(&format!("{label}.end:\n"));
+
+        bufs.folds.insert(node as *const Expr as usize, buffer);
+        Ok(format!("{label}.end"))
+    }
+
     /// Emit one loop over `[lo, hi)`, stepping by the mode's lane count.
     /// Returns the label control flow lands on, so ranges can be chained.
     #[allow(clippy::too_many_arguments)]
@@ -644,10 +827,29 @@ impl LlvmCodeGen {
         Ok(end)
     }
 
+    /// How many cells this flow writes: the length of what it flows into,
+    /// clamped by a bounded call.
+    fn sweep_length(&self, src: &Expr, target: &FlowTarget, bufs: &Buffers) -> String {
+        // A bounded call carries a runtime limit and stays scalar.
+        if bufs.bound.starts_with('%') {
+            return bufs.bound.clone();
+        }
+        let name = match target {
+            FlowTarget::Var(n) => n.clone(),
+            FlowTarget::Equilibrium => "OUTPUT".to_string(),
+        };
+        let shape = Self::expr_shape(src, &self.space_shapes)
+            .or_else(|| self.space_shapes.get(&name).cloned());
+        match shape {
+            Some(s) => s.iter().product::<usize>().max(1).to_string(),
+            None => self.elements.to_string(),
+        }
+    }
+
     /// Decide how to split one flow's sweep.
-    fn plan_sweep(&self, src: &Expr, bufs: &Buffers) -> Result<Sweep> {
+    fn plan_sweep(&self, src: &Expr, bound: &str) -> Result<Sweep> {
         // Vector loads read a fixed window, so the length has to be known here.
-        let Ok(total) = bufs.bound.parse::<u64>() else {
+        let Ok(total) = bound.parse::<u64>() else {
             return Ok(Sweep::AllScalar);
         };
         if !self.simd {
@@ -682,6 +884,9 @@ impl LlvmCodeGen {
             Expr::BinaryOp { lhs, rhs, .. } => self
                 .max_shift_stride(lhs)?
                 .max(self.max_shift_stride(rhs)?),
+            // A fold is precomputed into its own buffer before the sweep, so
+            // it contributes no reach to the sweep itself.
+            Expr::Reduce { .. } => 0,
             Expr::Shift { axis, operand, .. } => {
                 let inner = self.max_shift_stride(operand)?;
                 let Some(name) = Self::place_name(operand) else {
@@ -755,6 +960,27 @@ impl LlvmCodeGen {
 
             Expr::Shift { dir, axis, operand } => {
                 self.emit_shift(operand, *dir, *axis, ir, bufs, idx, counter, mode)
+            }
+
+            // The fold ran before this sweep started; read its result.
+            Expr::Reduce { .. } => {
+                let key = expr as *const Expr as usize;
+                let ptr = bufs
+                    .folds
+                    .get(&key)
+                    .cloned()
+                    .ok_or_else(|| HarmonyDisruption::LoweringErr {
+                        line: self.current_line.get(),
+                        detail: "a fold was not precomputed before the sweep that reads it"
+                            .to_string(),
+                    })?;
+                let gep = Self::fresh(counter);
+                let val = Self::fresh(counter);
+                ir.push_str(&format!(
+                    "  {gep} = getelementptr inbounds double, ptr {ptr}, i64 {idx}\n"
+                ));
+                ir.push_str(&format!("  {val} = load {ty}, ptr {gep}, align 8\n"));
+                Ok(val)
             }
 
             Expr::BinaryOp { op, lhs, rhs } => {

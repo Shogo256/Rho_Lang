@@ -30,6 +30,7 @@ punctuation.
 | `▷` | Positive Shift | Soroban Shift (右) | Reads the preceding cell along an axis, 0 at the edge | ✅ |
 | `▽` | Negative Shift | Soroban Shift (左) | Reads the following cell along an axis, 0 at the edge | ✅ |
 | `△` | Space Glyph | — | Usable as a space identifier | ✅ |
+| `◇` | Fold | Dasseki (垜積) | Collapses an axis, see §3.5 | ✅ |
 | `+` | Addition | Superposition | Element-wise addition | ✅ |
 | `-` | Subtraction | Difference | Element-wise subtraction | ✅ |
 | `×` / `*` | Multiplication | Scaling | Element-wise product | ✅ |
@@ -49,7 +50,8 @@ punctuation.
 ASCII aliases: `->` or `=>` for `→`, `>>` for `▷`, `<<` for `▽`, `@` for `&`.
 
 A shift may name its axis with a digit: `▷0X` shifts along axis 0, `▽1X` along
-axis 1. A bare `▷X` uses the innermost axis that has more than one cell.
+axis 1. A bare `▷X` uses the innermost axis that has more than one cell. A fold
+is written the same way: `◇+1X`. Its ASCII alias is `<>`.
 
 ---
 
@@ -115,6 +117,33 @@ predicate holds and `0.0` elsewhere. The same applies to `<`, `>=`, `<=`, `==`.
 
 📋 Flows are executed in source order on one thread. Extracting independent flows
 to run in parallel is future work.
+
+### 3.5 Folds (`◇`) ✅
+
+`◇opX` folds the cells along one axis and removes it, so a flow's target is
+smaller than its source. This is the only construct in the language that changes
+a shape.
+
+```rho
+◇+ INPUT              /* sum along the innermost axis with more than one cell */
+◇+1 INPUT             /* [3,4] -> [3]: the sum of each row                    */
+◇>0 INPUT             /* [3,4] -> [4]: the largest value in each column       */
+◇+ (A × B)            /* a dot product: the operand may be computed           */
+◇+0 (◇+1 INPUT)       /* the whole grid, folded twice                         */
+```
+
+The operator names the fold and must be associative: `+`, `×`, `>` (maximum) and
+`<` (minimum). `◇-` and `◇/` are rejected, since their result would depend on
+the traversal order. An empty axis yields the operator's identity — `0`, `1`,
+`-∞`, `+∞` respectively.
+
+Folds are lowered before the sweep that reads them, into their own buffer. That
+keeps the sweep body straight-line and vectorised, and it means a nested fold's
+result exists before the fold that consumes it.
+
+📋 A fold's own loop is scalar: the accumulator carries a dependency across
+iterations, and splitting it would change the order of the additions and so the
+result. `◇` also does not yet have a scan (running total) counterpart.
 
 ### 3.4 Zero-Copy Pointer (`&`) ✅
 
@@ -192,6 +221,11 @@ interval backend widens each result outward by that factor; the SMT backend
 introduces a bounded `δ` per operation. This keeps the useful proofs — a squared
 value stays non-negative through rounding, and `x² + 1` stays clear of zero —
 while refusing the ones that only hold over ℝ.
+
+A fold is not expanded term by term — the number of terms is a property of the
+grid, not of the cell a constraint speaks about — so it enters the analysis as an
+unconstrained value. Proofs about a folded value stay sound; counterexamples
+involving one are reported as unproven rather than as violations.
 
 Still outside the model, and so still assumptions on any proof:
 

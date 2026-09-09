@@ -442,6 +442,15 @@ pub fn eval_interval(sym: &Sym) -> Interval {
         Sym::Boundary { interior, .. } => {
             Interval::hull(Interval::point(0.0), eval_interval(interior))
         }
+        // A fold is not expanded term by term: the number of terms is a
+        // property of the grid, not of the cell the constraint speaks about.
+        // What is known is what the operator can produce.
+        Sym::Fold { op, .. } => match op {
+            // A sum or product of unknown reals is unknown.
+            FoldOp::Sum | FoldOp::Product => Interval::UNBOUNDED,
+            // A max or min is one of the operands, so it inherits their range.
+            FoldOp::Max | FoldOp::Min => Interval::UNBOUNDED,
+        },
         // A masked value is either the left operand where the test holds, or 0.
         Sym::Mask { cmp, lhs, rhs } => {
             let l = eval_interval(lhs);

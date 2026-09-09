@@ -1,0 +1,15 @@
+{
+    /* Folds collapse an axis, so a flow's output can be smaller than its
+       input. This is the mean of a vector, in one line of arithmetic. */
+    INPUT:◯ □ 1024 1
+
+    ((◇+ INPUT) / 1024.0) → MEAN
+
+    /* ◇+ over a computed operand is a dot product; over a square, a norm. */
+    ((◇+ (INPUT × INPUT)) ^ 0.5) → NORM
+
+    (NORM - MEAN) → OUTPUT
+    ! (OUTPUT >= -1000000.0)
+
+    OUTPUT → =
+}

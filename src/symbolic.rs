@@ -72,6 +72,13 @@ pub enum Sym {
         flag: String,
         interior: Box<Sym>,
     },
+    /// The result of folding an axis away. A constraint speaks about one cell,
+    /// and a fold's cell is a function of many, so it is modelled by what the
+    /// fold's operator can produce rather than expanded term by term.
+    Fold {
+        op: FoldOp,
+        id: usize,
+    },
 }
 
 /// A constraint lifted to `lhs cmp rhs` over expanded values.
@@ -99,6 +106,7 @@ struct Builder<'a> {
     fallback_shape: Vec<usize>,
     elements: usize,
     tau: f64,
+    folds: usize,
 }
 
 impl Builder<'_> {
@@ -157,6 +165,18 @@ impl Builder<'_> {
                     interior: Box::new(interior),
                 }
             }
+            // A fold collapses many cells into one, so a single-cell view of
+            // the program cannot expand it. It becomes an opaque value whose
+            // range the interval backend still bounds.
+            Expr::Reduce { op, operand, .. } => {
+                let _ = self.build(operand, before, offset);
+                self.folds += 1;
+                Sym::Fold {
+                    op: *op,
+                    id: self.folds,
+                }
+            }
+
             Expr::BinaryOp { op, lhs, rhs } => {
                 let l = self.build(lhs, before, offset);
                 let r = self.build(rhs, before, offset);
@@ -239,6 +259,7 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
         fallback_shape,
         elements,
         tau,
+        folds: 0,
     };
 
     // One entry per division written in the source, with its denominator
@@ -301,7 +322,9 @@ fn collect_divisions(
             collect_divisions(lhs, at, line, builder, out);
             collect_divisions(rhs, at, line, builder, out);
         }
-        Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
+        Expr::Shift { operand: inner, .. }
+        | Expr::Reduce { operand: inner, .. }
+        | Expr::AuditTrace(inner) => {
             collect_divisions(inner, at, line, builder, out)
         }
         Expr::Var(_) | Expr::Number(_) => {}
@@ -341,6 +364,10 @@ impl fmt::Display for ExprGlyphs<'_> {
             Expr::Shift { dir, axis, operand } => match axis {
                 Some(a) => write!(f, "{dir}{a}{}", ExprGlyphs(operand)),
                 None => write!(f, "{dir}{}", ExprGlyphs(operand)),
+            },
+            Expr::Reduce { op, axis, operand } => match axis {
+                Some(a) => write!(f, "{op}{a}{}", ExprGlyphs(operand)),
+                None => write!(f, "{op}{}", ExprGlyphs(operand)),
             },
             Expr::BinaryOp { op, lhs, rhs } => {
                 write!(f, "({} {} {})", ExprGlyphs(lhs), op, ExprGlyphs(rhs))

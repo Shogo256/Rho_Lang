@@ -172,6 +172,11 @@ impl<'ctx> Translator<'ctx> {
                 let value = self.build(interior);
                 cond.ite(&zero, &value)
             }
+            // The fold's term count depends on the grid, so it enters the
+            // formula as an unconstrained value rather than an expansion.
+            // Widening like this keeps proofs sound and counterexamples
+            // suspect, which is why they are reported as unproven.
+            Sym::Fold { .. } => self.unknown(),
             Sym::Mask { cmp, lhs, rhs } => {
                 let l = self.build(lhs);
                 let r = self.build(rhs);

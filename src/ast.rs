@@ -50,6 +50,56 @@ impl fmt::Display for ShiftDir {
     }
 }
 
+/// How a reduction folds the cells along an axis.
+///
+/// Only associative operators are accepted: a fold has no defined meaning for
+/// subtraction or division, whose result would depend on the traversal order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldOp {
+    /// `◇+` — sum (Wasan: 垜積, the summing of piles)
+    Sum,
+    /// `◇×` — product
+    Product,
+    /// `◇>` — the greater of the two, i.e. maximum
+    Max,
+    /// `◇<` — the lesser of the two, i.e. minimum
+    Min,
+}
+
+impl FoldOp {
+    pub fn from_op(op: &BinaryOpKind) -> Option<FoldOp> {
+        match op {
+            BinaryOpKind::Add => Some(FoldOp::Sum),
+            BinaryOpKind::Mul => Some(FoldOp::Product),
+            BinaryOpKind::Gt => Some(FoldOp::Max),
+            BinaryOpKind::Lt => Some(FoldOp::Min),
+            _ => None,
+        }
+    }
+
+    /// The value a fold starts from, which is also its result on an empty axis.
+    pub fn identity(self) -> f64 {
+        match self {
+            FoldOp::Sum => 0.0,
+            FoldOp::Product => 1.0,
+            FoldOp::Max => f64::NEG_INFINITY,
+            FoldOp::Min => f64::INFINITY,
+        }
+    }
+}
+
+impl fmt::Display for FoldOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let glyph = match self {
+            FoldOp::Sum => "+",
+            FoldOp::Product => "×",
+            FoldOp::Max => ">",
+            FoldOp::Min => "<",
+        };
+        write!(f, "◇{glyph}")
+    }
+}
+
 /// Topological Expression
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -66,6 +116,13 @@ pub enum Expr {
         op: BinaryOpKind,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
+    },
+    /// `◇+0X` — fold the cells along one axis, collapsing it.
+    /// The result has the operand's shape with that axis removed.
+    Reduce {
+        op: FoldOp,
+        axis: Option<usize>,
+        operand: Box<Expr>,
     },
     AuditTrace(Box<Expr>), // $
 }
@@ -127,6 +184,24 @@ impl ToposBlock {
             .map(|i| self.line_of(i))
             .unwrap_or(0)
     }
+}
+
+/// The shape left after folding away `axis`.
+///
+/// A rank-1 space collapses to a single cell rather than to rank 0, so every
+/// value in the language still lives in a grid that can be addressed.
+pub fn shape_without_axis(shape: &[usize], axis: usize) -> Vec<usize> {
+    if shape.len() <= 1 {
+        return vec![1];
+    }
+    let mut out = shape.to_vec();
+    out.remove(axis);
+    out
+}
+
+/// The axis a bare `▷` / `◇` operates on: the innermost with more than one cell.
+pub fn default_axis(shape: &[usize]) -> usize {
+    shape.iter().rposition(|&d| d > 1).unwrap_or(shape.len().saturating_sub(1))
 }
 
 /// Geometry of one axis of a row-major shape: `(stride, extent)`.

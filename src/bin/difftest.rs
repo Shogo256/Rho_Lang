@@ -8,7 +8,27 @@
 
 use rho_lang::codegen::LlvmCodeGen;
 use rho_lang::interp::{interpret, Env, Grid};
+use rho_lang::irvm::{parse_module, Machine, Value};
 use rho_lang::parser::parse_rho_program;
+
+/// Run the emitted IR directly, without going through clang.
+///
+/// This is the middle link of the chain: the interpreter says what the source
+/// means, the IR says what the generator decided, and the .so says what clang
+/// built. Checking the IR separately tells the two kinds of mistake apart.
+fn run_ir(ir: &str, input: &[f64], cells: usize) -> Result<Vec<f64>, String> {
+    let functions = parse_module(ir);
+    let entry = functions
+        .iter()
+        .find(|f| f.name == "rho_kernel_exec_with_args")
+        .ok_or("no rho_kernel_exec_with_args in the module")?;
+
+    let mut machine = Machine::new();
+    let source = machine.add_buffer(input.to_vec());
+    let target = machine.add_buffer(vec![0.0; cells]);
+    machine.run(entry, &[Value::P(source, 0), Value::P(target, 0)])?;
+    Ok(machine.buffer(target).to_vec())
+}
 
 /// Deterministic xorshift, so any failure is reproducible from its seed.
 struct Rng(u64);
@@ -177,6 +197,7 @@ fn main() {
 
     let mut rng = Rng(seed);
     let (mut compared, mut skipped, mut mismatches) = (0usize, 0usize, 0usize);
+    let (mut ir_mismatches, mut ir_unsupported) = (0usize, 0usize);
     let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
 
     for round in 0..rounds {
@@ -227,6 +248,31 @@ fn main() {
             continue;
         }
 
+        // The IR, read back and run without clang.
+        match run_ir(&ir, &input, cells.max(expected.len())) {
+            Ok(from_ir) => {
+                let gap = expected
+                    .cells
+                    .iter()
+                    .zip(&from_ir)
+                    .position(|(a, b)| !(a.is_nan() && b.is_nan()) && a.to_bits() != b.to_bits());
+                if let Some(cell) = gap {
+                    ir_mismatches += 1;
+                    println!("IR MISMATCH at cell {cell} (round {round}, shape {shape:?})");
+                    println!("{source}");
+                    println!("  input       {input:?}");
+                    println!("  interpreted {:?}", expected.cells[cell]);
+                    println!("  from IR     {:?}\n", from_ir[cell]);
+                }
+            }
+            Err(why) => {
+                ir_unsupported += 1;
+                if ir_unsupported <= 2 {
+                    println!("IR NOT READ (round {round}): {why}");
+                }
+            }
+        }
+
         let mut output = vec![0.0f64; cells.max(expected.len())];
         unsafe {
             let lib = libloading::Library::new(&so).unwrap();
@@ -263,11 +309,14 @@ fn main() {
         }
     }
 
-    println!("seed {seed}: compared {compared}, skipped {skipped}, mismatches {mismatches}");
+    println!(
+        "seed {seed}: compared {compared}, skipped {skipped}, \
+         mismatches {mismatches}, ir mismatches {ir_mismatches}, ir unread {ir_unsupported}"
+    );
     if std::env::var("DIFFTEST_VERBOSE").is_ok() {
         for (reason, count) in &reasons {
             println!("  skipped {count:4} x {reason}");
         }
     }
-    std::process::exit(if mismatches > 0 { 1 } else { 0 });
+    std::process::exit(if mismatches > 0 || ir_mismatches > 0 { 1 } else { 0 });
 }

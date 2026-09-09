@@ -35,8 +35,9 @@ Working prototype. What runs today:
 - Deterministic output: the same source always produces byte-identical IR
 - A machine-readable contract compiled into the `.so`, so a caller can check what
   was proved at load time
-- A reference interpreter written from the specification, differential-tested
-  against the compiler on every push
+- A reference interpreter written from the specification, and a reader that runs
+  the emitted IR without clang, so the source, the IR and the `.so` are compared
+  against each other on every push
 
 See [Implementation Status](#implementation-status) for what is designed but not
 yet built. The implementation is deliberately a small verifiable core, not a
@@ -245,6 +246,7 @@ smooth input drives it to zero and the kernel returns infinities.
 | Proven contract embedded in the artifact | ✅ implemented |
 | Diagnostics with source lines | ✅ implemented |
 | Reference interpreter + differential testing | ✅ implemented |
+| IR read back and validated against the source | ✅ implemented — empirical, not yet proved |
 | C ABI, JSON metadata, Python FFI | ✅ implemented |
 | AVX-512 / NEON width selection, GPU backends | 📋 planned — the vector width is fixed at four lanes |
 | Tiling and cache blocking | 📋 planned — a sweep is one linear pass |

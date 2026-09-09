@@ -343,6 +343,35 @@ written to match the other. It has already found four defects:
 - and `^` had no pinned meaning, so the compiler and the interpreter rounded a
   square differently.
 
+### The chain
+
+Three representations of the same program are compared, which separates the two
+kinds of mistake a compiler can make:
+
+```
+what the source means      src/interp.rs, written from this specification
+        ≡
+what the generator decided src/irvm.rs reads the emitted IR back and runs it
+        ≡
+what clang built           the .so, loaded and called
+```
+
+A break in the first link is a code generation bug. A break in the second is a
+backend or a flag. Without the middle term the two are indistinguishable.
+
+`src/irvm.rs` accepts only the subset `rhoc` emits and reports anything else as
+unreadable rather than skipping it — a validator that quietly ignored an
+instruction would be worse than none. One property of the subset makes this
+work: control flow never depends on data. Loop bounds are literals, `br` only
+tests an integer comparison, and every floating-point decision goes through
+`select`. So the program unrolls with concrete indices and only the values are
+in question.
+
+📋 This is the empirical half of translation validation: 1,291 random programs
+currently agree on every cell. Proving the equivalence for *all* inputs at a
+given shape — handing both sides to Z3 rather than to a random generator — is
+the remaining step, and the machinery is now in place for it.
+
 ### Two decisions the differential testing forced
 
 **A whole exponent is repeated multiplication.** `x ^ 2` is `x * x`, not a call

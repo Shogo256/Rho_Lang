@@ -1731,3 +1731,86 @@ fn test_a_whole_exponent_is_repeated_multiplication() {
     );
     assert_eq!(zero, vec![1.0, 1.0, 1.0, 1.0]);
 }
+
+// --------------------------------------------------------------------------
+// The emitted IR, read back and run without clang. This separates "did the
+// generator mean the right thing" from "did clang build what it was told".
+// --------------------------------------------------------------------------
+
+use rho_lang::irvm::{parse_module, Machine, Value};
+
+fn run_emitted_ir(name: &str, source: &str, input: &[f64], out_cells: usize) -> Vec<f64> {
+    let block = parse_rho_program(source).unwrap();
+    let ir = LlvmCodeGen::new(name).generate_llvm_ir(&block).unwrap();
+
+    let functions = parse_module(&ir);
+    let entry = functions
+        .iter()
+        .find(|f| f.name == "rho_kernel_exec_with_args")
+        .expect("the argument entrypoint");
+
+    let mut machine = Machine::new();
+    let src = machine.add_buffer(input.to_vec());
+    let dst = machine.add_buffer(vec![0.0; out_cells]);
+    machine
+        .run(entry, &[Value::P(src, 0), Value::P(dst, 0)])
+        .unwrap_or_else(|why| panic!("{name}: {why}\n{ir}"));
+    machine.buffer(dst).to_vec()
+}
+
+#[test]
+fn test_the_emitted_ir_computes_what_the_source_means() {
+    let input: Vec<f64> = vec![2.0, -4.0, 4.0, 0.5, 5.0, -5.0, 7.0, 9.0, -1.0, 3.0, 0.0, 6.0];
+
+    let cases: [(&str, &str, &[usize], usize); 7] = [
+        ("ir_add", "(INPUT + 1.0) → OUTPUT\n        OUTPUT → =", &[12, 1], 12),
+        ("ir_shift", "(▷INPUT - INPUT) → OUTPUT\n        OUTPUT → =", &[3, 4], 12),
+        ("ir_axis", "(▽0INPUT) → OUTPUT\n        OUTPUT → =", &[3, 4], 12),
+        ("ir_mask", "(INPUT > 1.0) → OUTPUT\n        OUTPUT → =", &[12, 1], 12),
+        ("ir_fold", "◇+1 INPUT → OUTPUT\n        OUTPUT → =", &[3, 4], 3),
+        ("ir_scan", "◈+ INPUT → OUTPUT\n        OUTPUT → =", &[12, 1], 12),
+        (
+            "ir_chain",
+            "(▷INPUT - INPUT) → D\n        ((D ^ 2.0) + 1.0) → OUTPUT\n        OUTPUT → =",
+            &[12, 1],
+            12,
+        ),
+    ];
+
+    for (name, body, shape, out_cells) in cases {
+        let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+        let source = format!(
+            "{{\n        INPUT:◯ □ {}\n        {body}\n    }}",
+            dims.join(" ")
+        );
+
+        // What the source means, per the reference interpreter.
+        let block = parse_rho_program(&source).unwrap();
+        let mut env = Env::new();
+        env.insert("INPUT".to_string(), Grid::from(shape.to_vec(), input.clone()));
+        let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+
+        // What the generator emitted, run on its own.
+        let emitted = run_emitted_ir(name, &source, &input, out_cells);
+
+        assert_eq!(
+            meant.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            emitted[..meant.len()].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "{name}: the emitted IR does not compute what the source means"
+        );
+    }
+}
+
+#[test]
+fn test_the_ir_reader_refuses_what_it_does_not_understand() {
+    // A validator that quietly ignored an instruction would be worse than one
+    // that stops, so an unknown opcode has to be an error rather than a shrug.
+    let functions = parse_module(
+        "define void @rho_kernel_exec_with_args(ptr %in_ptr, ptr %out_ptr) #0 {\nentry:\n  %x = frobnicate double 1.0, 2.0\n  ret void\n}\n",
+    );
+    let mut machine = Machine::new();
+    let a = machine.add_buffer(vec![0.0; 4]);
+    let b = machine.add_buffer(vec![0.0; 4]);
+    let outcome = machine.run(&functions[0], &[Value::P(a, 0), Value::P(b, 0)]);
+    assert!(outcome.is_err(), "an unknown opcode must be reported");
+}

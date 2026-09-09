@@ -355,7 +355,7 @@ fn find_binary_op_position(s: &str, op: &str) -> Option<usize> {
         } else if depth == 0 && s.as_bytes()[i..].starts_with(op_bytes) {
             // The operator right after ◇ names the fold, so it is part of the
             // glyph rather than a binary operator splitting the expression.
-            if s[..i].chars().next_back() == Some('◇') {
+            if s[..i].ends_with('◇') {
                 continue;
             }
             let lhs = s[..i].trim();

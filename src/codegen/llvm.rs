@@ -526,7 +526,7 @@ impl LlvmCodeGen {
 
             // Fold every reduction in this flow into its own buffer first. The
             // sweep below then reads a plain array, so it stays straight-line.
-            pred = self.emit_fold_prepass(src, ir, bufs, &pred, loop_id, counter)?;
+            pred = self.emit_fold_prepass(src, ir, bufs, &pred, counter)?;
 
             let sweep = self.sweep_length(src, target, bufs);
             let plan = self.plan_sweep(src, &sweep)?;
@@ -612,21 +612,20 @@ impl LlvmCodeGen {
         ir: &mut String,
         bufs: &mut Buffers,
         pred: &str,
-        loop_id: usize,
         counter: &mut usize,
     ) -> Result<String> {
         let mut block = pred.to_string();
         match expr {
             Expr::Var(_) | Expr::Number(_) => {}
             Expr::AuditTrace(inner) | Expr::Shift { operand: inner, .. } => {
-                block = self.emit_fold_prepass(inner, ir, bufs, &block, loop_id, counter)?;
+                block = self.emit_fold_prepass(inner, ir, bufs, &block, counter)?;
             }
             Expr::BinaryOp { lhs, rhs, .. } => {
-                block = self.emit_fold_prepass(lhs, ir, bufs, &block, loop_id, counter)?;
-                block = self.emit_fold_prepass(rhs, ir, bufs, &block, loop_id, counter)?;
+                block = self.emit_fold_prepass(lhs, ir, bufs, &block, counter)?;
+                block = self.emit_fold_prepass(rhs, ir, bufs, &block, counter)?;
             }
             Expr::Reduce { op, axis, operand } => {
-                block = self.emit_fold_prepass(operand, ir, bufs, &block, loop_id, counter)?;
+                block = self.emit_fold_prepass(operand, ir, bufs, &block, counter)?;
                 block = self.emit_fold(expr, *op, *axis, operand, ir, bufs, &block, counter)?;
             }
         }

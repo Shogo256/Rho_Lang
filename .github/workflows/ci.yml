@@ -44,6 +44,13 @@ jobs:
     - name: Check SIMD Matches The Scalar Reference
       run: cargo test --release vector_and_scalar
 
+    - name: Differential Test The Compiler Against The Interpreter
+      run: |
+        cargo build --release
+        for seed in 20260909 7 424242; do
+          ./target/release/difftest $seed 250
+        done
+
     - name: Fuzz The Constraint Solver Against Real Runs
       run: |
         cargo build --release

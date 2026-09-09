@@ -1027,6 +1027,43 @@ impl LlvmCodeGen {
         })
     }
 
+    /// A literal exponent that is a whole number small enough to unroll.
+    fn whole_exponent(rhs: &Expr) -> Option<i32> {
+        let Expr::Number(v) = rhs else { return None };
+        if *v != v.trunc() || v.abs() > 64.0 {
+            return None;
+        }
+        Some(*v as i32)
+    }
+
+    /// `x^n` as repeated multiplication, with a reciprocal for a negative n.
+    fn emit_integer_power(
+        &self,
+        base: &str,
+        n: i32,
+        ir: &mut String,
+        counter: &mut usize,
+        mode: Mode,
+        out: &str,
+    ) {
+        let ty = mode.ty();
+        if n == 0 {
+            ir.push_str(&format!("  {out} = fadd {ty} {}, {}\n", mode.zero(), mode.splat(1.0)));
+            return;
+        }
+        let mut acc = base.to_string();
+        for _ in 1..n.abs() {
+            let next = Self::fresh(counter);
+            ir.push_str(&format!("  {next} = fmul {ty} {acc}, {base}\n"));
+            acc = next;
+        }
+        if n < 0 {
+            ir.push_str(&format!("  {out} = fdiv {ty} {}, {acc}\n", mode.splat(1.0)));
+        } else {
+            ir.push_str(&format!("  {out} = fadd {ty} {}, {acc}\n", mode.zero(), ));
+        }
+    }
+
     /// The shape of the buffer a fold or scan was precomputed into.
     fn precomputed_shape(&self, expr: &Expr) -> Vec<usize> {
         Self::expr_shape(expr, &self.space_shapes).unwrap_or_else(|| vec![self.elements])
@@ -1234,10 +1271,18 @@ impl LlvmCodeGen {
                     BinaryOpKind::Div => {
                         ir.push_str(&format!("  {out} = fdiv {ty} {l}, {r}\n"))
                     }
-                    BinaryOpKind::Pow => ir.push_str(&format!(
-                        "  {out} = call {ty} {}({ty} {l}, {ty} {r})\n",
-                        mode.pow_intrinsic()
-                    )),
+                    // A whole-number exponent is repeated multiplication, which
+                    // is exact and does not depend on a maths library. Leaving
+                    // it to pow() made the result differ by an ulp from the
+                    // reference interpreter, because the two libm implementations
+                    // round the square differently.
+                    BinaryOpKind::Pow => match Self::whole_exponent(rhs) {
+                        Some(n) => self.emit_integer_power(&l, n, ir, counter, mode, &out),
+                        None => ir.push_str(&format!(
+                            "  {out} = call {ty} {}({ty} {l}, {ty} {r})\n",
+                            mode.pow_intrinsic()
+                        )),
+                    },
                     // Threshold comparison masks the grid: the left value passes
                     // through where the predicate holds, elsewhere the cell is 0.
                     BinaryOpKind::Gt
@@ -1522,6 +1567,11 @@ impl LlvmCodeGen {
             "-shared",
             "-fPIC",
             "-O3",
+            // Contraction — fusing a multiply and an add into one rounding —
+            // makes the kernel disagree with the per-operation rounding the
+            // solver models, and with the reference interpreter. Differential
+            // testing found the divergence as a one-ulp mismatch.
+            "-ffp-contract=off",
             "-Wno-override-module",
             &temp_ll,
             "-o",

@@ -375,9 +375,15 @@ fn find_binary_op_position(s: &str, op: &str) -> Option<usize> {
         } else if c == '(' {
             depth -= 1;
         } else if depth == 0 && s.as_bytes()[i..].starts_with(op_bytes) {
-            // The operator right after ◇ names the fold, so it is part of the
-            // glyph rather than a binary operator splitting the expression.
+            // The operator right after ◇ or ◈ names the fold, so it is part of
+            // the glyph rather than a binary operator splitting the expression.
             if s[..i].ends_with('◇') || s[..i].ends_with('◈') {
+                continue;
+            }
+            // A + or - that follows another operator is a sign on the number to
+            // its right, not a split point. Without this, `A × -3.0` breaks at
+            // the minus and leaves `A ×` behind as if it were a name.
+            if matches!(op, "+" | "-") && is_sign_position(&s[..i]) {
                 continue;
             }
             let lhs = s[..i].trim();
@@ -388,6 +394,37 @@ fn find_binary_op_position(s: &str, op: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Whether a `+` or `-` at the end of `before` would be a sign rather than a
+/// binary operator: nothing precedes it, or what does is itself an operator.
+fn is_sign_position(before: &str) -> bool {
+    let trimmed = before.trim_end();
+
+    // An axis index can sit between a glyph and the sign, as in `◈×0 -3.0`.
+    // Digits only follow a glyph there, so stepping over them and finding one
+    // settles it.
+    let stripped = trimmed.trim_end_matches(|c: char| c.is_ascii_digit());
+    if stripped.len() < trimmed.len() {
+        let mut tail = stripped.chars();
+        let last = tail.next_back();
+        let before_last = tail.next_back();
+        if matches!(last, Some('▷' | '▽' | '□'))
+            || (matches!(last, Some('+' | '-' | '×' | '*' | '>' | '<'))
+                && matches!(before_last, Some('◇' | '◈')))
+        {
+            return true;
+        }
+    }
+
+    match trimmed.chars().next_back() {
+        None => true,
+        Some(c) => matches!(
+            c,
+            '+' | '-' | '×' | '*' | '/' | '^' | '>' | '<' | '=' | '(' | ':' | '→'
+                | '◇' | '◈' | '▷' | '▽' | '□' | '!' | '$'
+        ),
+    }
 }
 
 fn is_enclosed_by_outer_parens(s: &str) -> bool {

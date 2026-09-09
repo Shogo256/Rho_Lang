@@ -58,7 +58,6 @@ pub const CONTRACT_ASSUMPTIONS: &[&str] = &[
     "no overflow to infinity",
     "no underflow to subnormals",
     "no NaN input",
-    "no operation contraction, e.g. into an FMA",
 ];
 
 impl Contract {

@@ -8,6 +8,10 @@ description = "Compiler for ρ (RHO) Language: Time-eliminated topological dataf
 name = "rhoc"
 path = "src/main.rs"
 
+[[bin]]
+name = "difftest"
+path = "src/bin/difftest.rs"
+
 [dependencies]
 nom = "7.1"
 thiserror = "2.0"

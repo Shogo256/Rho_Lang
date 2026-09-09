@@ -37,7 +37,7 @@ punctuation.
 | `-` | Subtraction | Difference | Element-wise subtraction | ✅ |
 | `×` / `*` | Multiplication | Scaling | Element-wise product | ✅ |
 | `/` | Division | Distortion | Element-wise division | ✅ |
-| `^` | Exponentiation | Expansion | Element-wise power (`llvm.pow.f64`) | ✅ |
+| `^` | Exponentiation | Expansion | Element-wise power; a whole exponent is repeated multiplication | ✅ |
 | `→` | Flow | Ruten (流転) | One full sweep of the grid into the target | ✅ |
 | `<` `>` | Threshold | Boundary Condition | Masking compare, see §3.3 | ✅ |
 | `=` | Equilibrium | Tou (答 / 均衡) | Final output; ends the pipeline | ✅ |
@@ -322,3 +322,35 @@ tell a proof from a proof-under-conditions.
 `rhoc --require-contract` refuses to emit a kernel with an incomplete contract,
 and `RhoEngine.require_contract()` refuses to load one. Together they let a
 system draw a line that unproven kernels cannot cross.
+
+---
+
+## 6. The Reference Interpreter ✅
+
+`src/interp.rs` evaluates a program directly, written from this specification
+rather than from the code generator. It exists to be an independent second
+opinion: `cargo run --bin difftest` generates random programs, shapes and
+inputs, runs both, and reports any cell where they disagree.
+
+That is a stronger check than a test suite, because neither implementation was
+written to match the other. It has already found four defects:
+
+- the interpreter treated a fold's surviving index as the start of the line that
+  cell summarises, so every row after the first folded the wrong values;
+- the parser split `A × -3.0` at the minus and left `A ×` behind as a name,
+  because it never asked whether a sign was a sign;
+- the same, one step further, for an axis index: `◈×0 -3.0`;
+- and `^` had no pinned meaning, so the compiler and the interpreter rounded a
+  square differently.
+
+### Two decisions the differential testing forced
+
+**A whole exponent is repeated multiplication.** `x ^ 2` is `x * x`, not a call
+to a maths library. Libraries do not agree with each other on the last bit of a
+square, and a language that promises byte-identical output cannot inherit that.
+
+**Floating-point contraction is off.** `clang` may fuse a multiply and an add
+into a single rounding, which is more accurate but is not what the solver models
+— it assumes every operation rounds once. The kernels are compiled with
+`-ffp-contract=off` so the machine agrees with the model, and one assumption
+drops off every contract.

@@ -2,6 +2,7 @@ pub mod ast;
 pub mod codegen;
 pub mod dag;
 pub mod error;
+pub mod interp;
 pub mod parser;
 pub mod solver;
 pub mod symbolic;

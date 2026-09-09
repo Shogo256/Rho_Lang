@@ -1587,3 +1587,147 @@ fn test_a_non_associative_scan_is_rejected() {
         assert!(parse_rho_program(&source).is_err(), "{glyph} should not parse");
     }
 }
+
+// --------------------------------------------------------------------------
+// The reference interpreter. It is written from the semantics rather than from
+// the code generator, so a disagreement between the two means one of them is
+// wrong — and says where to look.
+// --------------------------------------------------------------------------
+
+use rho_lang::interp::{interpret, Env, Grid};
+
+/// Run a program both ways and require the compiled kernel to match the
+/// interpreter cell for cell.
+fn agree(name: &str, source: &str, shape: &[usize], input: &[f64]) {
+    let block = parse_rho_program(source).unwrap();
+
+    let mut env: Env = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(shape.to_vec(), input.to_vec()));
+    let interpreted = interpret(&block, &env, 0.0).unwrap();
+    let expected = &interpreted.get("OUTPUT").expect("OUTPUT").cells;
+
+    let compiled = run_kernel(name, source, input);
+
+    assert_eq!(
+        compiled[..expected.len()]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "{name}: the compiler and the interpreter disagree\n  compiled    {:?}\n  interpreted {:?}",
+        &compiled[..expected.len()],
+        expected
+    );
+}
+
+#[test]
+fn test_compiler_agrees_with_the_reference_interpreter() {
+    let ramp: Vec<f64> = (0..12).map(|i| i as f64 - 5.0).collect();
+    let mixed = vec![
+        2.0, -4.0, 4.0, 0.5, 5.0, -5.0, 7.0, 9.0, -1.0, 3.0, 0.0, 6.0,
+    ];
+
+    let cases: [(&str, &str, &[usize]); 12] = [
+        ("ref_add", "(INPUT + 1.0) → OUTPUT\n        OUTPUT → =", &[12, 1]),
+        ("ref_shift", "(▷INPUT) → OUTPUT\n        OUTPUT → =", &[12, 1]),
+        ("ref_shift_neg", "(▽INPUT) → OUTPUT\n        OUTPUT → =", &[12, 1]),
+        ("ref_grid_shift", "(▷INPUT - INPUT) → OUTPUT\n        OUTPUT → =", &[3, 4]),
+        ("ref_axis0", "(▽0INPUT + INPUT) → OUTPUT\n        OUTPUT → =", &[3, 4]),
+        ("ref_mask", "(INPUT > 1.0) → OUTPUT\n        OUTPUT → =", &[12, 1]),
+        ("ref_pow", "((INPUT ^ 2) + 1.0) → OUTPUT\n        OUTPUT → =", &[12, 1]),
+        ("ref_fold", "◇+ INPUT → OUTPUT\n        OUTPUT → =", &[12, 1]),
+        ("ref_fold_axis", "◇>1 INPUT → OUTPUT\n        OUTPUT → =", &[3, 4]),
+        ("ref_scan", "◈+ INPUT → OUTPUT\n        OUTPUT → =", &[12, 1]),
+        ("ref_scan_axis", "◈+0 INPUT → OUTPUT\n        OUTPUT → =", &[3, 4]),
+        (
+            "ref_chain",
+            "(▷INPUT - INPUT) → D\n        (◈+ (D × D)) → S\n        (S / 2.0) → OUTPUT\n        OUTPUT → =",
+            &[12, 1],
+        ),
+    ];
+
+    for (name, body, shape) in cases {
+        let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+        let source = format!(
+            "{{\n        INPUT:◯ □ {}\n        {body}\n    }}",
+            dims.join(" ")
+        );
+        agree(name, &source, shape, &ramp);
+        agree(&format!("{name}_b"), &source, shape, &mixed);
+    }
+}
+
+#[test]
+fn test_a_sign_is_not_a_binary_operator() {
+    // Found by differential testing. The expression parser split at the
+    // rightmost operator without asking whether a + or - was a sign, so
+    // `A × -3.0` broke at the minus and left `A ×` behind as if it were a name.
+    for (index, (body, expected)) in [
+        ("(INPUT × -3.0)", vec![-3.0, -6.0, -9.0, -12.0]),
+        ("(INPUT - -2.0)", vec![3.0, 4.0, 5.0, 6.0]),
+        ("(INPUT + -1.0)", vec![0.0, 1.0, 2.0, 3.0]),
+        ("(INPUT / -2.0)", vec![-0.5, -1.0, -1.5, -2.0]),
+        ("((-2.0) × INPUT)", vec![-2.0, -4.0, -6.0, -8.0]),
+        ("(INPUT ^ -1.0)", vec![1.0, 0.5, 1.0 / 3.0, 0.25]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = format!(
+            "{{\n        INPUT:◯ □ 4 1\n        {body} → OUTPUT\n        OUTPUT → =\n    }}"
+        );
+        let name = format!("sign_case_{index}");
+        let out = run_kernel(&name, &source, &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(out, expected, "{body}");
+    }
+}
+
+#[test]
+fn test_interpreter_folds_the_right_line() {
+    // Also found by differential testing: the interpreter treated the index of
+    // a surviving cell as if it were the start of the line that cell
+    // summarises, so every row after the first folded the wrong values.
+    let source = r#"{
+        INPUT:◯ □ 3 4
+        ◇>1 INPUT → OUTPUT
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let grid: Vec<f64> = (0..12).map(|i| i as f64 - 5.0).collect();
+
+    let mut env = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![3, 4], grid));
+    let out = interpret(&block, &env, 0.0).unwrap();
+
+    // Row maxima of [-5..-2], [-1..2], [3..6].
+    assert_eq!(out["OUTPUT"].cells, vec![-2.0, 2.0, 6.0]);
+}
+
+#[test]
+fn test_a_whole_exponent_is_repeated_multiplication() {
+    // Found by differential testing. Leaving `^` to a maths library made the
+    // compiler and the interpreter disagree by an ulp, because the two round a
+    // square differently. Pinning whole exponents to repeated multiplication
+    // makes the result exact and the same everywhere.
+    let x = 3.6295812865328214f64;
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        (INPUT ^ 2.0) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let out = run_kernel("whole_power", source, &[x, 2.0, -3.0, 0.5]);
+
+    assert_eq!(out[0], x * x, "a square must be exactly the product");
+    assert_ne!(out[0], x.powf(2.0), "and not what powf returns for it");
+    assert_eq!(out[1], 4.0);
+    assert_eq!(out[2], 9.0);
+    assert_eq!(out[3], 0.25);
+
+    // Zero and negative exponents keep the same definition.
+    let zero = run_kernel(
+        "whole_power_zero",
+        "{\n        INPUT:◯ □ 4 1\n        (INPUT ^ 0.0) → OUTPUT\n        OUTPUT → =\n    }",
+        &[5.0, -2.0, 0.0, 1.0],
+    );
+    assert_eq!(zero, vec![1.0, 1.0, 1.0, 1.0]);
+}

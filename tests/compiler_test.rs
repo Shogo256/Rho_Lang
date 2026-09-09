@@ -1451,3 +1451,139 @@ fn test_zero_copy_entrypoint_needs_every_source_bound() {
     assert!(!exec.contains("is unbound"), "{exec}");
     assert!(exec.contains("inttoptr i64 8192"), "B should be read from its binding");
 }
+
+// --------------------------------------------------------------------------
+// Scan. Where a fold answers "what is the total", a scan answers "what is the
+// total so far" for every cell, and so keeps the shape it walks.
+// --------------------------------------------------------------------------
+
+#[test]
+fn test_scan_accumulates_along_an_axis() {
+    let source = r#"{
+        INPUT:◯ □ 6 1
+        ◈+ INPUT → OUTPUT
+        OUTPUT → =
+    }"#;
+    let out = run_kernel("scan_sum", source, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    assert_eq!(out, vec![1.0, 3.0, 6.0, 10.0, 15.0, 21.0]);
+}
+
+#[test]
+fn test_scan_operators_product_max_and_min() {
+    for (name, glyph, data, expected) in [
+        (
+            "scan_prod",
+            "◈×",
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 1.0],
+            vec![1.0, 2.0, 6.0, 24.0, 120.0, 120.0],
+        ),
+        (
+            "scan_max",
+            "◈>",
+            vec![3.0, 1.0, 4.0, 1.0, 5.0, 2.0],
+            vec![3.0, 3.0, 4.0, 4.0, 5.0, 5.0],
+        ),
+        (
+            "scan_min",
+            "◈<",
+            vec![3.0, 1.0, 4.0, 1.0, 5.0, 2.0],
+            vec![3.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        ),
+    ] {
+        let source = format!(
+            "{{\n        INPUT:◯ □ 6 1\n        {glyph} INPUT → OUTPUT\n        OUTPUT → =\n    }}"
+        );
+        assert_eq!(run_kernel(name, &source, &data), expected, "{name}");
+    }
+}
+
+#[test]
+fn test_scan_keeps_its_shape_and_respects_the_axis() {
+    let grid: Vec<f64> = vec![
+        1.0, 2.0, 3.0, 4.0, //
+        10.0, 20.0, 30.0, 40.0, //
+        100.0, 200.0, 300.0, 400.0,
+    ];
+
+    // Along a row: each row accumulates on its own.
+    let rows = run_kernel(
+        "scan_rows",
+        "{\n        INPUT:◯ □ 3 4\n        ◈+1 INPUT → OUTPUT\n        OUTPUT → =\n    }",
+        &grid,
+    );
+    assert_eq!(
+        rows,
+        vec![1.0, 3.0, 6.0, 10.0, 10.0, 30.0, 60.0, 100.0, 100.0, 300.0, 600.0, 1000.0]
+    );
+
+    // Down a column: the totals run between rows instead.
+    let cols = run_kernel(
+        "scan_cols",
+        "{\n        INPUT:◯ □ 3 4\n        ◈+0 INPUT → OUTPUT\n        OUTPUT → =\n    }",
+        &grid,
+    );
+    assert_eq!(
+        cols,
+        vec![1.0, 2.0, 3.0, 4.0, 11.0, 22.0, 33.0, 44.0, 111.0, 222.0, 333.0, 444.0]
+    );
+}
+
+#[test]
+fn test_scan_composes_with_a_fold() {
+    // A cumulative distribution: the running total over the total. The fold
+    // drops an axis, so `□` puts one back before the division.
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        ((◈+ INPUT) / (□0 (◇+ INPUT))) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let out = run_kernel("scan_cdf", source, &[1.0, 1.0, 1.0, 1.0]);
+    assert_eq!(out, vec![0.25, 0.5, 0.75, 1.0]);
+}
+
+#[test]
+fn test_ascii_alias_for_the_scan_glyph() {
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        <.>+ INPUT -> OUTPUT
+        OUTPUT -> =
+    }"#;
+    let out = run_kernel("scan_ascii", source, &[5.0, 5.0, 5.0, 5.0]);
+    assert_eq!(out, vec![5.0, 10.0, 15.0, 20.0]);
+}
+
+#[test]
+fn test_scan_and_fold_write_different_amounts() {
+    // The same expression under each glyph: one keeps the grid, one collapses it.
+    let scan = LlvmCodeGen::new("scan_extent")
+        .generate_llvm_ir(
+            &parse_rho_program(
+                "{\n    INPUT:◯ □ 3 4\n    ◈+1 INPUT → OUTPUT\n    OUTPUT → =\n}",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(scan.contains("(running) over axis 1 of [3, 4] -> 12 cells"), "{scan}");
+    assert!(scan.contains("sweep 12 cells"), "{scan}");
+
+    let fold = LlvmCodeGen::new("fold_extent")
+        .generate_llvm_ir(
+            &parse_rho_program(
+                "{\n    INPUT:◯ □ 3 4\n    ◇+1 INPUT → OUTPUT\n    OUTPUT → =\n}",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(fold.contains("(total) over axis 1 of [3, 4] -> 3 cells"), "{fold}");
+    assert!(fold.contains("sweep 3 cells"), "{fold}");
+}
+
+#[test]
+fn test_a_non_associative_scan_is_rejected() {
+    for glyph in ["◈-", "◈/"] {
+        let source = format!(
+            "{{\n        INPUT:◯ □ 4 1\n        {glyph} INPUT → OUTPUT\n        OUTPUT → =\n    }}"
+        );
+        assert!(parse_rho_program(&source).is_err(), "{glyph} should not parse");
+    }
+}

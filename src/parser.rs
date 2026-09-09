@@ -7,7 +7,7 @@ pub fn validate_symbols(input: &str) -> Result<()> {
     let code_only = remove_comments(input);
 
     let allowed_unicode: HashSet<char> = [
-        '◯', '□', '▷', '▽', '△', '◇', '+', '-', '×', '*', '/', '^', '→', '<', '>', '=', ':', '{', '}', '$', '&', '!',
+        '◯', '□', '▷', '▽', '△', '◇', '◈', '+', '-', '×', '*', '/', '^', '→', '<', '>', '=', ':', '{', '}', '$', '&', '!',
         '(', ')', '[', ']', ';', ',', '.', ' ', '\t', '\r', '\n', '_', '𝜏', 'τ'
     ].iter().cloned().collect();
 
@@ -56,7 +56,9 @@ pub fn check_forbidden_keywords(input: &str) -> Result<()> {
 /// Normalize ASCII symbol aliases to Unicode RHO topological symbols
 pub fn normalize_ascii_aliases(input: &str) -> String {
     input
-        // <> before << and >>, so a fold is not mistaken for two shifts.
+        // <.> before <>, and both before << and >>, so a scan is not read as a
+        // fold and neither is read as two shifts.
+        .replace("<.>", "◈")
         .replace("<>", "◇")
         // [] never appears in an address binding, which is always &[0x...].
         .replace("[]", "□")
@@ -281,9 +283,12 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         }
     }
 
-    // Reduction: ◇+X folds along an axis, ◇+0X pins the axis.
-    if expr_str.starts_with('◇') && expr_str.chars().count() > 2 {
-        let rest = &expr_str['◇'.len_utf8()..];
+    // Fold and scan share a shape: glyph, operator, optional axis, operand.
+    for (glyph, scanning) in [('◇', false), ('◈', true)] {
+        if !expr_str.starts_with(glyph) || expr_str.chars().count() <= 2 {
+            continue;
+        }
+        let rest = &expr_str[glyph.len_utf8()..];
         let mut chars = rest.chars();
         let op_char = chars.next().unwrap();
         let op = match op_char {
@@ -308,10 +313,12 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         let digits: String = after_op.chars().take_while(char::is_ascii_digit).collect();
         let operand_str = after_op[digits.len()..].trim();
         if !operand_str.is_empty() {
-            return Ok(Expr::Reduce {
-                op: fold,
-                axis: if digits.is_empty() { None } else { digits.parse().ok() },
-                operand: Box::new(parse_expr(operand_str)?),
+            let axis = if digits.is_empty() { None } else { digits.parse().ok() };
+            let operand = Box::new(parse_expr(operand_str)?);
+            return Ok(if scanning {
+                Expr::Scan { op: fold, axis, operand }
+            } else {
+                Expr::Reduce { op: fold, axis, operand }
             });
         }
     }
@@ -370,7 +377,7 @@ fn find_binary_op_position(s: &str, op: &str) -> Option<usize> {
         } else if depth == 0 && s.as_bytes()[i..].starts_with(op_bytes) {
             // The operator right after ◇ names the fold, so it is part of the
             // glyph rather than a binary operator splitting the expression.
-            if s[..i].ends_with('◇') {
+            if s[..i].ends_with('◇') || s[..i].ends_with('◈') {
                 continue;
             }
             let lhs = s[..i].trim();
@@ -449,6 +456,7 @@ fn check_expr_spaces(expr: &Expr, declared: &HashSet<String>, line: usize) -> Re
         }
         Expr::Shift { operand: inner, .. }
         | Expr::Reduce { operand: inner, .. }
+        | Expr::Scan { operand: inner, .. }
         | Expr::Lift { operand: inner, .. }
         | Expr::AuditTrace(inner) => {
             check_expr_spaces(inner, declared, line)?;
@@ -507,6 +515,7 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
                 let inner = get_expr_shape(operand, shapes)?;
                 shape_with_unit_axis(&inner, *axis)
             }
+            Expr::Scan { operand, .. } => get_expr_shape(operand, shapes),
             Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
                 get_expr_shape(inner, shapes)
             }
@@ -554,6 +563,7 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
             }
             Expr::Shift { operand: inner, .. }
             | Expr::Reduce { operand: inner, .. }
+            | Expr::Scan { operand: inner, .. }
             | Expr::Lift { operand: inner, .. }
             | Expr::AuditTrace(inner) => check_broadcast(inner, shapes, line)?,
             Expr::Var(_) | Expr::Number(_) => {}

@@ -1,0 +1,12 @@
+{
+    /* A cumulative distribution.
+
+       ◈+ is a running total, so it keeps the grid it walks. ◇+ is the total,
+       so it drops the axis it walks — which is why □ puts an axis back before
+       the division lines the two up. */
+    INPUT:◯ □ 1024 1
+
+    ((◈+ INPUT) / (□0 (◇+ INPUT))) → OUTPUT
+
+    OUTPUT → =
+}

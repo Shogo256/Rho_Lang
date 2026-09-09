@@ -400,6 +400,7 @@ impl LlvmCodeGen {
                 let inner = Self::expr_shape(operand, shapes)?;
                 crate::ast::shape_with_unit_axis(&inner, *axis)
             }
+            Expr::Scan { operand, .. } => Self::expr_shape(operand, shapes),
             Expr::Reduce { axis, operand, .. } => {
                 let inner = Self::expr_shape(operand, shapes)?;
                 let a = axis.unwrap_or_else(|| crate::ast::default_axis(&inner));
@@ -668,7 +669,13 @@ impl LlvmCodeGen {
             }
             Expr::Reduce { op, axis, operand } => {
                 block = self.emit_fold_prepass(operand, ir, bufs, &block, counter)?;
-                block = self.emit_fold(expr, *op, *axis, operand, ir, bufs, &block, counter)?;
+                block =
+                    self.emit_fold(expr, *op, *axis, operand, ir, bufs, &block, counter, false)?;
+            }
+            Expr::Scan { op, axis, operand } => {
+                block = self.emit_fold_prepass(operand, ir, bufs, &block, counter)?;
+                block =
+                    self.emit_fold(expr, *op, *axis, operand, ir, bufs, &block, counter, true)?;
             }
         }
         Ok(block)
@@ -687,6 +694,7 @@ impl LlvmCodeGen {
         bufs: &mut Buffers,
         pred: &str,
         counter: &mut usize,
+        running: bool,
     ) -> Result<String> {
         let shape = Self::expr_shape(operand, &self.space_shapes).ok_or_else(|| {
             HarmonyDisruption::LoweringErr {
@@ -708,15 +716,21 @@ impl LlvmCodeGen {
         let extent = shape[a].max(1);
         let inner: usize = shape[a + 1..].iter().product::<usize>().max(1);
         let outer: usize = shape[..a].iter().product::<usize>().max(1);
-        let out_cells = (outer * inner).max(1);
+        // A fold writes one cell per line; a scan writes every cell it walks.
+        let out_cells = if running {
+            (outer * extent * inner).max(1)
+        } else {
+            (outer * inner).max(1)
+        };
 
         *counter += 1;
         let id = *counter;
         let label = format!("fold{id}");
         let buffer = self.emit_scratch(ir, &format!("{label}_buf"), out_cells, &mut bufs.heap);
 
+        let kind = if running { "running" } else { "total" };
         ir.push_str(&format!(
-            "  ; {op} over axis {a} of {shape:?} -> {out_cells} cells\n"
+            "  ; {op} ({kind}) over axis {a} of {shape:?} -> {out_cells} cells\n"
         ));
         ir.push_str(&format!("  br label %{label}.header\n\n"));
 
@@ -726,7 +740,8 @@ impl LlvmCodeGen {
             "  %{label}.j = phi i64 [ 0, %{pred} ], [ %{label}.j.next, %{label}.tail ]\n"
         ));
         ir.push_str(&format!(
-            "  %{label}.go = icmp ult i64 %{label}.j, {out_cells}\n"
+            "  %{label}.go = icmp ult i64 %{label}.j, {}\n",
+            (outer * inner).max(1)
         ));
         ir.push_str(&format!(
             "  br i1 %{label}.go, label %{label}.body, label %{label}.end\n\n"
@@ -795,16 +810,27 @@ impl LlvmCodeGen {
                 ));
             }
         }
+        if running {
+            // Every step of a scan is an answer, so it is stored as it goes.
+            ir.push_str(&format!(
+                "  %{label}.here = getelementptr inbounds double, ptr {buffer}, i64 %{label}.at\n"
+            ));
+            ir.push_str(&format!(
+                "  store double %{label}.acc.next, ptr %{label}.here, align 8\n"
+            ));
+        }
         ir.push_str(&format!("  %{label}.m.next = add i64 %{label}.m, 1\n"));
         ir.push_str(&format!("  br label %{label}.inner\n\n"));
 
         ir.push_str(&format!("{label}.tail:\n"));
-        ir.push_str(&format!(
-            "  %{label}.slot = getelementptr inbounds double, ptr {buffer}, i64 %{label}.j\n"
-        ));
-        ir.push_str(&format!(
-            "  store double %{label}.acc, ptr %{label}.slot, align 8\n"
-        ));
+        if !running {
+            ir.push_str(&format!(
+                "  %{label}.slot = getelementptr inbounds double, ptr {buffer}, i64 %{label}.j\n"
+            ));
+            ir.push_str(&format!(
+                "  store double %{label}.acc, ptr %{label}.slot, align 8\n"
+            ));
+        }
         ir.push_str(&format!("  %{label}.j.next = add i64 %{label}.j, 1\n"));
         ir.push_str(&format!("  br label %{label}.header\n\n"));
 
@@ -970,7 +996,7 @@ impl LlvmCodeGen {
                 .max(self.max_shift_stride(rhs)?),
             // A fold is precomputed into its own buffer before the sweep, so
             // it contributes no reach to the sweep itself.
-            Expr::Reduce { .. } => 0,
+            Expr::Reduce { .. } | Expr::Scan { .. } => 0,
             Expr::Lift { operand, .. } => self.max_shift_stride(operand)?,
             Expr::Shift { axis, operand, .. } => {
                 let inner = self.max_shift_stride(operand)?;
@@ -999,6 +1025,11 @@ impl LlvmCodeGen {
                 shape.len()
             ),
         })
+    }
+
+    /// The shape of the buffer a fold or scan was precomputed into.
+    fn precomputed_shape(&self, expr: &Expr) -> Vec<usize> {
+        Self::expr_shape(expr, &self.space_shapes).unwrap_or_else(|| vec![self.elements])
     }
 
     /// A shape with the enclosing lifts' unit axes inserted. The lifts arrive
@@ -1088,8 +1119,11 @@ impl LlvmCodeGen {
                 nested.push(*axis);
                 self.needs_broadcast(operand, result_shape, &nested)
             }
-            // A fold is read from its own buffer, which already has the result shape.
-            Expr::Reduce { .. } => false,
+            // A fold or scan is read from its own buffer; whether that buffer
+            // is stretched is decided by the read below, not by its contents.
+            Expr::Reduce { .. } | Expr::Scan { .. } => {
+                Self::lifted_shape(&self.precomputed_shape(expr), lifts) != result_shape
+            }
             Expr::BinaryOp { lhs, rhs, .. } => {
                 self.needs_broadcast(lhs, result_shape, lifts)
                     || self.needs_broadcast(rhs, result_shape, lifts)
@@ -1159,8 +1193,8 @@ impl LlvmCodeGen {
                 self.emit_shift(operand, *dir, *axis, ir, bufs, idx, counter, mode)
             }
 
-            // The fold ran before this sweep started; read its result.
-            Expr::Reduce { .. } => {
+            // The fold or scan ran before this sweep started; read its result.
+            Expr::Reduce { .. } | Expr::Scan { .. } => {
                 let key = expr as *const Expr as usize;
                 let ptr = bufs
                     .folds
@@ -1171,10 +1205,12 @@ impl LlvmCodeGen {
                         detail: "a fold was not precomputed before the sweep that reads it"
                             .to_string(),
                     })?;
+                let view = Self::lifted_shape(&self.precomputed_shape(expr), lifts);
+                let read_at = self.emit_index_map(ir, idx, &view, result_shape, counter)?;
                 let gep = Self::fresh(counter);
                 let val = Self::fresh(counter);
                 ir.push_str(&format!(
-                    "  {gep} = getelementptr inbounds double, ptr {ptr}, i64 {idx}\n"
+                    "  {gep} = getelementptr inbounds double, ptr {ptr}, i64 {read_at}\n"
                 ));
                 ir.push_str(&format!("  {val} = load {ty}, ptr {gep}, align 8\n"));
                 Ok(val)

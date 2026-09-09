@@ -168,7 +168,7 @@ impl Builder<'_> {
             // A fold collapses many cells into one, so a single-cell view of
             // the program cannot expand it. It becomes an opaque value whose
             // range the interval backend still bounds.
-            Expr::Reduce { op, operand, .. } => {
+            Expr::Scan { op, operand, .. } | Expr::Reduce { op, operand, .. } => {
                 let _ = self.build(operand, before, offset);
                 self.folds += 1;
                 Sym::Fold {
@@ -322,6 +322,7 @@ fn collect_divisions(
         }
         Expr::Shift { operand: inner, .. }
         | Expr::Reduce { operand: inner, .. }
+        | Expr::Scan { operand: inner, .. }
         | Expr::Lift { operand: inner, .. }
         | Expr::AuditTrace(inner) => {
             collect_divisions(inner, at, line, builder, out)
@@ -369,6 +370,13 @@ impl fmt::Display for ExprGlyphs<'_> {
                 Some(a) => write!(f, "{op}{a}{}", ExprGlyphs(operand)),
                 None => write!(f, "{op}{}", ExprGlyphs(operand)),
             },
+            Expr::Scan { op, axis, operand } => {
+                let running = format!("{op}").replace('◇', "◈");
+                match axis {
+                    Some(a) => write!(f, "{running}{a}{}", ExprGlyphs(operand)),
+                    None => write!(f, "{running}{}", ExprGlyphs(operand)),
+                }
+            }
             Expr::BinaryOp { op, lhs, rhs } => {
                 write!(f, "({} {} {})", ExprGlyphs(lhs), op, ExprGlyphs(rhs))
             }

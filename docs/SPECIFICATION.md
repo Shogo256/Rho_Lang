@@ -31,6 +31,7 @@ punctuation.
 | `▽` | Negative Shift | Soroban Shift (左) | Reads the following cell along an axis, 0 at the edge | ✅ |
 | `△` | Space Glyph | — | Usable as a space identifier | ✅ |
 | `◇` | Fold | Dasseki (垜積) | Collapses an axis, see §3.5 | ✅ |
+| `◈` | Scan | Dasseki (垜積) | A running fold; keeps the shape, see §3.5 | ✅ |
 | `□` | Lift | Hojin (方陣) | In an expression, inserts a length-1 axis, see §3.6 | ✅ |
 | `+` | Addition | Superposition | Element-wise addition | ✅ |
 | `-` | Subtraction | Difference | Element-wise subtraction | ✅ |
@@ -48,7 +49,8 @@ punctuation.
 | `!` | Constraint | Invariant Check | Statically verified, see §4 | ✅ |
 | `→ =` | Convergence | — | Writes the caller's output buffer | ✅ |
 
-ASCII aliases: `->` or `=>` for `→`, `>>` for `▷`, `<<` for `▽`, `@` for `&`.
+ASCII aliases: `->` or `=>` for `→`, `>>` for `▷`, `<<` for `▽`, `@` for `&`,
+`<>` for `◇`, `<.>` for `◈`, `[]` for `□`.
 
 A shift may name its axis with a digit: `▷0X` shifts along axis 0, `▽1X` along
 axis 1. A bare `▷X` uses the innermost axis that has more than one cell. A fold
@@ -119,7 +121,7 @@ predicate holds and `0.0` elsewhere. The same applies to `<`, `>=`, `<=`, `==`.
 📋 Flows are executed in source order on one thread. Extracting independent flows
 to run in parallel is future work.
 
-### 3.5 Folds (`◇`) ✅
+### 3.5 Folds and scans (`◇`, `◈`) ✅
 
 `◇opX` folds the cells along one axis and removes it, so a flow's target is
 smaller than its source. This is the only construct in the language that changes
@@ -142,9 +144,26 @@ Folds are lowered before the sweep that reads them, into their own buffer. That
 keeps the sweep body straight-line and vectorised, and it means a nested fold's
 result exists before the fold that consumes it.
 
-📋 A fold's own loop is scalar: the accumulator carries a dependency across
-iterations, and splitting it would change the order of the additions and so the
-result. `◇` also does not yet have a scan (running total) counterpart.
+`◈` is the running form of the same operator. Where `◇+` answers "what is the
+total", `◈+` answers "what is the total so far" at every cell, so it keeps the
+shape it walks rather than collapsing it:
+
+```rho
+◇+ INPUT      /* [1,2,3,4] -> [10]           */
+◈+ INPUT      /* [1,2,3,4] -> [1,3,6,10]     */
+◈>1 INPUT     /* a running maximum along each row */
+```
+
+The two compose. A cumulative distribution is the running total over the total,
+and since the fold drops an axis, `□` puts one back to line them up:
+
+```rho
+((◈+ INPUT) / (□0 (◇+ INPUT))) → OUTPUT
+```
+
+📋 Both loops are scalar: the accumulator carries a dependency across
+iterations, and splitting it would reassociate the additions and change the
+result. A parallel scan would need to accept that.
 
 ### 3.6 Lifting and broadcasting (`□`) ✅
 

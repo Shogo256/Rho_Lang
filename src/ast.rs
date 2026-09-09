@@ -127,6 +127,15 @@ pub enum Expr {
         axis: usize,
         operand: Box<Expr>,
     },
+    /// `◈+0X` — a running fold along one axis, keeping the shape.
+    ///
+    /// Where `◇+` answers "what is the total", `◈+` answers "what is the total
+    /// so far" for every cell: `◈+ [1,2,3,4]` is `[1,3,6,10]`.
+    Scan {
+        op: FoldOp,
+        axis: Option<usize>,
+        operand: Box<Expr>,
+    },
     /// `◇+0X` — fold the cells along one axis, collapsing it.
     /// The result has the operand's shape with that axis removed.
     Reduce {

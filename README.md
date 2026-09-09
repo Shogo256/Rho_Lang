@@ -26,6 +26,7 @@ Working prototype. What runs today:
 - Multi-dimensional shifts `▷` / `▽`, per axis, zero-padded at each axis's boundary
 - Folds `◇+` `◇×` `◇>` `◇<` that collapse an axis, so sums, means, dot products
   and norms are one line each
+- Scans `◈+` `◈×` `◈>` `◈<` for running totals, which keep the shape they walk
 - `□` lifting and broadcasting, so an outer product — and a matrix product — is
   one flow
 - Explicit `<4 x double>` vector lowering, verified bit-identical to the scalar path
@@ -234,6 +235,7 @@ smooth input drives it to zero and the kernel returns infinities.
 | LLVM lowering, one sweep per `→` | ✅ implemented |
 | Multi-dimensional indexing and per-axis shifts | ✅ implemented |
 | Folds (`◇`) collapsing an axis | ✅ implemented — scalar inner loop, no scan yet |
+| Scans (`◈`) keeping the shape | ✅ implemented — scalar, no parallel scan |
 | Lifting (`□`) and broadcasting | ✅ implemented — no implicit rank promotion |
 | Explicit `<4 x double>` vector lowering | ✅ implemented — see the note below |
 | Zero-copy binding (`&[0x…]`, `--bind`) | ✅ implemented |

@@ -114,6 +114,7 @@ fn extract_dependencies(expr: &Expr) -> Vec<String> {
         }
         Expr::Shift { operand: inner, .. }
         | Expr::Reduce { operand: inner, .. }
+        | Expr::Scan { operand: inner, .. }
         | Expr::Lift { operand: inner, .. }
         | Expr::AuditTrace(inner) => {
             deps.extend(extract_dependencies(inner));

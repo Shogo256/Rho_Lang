@@ -913,7 +913,9 @@ fn test_zero_copy_binding_writes_the_supplied_address() {
     let block = parse_rho_program(source).unwrap();
 
     let mut grid: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0];
-    let address = grid.as_ptr() as u64;
+    // as_mut_ptr, not as_ptr: the kernel writes through this address, so the
+    // borrow that hands it out has to be the mutable one.
+    let address = grid.as_mut_ptr() as u64;
 
     let mut codegen = LlvmCodeGen::new("zero_copy").bind("INPUT", address);
     let ir = codegen.generate_llvm_ir(&block).unwrap();

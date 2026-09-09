@@ -202,6 +202,75 @@ class RhoEngine:
         fn(ctypes.c_void_p(in_addr), ctypes.c_void_p(out_addr), ctypes.c_int64(count))
         return True
 
+    def spaces(self):
+        """Every space of the kernel as (name, shape, role), in table order.
+
+        The order is the one `execute_spaces()` and the C entrypoint
+        `rho_kernel_exec_spaces` expect. The role says what the caller does
+        with a space: "input" must be supplied, "output" is where the result
+        lands, and "internal" may be left to the kernel.
+        """
+        return [
+            (s["name"], list(s["shape"]), s.get("role"))
+            for s in self.get_metadata().get("spaces", [])
+        ]
+
+    def execute_spaces(self, buffers):
+        """Run the kernel with every space supplied at call time.
+
+        `buffers` maps space names to ctypes arrays, numpy arrays or raw
+        addresses. Every "input" space must be present. Any other space may be
+        omitted, in which case the kernel uses memory of its own for it; an
+        intermediate that is supplied is filled in and left for the caller to
+        read. Nothing is baked into the kernel, so one compiled kernel serves
+        any buffers — this is how a kernel with several inputs, such as a
+        matrix product, is meant to be called.
+        """
+        lib = self._lib_or_load()
+        fn = getattr(lib, "rho_kernel_exec_spaces", None)
+        if fn is None:
+            raise AttributeError(
+                "@rho_kernel_exec_spaces not found; recompile the kernel with the "
+                "current rhoc."
+            )
+
+        spaces = self.get_metadata().get("spaces", [])
+        names = [s["name"] for s in spaces]
+        unknown = sorted(set(buffers) - set(names))
+        if unknown:
+            raise ValueError(f"unknown space(s) {unknown}; this kernel has {names}")
+        missing = [
+            s["name"] for s in spaces
+            if s.get("role") == "input" and buffers.get(s["name"]) is None
+        ]
+        if missing:
+            raise ValueError(
+                f"input space(s) {missing} need a buffer; without one the kernel "
+                f"returns without running"
+            )
+
+        table = (ctypes.c_void_p * len(spaces))()
+        for index, space in enumerate(spaces):
+            buf = buffers.get(space["name"])
+            if buf is None:
+                table[index] = None
+                continue
+            cells = 1
+            for extent in space["shape"]:
+                cells *= extent
+            length = _buffer_length(buf)
+            if length is not None and length < cells:
+                raise ValueError(
+                    f"buffer for {space['name']} holds {length} values but its "
+                    f"shape {space['shape']} needs {cells}"
+                )
+            table[index] = _buffer_address(buf)
+
+        fn.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        fn.restype = None
+        fn(table)
+        return True
+
 
 def compile(func):
     """Decorator that compiles the RHO block in a function's docstring."""

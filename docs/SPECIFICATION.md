@@ -270,6 +270,27 @@ address this process does not own.
 `rho_kernel_exec_with_args` and `rho_kernel_exec_bounded` take caller-supplied
 pointers instead, which suits buffers whose address is not known at compile time.
 
+### 3.4.1 Every space at call time ✅
+
+The two-pointer entrypoints can only name `INPUT` and `OUTPUT`. A kernel that
+reads two spaces — the matrix product above — used to need its other addresses
+baked in with `--bind`, which ties one compiled kernel to one set of buffers.
+
+`void rho_kernel_exec_spaces(void **spaces)` takes one pointer per space
+instead. `spaces[i]` is the *i*-th entry of the `spaces` array in
+`rho_kernel_metadata()`, which lists every space's name, shape and role:
+
+| role | the caller | a null pointer |
+|---|---|---|
+| `input` — no flow writes it | supplies it | returns without touching memory |
+| `output` — where `=` lands | reads the result from it | the kernel keeps the result to itself |
+| `internal` — written by a flow | may supply it to observe the intermediate | the kernel uses scratch of its own |
+
+A null table returns at once. The order is the metadata's, which is fixed by the
+names alone, so the same table serves every rebuild of the same source.
+`RhoEngine.execute_spaces({"A": a, "B": b, "OUTPUT": c})` builds the table from
+a dictionary and checks each buffer's length against its shape first.
+
 ---
 
 ## 4. Compile-Time Checking (`!`) ✅

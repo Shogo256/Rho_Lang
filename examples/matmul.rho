@@ -5,7 +5,13 @@
        shared axis up: a length-1 axis stretches against a longer one, so the
        product below spans [2,3,4]. Folding away axis 1 contracts it to [2,4].
 
-       Bind A, B and OUTPUT to your own buffers and call rho_kernel_exec():
+       Hand the kernel one pointer per space when you call it — the order is
+       the one rho_kernel_metadata() lists, and nothing is baked in:
+
+         engine.execute_spaces({"A": a, "B": b, "OUTPUT": c})   # rho.py
+         rho_kernel_exec_spaces((void *[]){a, b, c});           // C
+
+       Or bind the addresses at compile time and call rho_kernel_exec():
 
          rhoc examples/matmul.rho --bind A=0x... --bind B=0x... --bind OUTPUT=0x...
     */

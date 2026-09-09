@@ -1,7 +1,7 @@
 use crate::ast::*;
 use crate::error::{HarmonyDisruption, Result};
 use crate::numeric::Precision;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::process::Command;
 
@@ -158,6 +158,9 @@ pub struct LlvmCodeGen {
     pub precision: Precision,
     /// Source line of each statement, copied from the block being lowered.
     statement_lines: Vec<usize>,
+    /// Spaces some flow writes. Every other space is read from memory the
+    /// caller owns, which is what decides whether an entrypoint may run.
+    written_spaces: BTreeSet<String>,
     /// What the solver proved, embedded in the artifact so a caller can check
     /// it at load time instead of trusting a line from the build log.
     contract_json: Option<String>,
@@ -179,6 +182,7 @@ impl LlvmCodeGen {
             simd: true,
             precision: Precision::F64,
             statement_lines: Vec::new(),
+            written_spaces: BTreeSet::new(),
             contract_json: None,
             elements: 0,
             current_line: std::cell::Cell::new(0),
@@ -223,6 +227,7 @@ impl LlvmCodeGen {
     /// Generate complete LLVM IR (.ll) from a ToposBlock AST
     pub fn generate_llvm_ir(&mut self, block: &ToposBlock) -> Result<String> {
         self.statement_lines = block.lines.clone();
+        self.written_spaces = Self::written_spaces(block);
         self.collect_shapes(block);
         for (name, addr) in &self.binding_overrides {
             self.ext_bindings.insert(name.clone(), *addr);
@@ -307,7 +312,8 @@ impl LlvmCodeGen {
                 None if self.ext_bindings.contains_key("INPUT") => in_sym.clone(),
                 None => self.emit_scratch(&mut ir, "OUTPUT_local", self.elements, &mut heap),
             };
-            self.emit_body(block, &mut ir, &in_sym, &out_sym, "entry", heap, &elements)?;
+            let provided = Self::in_out(&in_sym, &out_sym);
+            self.emit_body(block, &mut ir, &provided, "entry", heap, &elements)?;
         } else {
             ir.push_str("  ; Not every space this kernel reads has an & binding:\n");
             for name in &unbound {
@@ -332,8 +338,7 @@ impl LlvmCodeGen {
         self.emit_body(
             block,
             &mut ir,
-            "%in_ptr",
-            "%out_effective",
+            &Self::in_out("%in_ptr", "%out_effective"),
             "exec_start",
             Vec::new(),
             &elements,
@@ -365,21 +370,28 @@ impl LlvmCodeGen {
         self.emit_body(
             block,
             &mut ir,
-            "%in_ptr",
-            "%b_out_effective",
+            &Self::in_out("%in_ptr", "%b_out_effective"),
             "bounded_start",
             Vec::new(),
             "%sweep",
         )?;
         ir.push_str("}\n\n");
 
-        // 4. Metadata export: ptr @rho_kernel_metadata()
+        // 4. Every space at call time: void @rho_kernel_exec_spaces(ptr)
+        //
+        // The two-pointer form can only name INPUT and OUTPUT, so a kernel
+        // with two inputs — a matrix product — had to have its addresses
+        // baked in with --bind. Here the caller hands over one pointer per
+        // space, in the order the metadata lists them, and nothing is baked.
+        self.emit_spaces_entrypoint(block, &mut ir, &elements)?;
+
+        // 5. Metadata export: ptr @rho_kernel_metadata()
         ir.push_str("define ptr @rho_kernel_metadata() #0 {\n");
         ir.push_str("entry:\n");
         ir.push_str("  ret ptr @.rho_meta_str\n");
         ir.push_str("}\n\n");
 
-        // 5. Required buffer length: i64 @rho_kernel_element_count()
+        // 6. Required buffer length: i64 @rho_kernel_element_count()
         ir.push_str("define i64 @rho_kernel_element_count() #0 {\n");
         ir.push_str("entry:\n");
         ir.push_str(&format!("  ret i64 {}\n", self.elements));
@@ -411,18 +423,21 @@ impl LlvmCodeGen {
 
         // A flow target inherits the shape of its source rather than a fixed
         // guess, so temporaries are never smaller than the loop that fills them.
+        // `X → =` writes OUTPUT too, and a caller that supplies every buffer
+        // needs to know that space and its shape.
         for stmt in &block.statements {
-            if let Statement::Flow {
-                src,
-                target: FlowTarget::Var(name),
-            } = stmt
-            {
-                if !shapes.contains_key(name) {
-                    let inferred = Self::expr_shape(src, &shapes)
-                        .or_else(|| Self::primary_shape(&shapes))
-                        .unwrap_or_else(|| vec![4]);
-                    shapes.insert(name.clone(), inferred);
-                }
+            let Statement::Flow { src, target } = stmt else {
+                continue;
+            };
+            let name = match target {
+                FlowTarget::Var(name) => name.as_str(),
+                FlowTarget::Equilibrium => "OUTPUT",
+            };
+            if !shapes.contains_key(name) {
+                let inferred = Self::expr_shape(src, &shapes)
+                    .or_else(|| Self::primary_shape(&shapes))
+                    .unwrap_or_else(|| vec![4]);
+                shapes.insert(name.to_string(), inferred);
             }
         }
 
@@ -501,30 +516,36 @@ impl LlvmCodeGen {
         sym
     }
 
+    /// The pointer map an entrypoint with an input and an output starts from.
+    fn in_out(in_sym: &str, out_sym: &str) -> BTreeMap<String, String> {
+        let mut map = BTreeMap::new();
+        map.insert("INPUT".to_string(), in_sym.to_string());
+        map.insert("OUTPUT".to_string(), out_sym.to_string());
+        map
+    }
+
+    /// Resolve every space to a pointer: the ones in `provided` came in from
+    /// the caller, a bound space is read at its address, and the rest are
+    /// scratch the kernel owns for the length of the call.
     fn emit_buffers(
         &self,
         ir: &mut String,
-        in_sym: &str,
-        out_sym: &str,
+        provided: &BTreeMap<String, String>,
         heap: Vec<String>,
         bound: &str,
     ) -> Buffers {
-        let mut map = BTreeMap::new();
+        let mut map = provided.clone();
         let mut heap = heap;
 
-        map.insert("INPUT".to_string(), in_sym.to_string());
-        map.insert("OUTPUT".to_string(), out_sym.to_string());
-
         for (name, shape) in &self.space_shapes {
-            if name == "INPUT" || name == "OUTPUT" {
+            if map.contains_key(name) {
                 continue;
             }
             let sanitized = self.sanitize_ident(name);
 
             // A space bound to an address is the caller's memory, not ours.
-            // Only INPUT and OUTPUT arrive as parameters; every other space
-            // reaches the kernel through its binding, which is what lets a
-            // kernel take more than one input.
+            // An entrypoint that only names INPUT and OUTPUT reaches every
+            // other space through its binding.
             if let Some(addr) = self.ext_bindings.get(name) {
                 let sym = format!("%{sanitized}_ext");
                 ir.push_str(&format!("  ; Zero-copy binding for [{name}] at {addr:#X}\n"));
@@ -547,20 +568,100 @@ impl LlvmCodeGen {
         }
     }
 
+    // ----------------------------------------------------------- entrypoints
+
+    /// `void rho_kernel_exec_spaces(void **spaces)`: one pointer per space, in
+    /// the order `rho_kernel_metadata()` lists them.
+    ///
+    /// A null pointer for a space no flow writes makes the call return without
+    /// touching memory, as a null input does for the two-pointer form. A null
+    /// pointer for a space some flow writes hands that space to the kernel,
+    /// which uses scratch of its own — so a caller passes its inputs and its
+    /// output, and may leave every intermediate to the kernel.
+    fn emit_spaces_entrypoint(
+        &self,
+        block: &ToposBlock,
+        ir: &mut String,
+        bound: &str,
+    ) -> Result<()> {
+        ir.push_str("define void @rho_kernel_exec_spaces(ptr %spaces) #0 {\n");
+        ir.push_str("entry:\n");
+        ir.push_str("  %spaces_null = icmp eq ptr %spaces, null\n");
+        ir.push_str("  br i1 %spaces_null, label %spaces_fail, label %spaces_load\n\n");
+        ir.push_str("spaces_fail:\n");
+        ir.push_str("  ret void\n\n");
+        ir.push_str("spaces_load:\n");
+
+        let mut provided = BTreeMap::new();
+        // Null flags of the spaces the kernel only reads; any one set aborts.
+        let mut required: Vec<String> = Vec::new();
+        // Spaces the kernel writes, which it can also own: (name, arg, flag).
+        let mut optional: Vec<(String, String, String)> = Vec::new();
+
+        for (index, name) in self.space_shapes.keys().enumerate() {
+            let ident = self.sanitize_ident(name);
+            let slot = format!("%{ident}_slot");
+            let arg = format!("%{ident}_arg");
+            let flag = format!("%{ident}_null");
+            ir.push_str(&format!("  ; [{name}] is spaces[{index}]\n"));
+            ir.push_str(&format!(
+                "  {slot} = getelementptr ptr, ptr %spaces, i64 {index}\n"
+            ));
+            ir.push_str(&format!("  {arg} = load ptr, ptr {slot}\n"));
+            ir.push_str(&format!("  {flag} = icmp eq ptr {arg}, null\n"));
+            if self.written_spaces.contains(name) {
+                optional.push((name.clone(), arg.clone(), flag));
+            } else {
+                required.push(flag);
+            }
+            provided.insert(name.clone(), arg);
+        }
+
+        match required.split_first() {
+            None => ir.push_str("  br label %spaces_start\n\n"),
+            Some((first, rest)) => {
+                let mut missing = first.clone();
+                for (k, flag) in rest.iter().enumerate() {
+                    let next = format!("%missing{k}");
+                    ir.push_str(&format!("  {next} = or i1 {missing}, {flag}\n"));
+                    missing = next;
+                }
+                ir.push_str(&format!(
+                    "  br i1 {missing}, label %spaces_fail, label %spaces_start\n\n"
+                ));
+            }
+        }
+
+        ir.push_str("spaces_start:\n");
+        let mut heap = Vec::new();
+        for (name, arg, flag) in optional {
+            let ident = self.sanitize_ident(&name);
+            let count = self.space_shapes[&name].iter().product::<usize>().max(1);
+            let own = self.emit_scratch(ir, &format!("{ident}_own"), count, &mut heap);
+            let effective = format!("%{ident}_eff");
+            ir.push_str(&format!(
+                "  {effective} = select i1 {flag}, ptr {own}, ptr {arg}\n"
+            ));
+            provided.insert(name, effective);
+        }
+
+        self.emit_body(block, ir, &provided, "spaces_start", heap, bound)?;
+        ir.push_str("}\n\n");
+        Ok(())
+    }
+
     // ---------------------------------------------------------------- bodies
 
-    #[allow(clippy::too_many_arguments)]
     fn emit_body(
         &self,
         block: &ToposBlock,
         ir: &mut String,
-        in_sym: &str,
-        out_sym: &str,
+        provided: &BTreeMap<String, String>,
         entry_label: &str,
         heap: Vec<String>,
         bound: &str,
     ) -> Result<()> {
-        let mut bufs = self.emit_buffers(ir, in_sym, out_sym, heap, bound);
+        let mut bufs = self.emit_buffers(ir, provided, heap, bound);
         let mut counter = 0usize;
         self.emit_flows(&block.statements, ir, &mut bufs, entry_label, &mut counter)?;
         for ptr in &bufs.heap {
@@ -949,9 +1050,9 @@ impl LlvmCodeGen {
         Ok(end)
     }
 
-    /// Declared spaces that no flow ever writes: the kernel's inputs.
-    fn source_spaces(&self, block: &ToposBlock) -> Vec<String> {
-        let written: Vec<String> = block
+    /// The spaces some flow writes. `X → =` writes OUTPUT.
+    fn written_spaces(block: &ToposBlock) -> BTreeSet<String> {
+        block
             .statements
             .iter()
             .filter_map(|stmt| match stmt {
@@ -965,7 +1066,11 @@ impl LlvmCodeGen {
                 } => Some("OUTPUT".to_string()),
                 _ => None,
             })
-            .collect();
+            .collect()
+    }
+
+    /// The declared spaces no flow writes: what a caller has to supply.
+    fn source_spaces(&self, block: &ToposBlock) -> Vec<String> {
         block
             .statements
             .iter()
@@ -974,8 +1079,20 @@ impl LlvmCodeGen {
                 Statement::ExtBind(b) => Some(b.space.name.clone()),
                 _ => None,
             })
-            .filter(|name| !written.contains(name))
+            .filter(|name| !self.written_spaces.contains(name))
             .collect()
+    }
+
+    /// What a caller does with a space: supply it, read the result from it,
+    /// or leave it to the kernel.
+    fn role_of(&self, name: &str) -> &'static str {
+        if name == "OUTPUT" {
+            "output"
+        } else if self.written_spaces.contains(name) {
+            "internal"
+        } else {
+            "input"
+        }
     }
 
     /// The shape this flow writes into.
@@ -1693,7 +1810,12 @@ impl LlvmCodeGen {
         let spaces: Vec<String> = self
             .space_shapes
             .iter()
-            .map(|(name, shape)| format!("{{\"name\":\"{name}\",\"shape\":{shape:?}}}"))
+            .map(|(name, shape)| {
+                format!(
+                    "{{\"name\":\"{name}\",\"shape\":{shape:?},\"role\":\"{}\"}}",
+                    self.role_of(name)
+                )
+            })
             .collect();
         let bindings: Vec<String> = self
             .ext_bindings

@@ -2150,3 +2150,303 @@ fn test_a_proof_carries_the_width_it_was_made_at() {
     );
     assert!(narrow.to_json().contains("\"precision\":\"f32\""));
 }
+
+// --------------------------------------------------------------------------
+// Every space at call time. `rho_kernel_exec_spaces` takes one pointer per
+// space in metadata order, so a kernel with two inputs runs without any
+// address baked in at compile time.
+// --------------------------------------------------------------------------
+
+/// The spaces a kernel lists in its metadata, in table order: (name, cells, role).
+fn kernel_spaces(lib: &libloading::Library) -> Vec<(String, usize, String)> {
+    let meta: libloading::Symbol<unsafe extern "C" fn() -> *const std::os::raw::c_char> =
+        unsafe { lib.get(b"rho_kernel_metadata").unwrap() };
+    let json = unsafe { std::ffi::CStr::from_ptr(meta()) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    let spaces = json
+        .split("\"spaces\":[")
+        .nth(1)
+        .and_then(|s| s.split("],\"bindings\"").next())
+        .unwrap_or_else(|| panic!("no spaces array in {json}"));
+    spaces
+        .split("{\"name\":\"")
+        .skip(1)
+        .map(|entry| {
+            let name = entry.split('"').next().unwrap().to_string();
+            let shape = entry.split("\"shape\":[").nth(1).unwrap().split(']').next().unwrap();
+            let cells: usize = shape
+                .split(',')
+                .map(|d| d.trim().parse::<usize>().unwrap())
+                .product();
+            let role = entry.split("\"role\":\"").nth(1).unwrap().split('"').next().unwrap();
+            (name, cells, role.to_string())
+        })
+        .collect()
+}
+
+/// Compile `source` and run it through `rho_kernel_exec_spaces` with the
+/// buffers named in `supplied`; every other space is left to the kernel.
+/// Returns each supplied buffer after the call.
+fn run_spaces(
+    name: &str,
+    source: &str,
+    supplied: &[(&str, Vec<f64>)],
+) -> std::collections::BTreeMap<String, Vec<f64>> {
+    let block = parse_rho_program(source).unwrap();
+    let mut codegen = LlvmCodeGen::new(name);
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    let so_path = format!("target/{name}.so");
+    assert!(codegen.compile_to_so(&ir, &so_path).is_ok(), "{name} should link:\n{ir}");
+
+    let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
+    let spaces = kernel_spaces(&lib);
+    let mut buffers: std::collections::BTreeMap<String, Vec<f64>> = supplied
+        .iter()
+        .map(|(n, data)| (n.to_string(), data.clone()))
+        .collect();
+    for supplied_name in buffers.keys() {
+        assert!(
+            spaces.iter().any(|(n, _, _)| n == supplied_name),
+            "{supplied_name} is not a space of this kernel: {spaces:?}"
+        );
+    }
+    let table: Vec<*mut f64> = spaces
+        .iter()
+        .map(|(n, _, _)| {
+            buffers
+                .get_mut(n)
+                .map(|b| b.as_mut_ptr())
+                .unwrap_or(std::ptr::null_mut())
+        })
+        .collect();
+
+    let func: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> =
+        unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+    unsafe { func(table.as_ptr()) };
+    buffers
+}
+
+const MATMUL_2_3_4: &str = r#"{
+    A:◯ □ 2 3 1
+    B:◯ □ 1 3 4
+    ◇+1 (A × B) → OUTPUT
+    OUTPUT → =
+}"#;
+
+const GRADIENT_4_4: &str = r#"{
+    INPUT:◯ □ 4 4
+    (▷INPUT - INPUT) → GX
+    (▽0INPUT - INPUT) → GY
+    ((GX × GX) + (GY × GY)) → OUTPUT
+    OUTPUT → =
+}"#;
+
+#[test]
+fn test_exec_spaces_runs_a_matrix_product_without_bindings() {
+    let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b = vec![1.0, 0.0, 2.0, 1.0, 0.0, 1.0, 1.0, 2.0, 3.0, 1.0, 0.0, 1.0];
+    let out = run_spaces(
+        "spaces_matmul",
+        MATMUL_2_3_4,
+        &[("A", a), ("B", b), ("OUTPUT", vec![0.0; 8])],
+    );
+    assert_eq!(out["OUTPUT"], vec![10.0, 5.0, 4.0, 8.0, 22.0, 11.0, 13.0, 20.0]);
+}
+
+#[test]
+fn test_metadata_lists_every_space_with_its_role_in_table_order() {
+    let block = parse_rho_program(GRADIENT_4_4).unwrap();
+    let mut codegen = LlvmCodeGen::new("spaces_roles");
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    let so_path = "target/spaces_roles.so";
+    assert!(codegen.compile_to_so(&ir, so_path).is_ok());
+    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
+
+    // The order is the table order, and the role says what a caller does
+    // with each entry: supply it, read it back, or leave it to the kernel.
+    let spaces = kernel_spaces(&lib);
+    let expected: Vec<(String, usize, String)> = [
+        ("GX", 16, "internal"),
+        ("GY", 16, "internal"),
+        ("INPUT", 16, "input"),
+        ("OUTPUT", 16, "output"),
+    ]
+    .iter()
+    .map(|(n, c, r)| (n.to_string(), *c, r.to_string()))
+    .collect();
+    assert_eq!(spaces, expected);
+
+    // The IR says the same thing next to each load.
+    assert!(ir.contains("; [GX] is spaces[0]"), "{ir}");
+    assert!(ir.contains("; [OUTPUT] is spaces[3]"), "{ir}");
+}
+
+#[test]
+fn test_exec_spaces_leaves_an_unsupplied_intermediate_to_the_kernel() {
+    let input: Vec<f64> = (0..16).map(|i| (i as f64 * 0.7).sin() * 3.0).collect();
+
+    // What the two-pointer entrypoint computes.
+    let block = parse_rho_program(GRADIENT_4_4).unwrap();
+    let mut codegen = LlvmCodeGen::new("spaces_gradient_ref");
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    let so_path = "target/spaces_gradient_ref.so";
+    assert!(codegen.compile_to_so(&ir, so_path).is_ok());
+    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
+    let with_args: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
+        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let mut reference = vec![0.0f64; 16];
+    unsafe { with_args(input.as_ptr(), reference.as_mut_ptr()) };
+
+    // GX and GY are not supplied: the kernel owns them for the call.
+    let out = run_spaces(
+        "spaces_gradient",
+        GRADIENT_4_4,
+        &[("INPUT", input.clone()), ("OUTPUT", vec![0.0; 16])],
+    );
+    assert_eq!(out["OUTPUT"], reference);
+
+    // Supplied, an intermediate becomes visible to the caller.
+    let out = run_spaces(
+        "spaces_gradient_gx",
+        GRADIENT_4_4,
+        &[
+            ("INPUT", input.clone()),
+            ("GX", vec![0.0; 16]),
+            ("OUTPUT", vec![0.0; 16]),
+        ],
+    );
+    assert_eq!(out["OUTPUT"], reference);
+    // ▷ reads the preceding cell along the axis, zero past the boundary.
+    let gx: Vec<f64> = (0..16)
+        .map(|i| {
+            let previous = if i % 4 == 0 { 0.0 } else { input[i - 1] };
+            previous - input[i]
+        })
+        .collect();
+    assert_eq!(out["GX"], gx);
+}
+
+#[test]
+fn test_exec_spaces_returns_without_writing_when_an_input_is_null() {
+    let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let sentinel = vec![-1.0; 8];
+
+    // B is missing, so the kernel must not run at all.
+    let out = run_spaces(
+        "spaces_missing_input",
+        MATMUL_2_3_4,
+        &[("A", a), ("OUTPUT", sentinel.clone())],
+    );
+    assert_eq!(out["OUTPUT"], sentinel);
+
+    // A null table is refused the same way.
+    let lib = unsafe { libloading::Library::new("target/spaces_missing_input.so").unwrap() };
+    let func: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> =
+        unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+    unsafe { func(std::ptr::null()) };
+}
+
+#[test]
+fn test_exec_spaces_and_exec_with_args_agree_bit_for_bit() {
+    // A shift, a fold and a scan, so the head, the vector body, the tail and
+    // the prepasses all run through the new entrypoint's buffers.
+    let source = r#"{
+        INPUT:◯ □ 3 4
+        (▷INPUT - INPUT) → D
+        (◈+ D) → S
+        ((S × S) + (□1 (◇+1 INPUT))) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let input: Vec<f64> = (0..12).map(|i| (i as f64 * 1.3).cos() * 5.0).collect();
+
+    let mut codegen = LlvmCodeGen::new("spaces_agree");
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    let so_path = "target/spaces_agree.so";
+    assert!(codegen.compile_to_so(&ir, so_path).is_ok(), "{ir}");
+    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
+
+    let with_args: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
+        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let mut expected = vec![0.0f64; 12];
+    unsafe { with_args(input.as_ptr(), expected.as_mut_ptr()) };
+
+    let spaces = kernel_spaces(&lib);
+    assert_eq!(
+        spaces.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>(),
+        vec!["D", "INPUT", "OUTPUT", "S"]
+    );
+    let mut input_copy = input.clone();
+    let mut actual = vec![0.0f64; 12];
+    let table: Vec<*mut f64> = vec![
+        std::ptr::null_mut(),
+        input_copy.as_mut_ptr(),
+        actual.as_mut_ptr(),
+        std::ptr::null_mut(),
+    ];
+    let exec_spaces: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> =
+        unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+    unsafe { exec_spaces(table.as_ptr()) };
+
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&actual), bits(&expected));
+
+    // The same holds at single precision: the table is of float buffers then.
+    let mut codegen = LlvmCodeGen::new("spaces_agree_f32")
+        .with_precision(rho_lang::numeric::Precision::F32);
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    let so_path = "target/spaces_agree_f32.so";
+    assert!(codegen.compile_to_so(&ir, so_path).is_ok(), "{ir}");
+    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
+
+    let narrow: Vec<f32> = input.iter().map(|x| *x as f32).collect();
+    let with_args: libloading::Symbol<unsafe extern "C" fn(*const f32, *mut f32)> =
+        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let mut expected = vec![0.0f32; 12];
+    unsafe { with_args(narrow.as_ptr(), expected.as_mut_ptr()) };
+
+    let mut narrow_copy = narrow.clone();
+    let mut actual = vec![0.0f32; 12];
+    let table: Vec<*mut f32> = vec![
+        std::ptr::null_mut(),
+        narrow_copy.as_mut_ptr(),
+        actual.as_mut_ptr(),
+        std::ptr::null_mut(),
+    ];
+    let exec_spaces: libloading::Symbol<unsafe extern "C" fn(*const *mut f32)> =
+        unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+    unsafe { exec_spaces(table.as_ptr()) };
+    let bits32 = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits32(&actual), bits32(&expected));
+}
+
+#[test]
+fn test_equilibrium_target_declares_output_in_the_metadata() {
+    // `X → =` writes OUTPUT without ever naming it, and a caller that supplies
+    // every buffer has to be told that space exists and how large it is.
+    let source = r#"{
+        INPUT:◯ □ 2 3
+        ◇+1 INPUT → =
+    }"#;
+    let out = run_spaces(
+        "spaces_equilibrium",
+        source,
+        &[
+            ("INPUT", vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            ("OUTPUT", vec![0.0; 2]),
+        ],
+    );
+    assert_eq!(out["OUTPUT"], vec![6.0, 15.0]);
+
+    let lib = unsafe { libloading::Library::new("target/spaces_equilibrium.so").unwrap() };
+    let spaces = kernel_spaces(&lib);
+    assert_eq!(
+        spaces,
+        vec![
+            ("INPUT".to_string(), 6, "input".to_string()),
+            ("OUTPUT".to_string(), 2, "output".to_string()),
+        ]
+    );
+}

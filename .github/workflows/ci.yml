@@ -81,3 +81,4 @@ jobs:
         python3 examples/run_matrix_add.py
         python3 examples/test_inline_decorator.py
         python3 examples/python_demo.py
+        python3 examples/run_matmul.py

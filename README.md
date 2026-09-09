@@ -198,7 +198,7 @@ smooth input drives it to zero and the kernel returns infinities.
 | Tiling and cache blocking | 📋 planned — a sweep is one linear pass |
 | Parallel execution of independent flows | 📋 planned — flows run in source order on one thread |
 
-Two honest caveats on the ✅ rows:
+Three honest caveats on the ✅ rows:
 
 - **Vector lowering is correct, not dramatically faster.** `clang -O3` vectorises
   no loops on the scalar IR by itself — the boundary select defeats it — and the

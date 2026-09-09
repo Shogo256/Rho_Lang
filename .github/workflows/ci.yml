@@ -44,6 +44,15 @@ jobs:
     - name: Check SIMD Matches The Scalar Reference
       run: cargo test --release vector_and_scalar
 
+    - name: Fuzz The Constraint Solver Against Real Runs
+      run: |
+        cargo build --release
+        cp target/release/rhoc rhoc-interval
+        cargo build --release --features z3-solver
+        cp target/release/rhoc rhoc-z3
+        RHOC_INTERVAL=./rhoc-interval RHOC_Z3=./rhoc-z3 \
+          python3 scripts/fuzz_solver.py 42 150
+
     - name: Run Sample Compilation (`teichmuller.rho`)
       run: cargo run --bin rhoc -- examples/teichmuller.rho --dump-dag --dump-llvm
 

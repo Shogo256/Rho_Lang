@@ -7,7 +7,7 @@
 //! proof stays sound; a counterexample found under an approximation is reported
 //! as unproven rather than as a violation.
 
-use super::{Finding, Report, Verdict};
+use super::{Contract, Finding, Interval, Report, Verdict, CONTRACT_ASSUMPTIONS};
 use crate::symbolic::{Cmp, Expansion, Sym};
 use std::collections::BTreeMap;
 use z3::ast::{Ast, Bool, Int, Real};
@@ -30,15 +30,17 @@ pub fn analyze(expansion: &Expansion) -> Report {
         .map(|o| Finding {
             subject: o.source.clone(),
             verdict: check_obligation(&ctx, o.cmp, &o.lhs, &o.rhs),
+            line: o.line,
         })
         .collect();
 
     let divisions = expansion
         .divisions
         .iter()
-        .map(|(text, denom)| Finding {
+        .map(|(text, denom, line)| Finding {
             subject: text.clone(),
             verdict: check_denominator(&ctx, denom),
+            line: *line,
         })
         .collect();
 
@@ -46,6 +48,15 @@ pub fn analyze(expansion: &Expansion) -> Report {
         backend: "z3",
         constraints,
         divisions,
+        // Filled in by ConstraintSolver::analyze once the findings are known.
+        contract: Contract {
+            backend: "z3",
+            output_range: Interval::UNBOUNDED,
+            divisions_proven_safe: false,
+            output_proven_finite: false,
+            open_obligations: 0,
+            assumes: CONTRACT_ASSUMPTIONS,
+        },
     }
 }
 

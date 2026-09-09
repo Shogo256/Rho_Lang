@@ -135,8 +135,16 @@ pub struct LlvmCodeGen {
     pub binding_overrides: BTreeMap<String, u64>,
     /// Emit vector loops for the constant-length entrypoints.
     pub simd: bool,
+    /// Source line of each statement, copied from the block being lowered.
+    statement_lines: Vec<usize>,
+    /// What the solver proved, embedded in the artifact so a caller can check
+    /// it at load time instead of trusting a line from the build log.
+    contract_json: Option<String>,
     /// Number of cells swept by every flow loop.
     elements: usize,
+    /// Source line of the flow being lowered, so a lowering failure can point
+    /// at the statement the reader wrote.
+    current_line: std::cell::Cell<usize>,
 }
 
 impl LlvmCodeGen {
@@ -148,13 +156,22 @@ impl LlvmCodeGen {
             tau: 0.0,
             binding_overrides: BTreeMap::new(),
             simd: true,
+            statement_lines: Vec::new(),
+            contract_json: None,
             elements: 0,
+            current_line: std::cell::Cell::new(0),
         }
     }
 
     /// Bind the threshold symbol 𝜏 to a concrete value (default 0.0).
     pub fn with_tau(mut self, tau: f64) -> Self {
         self.tau = tau;
+        self
+    }
+
+    /// Record what the solver proved, so it ships with the kernel.
+    pub fn with_contract(mut self, contract_json: String) -> Self {
+        self.contract_json = Some(contract_json);
         self
     }
 
@@ -177,6 +194,7 @@ impl LlvmCodeGen {
 
     /// Generate complete LLVM IR (.ll) from a ToposBlock AST
     pub fn generate_llvm_ir(&mut self, block: &ToposBlock) -> Result<String> {
+        self.statement_lines = block.lines.clone();
         self.collect_shapes(block);
         for (name, addr) in &self.binding_overrides {
             self.ext_bindings.insert(name.clone(), *addr);
@@ -483,10 +501,11 @@ impl LlvmCodeGen {
         let mut pred = entry_label.to_string();
         let mut loop_id = 0usize;
 
-        for stmt in statements {
+        for (index, stmt) in statements.iter().enumerate() {
             let Statement::Flow { src, target } = stmt else {
                 continue;
             };
+            self.current_line.set(self.statement_lines.get(index).copied().unwrap_or(0));
 
             let target_ptr = match target {
                 FlowTarget::Var(name) => self.lookup(bufs, name)?,
@@ -669,7 +688,7 @@ impl LlvmCodeGen {
                     return Ok(inner);
                 };
                 let shape = self.shape_for(&name);
-                let (stride, extent) = Self::axis_geometry(&shape, *axis)?;
+                let (stride, extent) = self.axis_geometry(&shape, *axis)?;
                 if extent <= 1 {
                     inner
                 } else {
@@ -679,8 +698,10 @@ impl LlvmCodeGen {
         })
     }
 
-    fn axis_geometry(shape: &[usize], axis: Option<usize>) -> Result<(usize, usize)> {
+    fn axis_geometry(&self, shape: &[usize], axis: Option<usize>) -> Result<(usize, usize)> {
+        let line = self.current_line.get();
         crate::ast::axis_geometry(shape, axis).ok_or_else(|| HarmonyDisruption::LoweringErr {
+            line,
             detail: format!(
                 "axis {} is out of range for a rank-{} space (shape {shape:?})",
                 axis.map(|a| a.to_string())
@@ -807,13 +828,14 @@ impl LlvmCodeGen {
         mode: Mode,
     ) -> Result<String> {
         let name = Self::place_name(operand).ok_or_else(|| HarmonyDisruption::LoweringErr {
+            line: self.current_line.get(),
             detail: format!(
                 "{dir} is a neighbourhood shift over a declared space, so it cannot be applied to a computed value. Flow the sub-expression into its own space first."
             ),
         })?;
         let ptr = self.lookup(bufs, &name)?;
         let shape = self.shape_for(&name);
-        let (stride, extent) = Self::axis_geometry(&shape, axis)?;
+        let (stride, extent) = self.axis_geometry(&shape, axis)?;
 
         let axis_label = match axis {
             Some(a) => format!("axis {a}"),
@@ -966,6 +988,7 @@ impl LlvmCodeGen {
             .cloned()
             .ok_or_else(|| HarmonyDisruption::SpaceErr {
                 space_name: name.to_string(),
+                line: self.current_line.get(),
             })
     }
 
@@ -996,11 +1019,16 @@ impl LlvmCodeGen {
             .iter()
             .map(|(name, addr)| format!("{{\"name\":\"{name}\",\"address\":{addr}}}"))
             .collect();
+        let contract = match &self.contract_json {
+            Some(json) => format!(",\"contract\":{json}"),
+            None => String::new(),
+        };
         format!(
-            "{{\"elements\":{},\"spaces\":[{}],\"bindings\":[{}]}}",
+            "{{\"elements\":{},\"spaces\":[{}],\"bindings\":[{}]{}}}",
             self.elements,
             spaces.join(","),
-            bindings.join(",")
+            bindings.join(","),
+            contract
         )
     }
 

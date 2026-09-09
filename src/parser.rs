@@ -70,27 +70,23 @@ pub fn parse_rho_program(input: &str) -> Result<ToposBlock> {
     check_forbidden_keywords(&normalized_input)?;
 
     let mut statements = Vec::new();
+    let mut lines = Vec::new();
     let clean_code = remove_comments(&normalized_input);
 
-    let trimmed = clean_code.trim();
-    let content = if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        trimmed
-    };
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+    for (index, raw) in clean_code.lines().enumerate() {
+        // The topos braces may share a line with a statement.
+        let text = raw.trim().trim_start_matches('{').trim_end_matches('}').trim();
+        if text.is_empty() {
             continue;
         }
 
-        if let Some(stmt) = parse_line(line)? {
+        if let Some(stmt) = parse_line(text)? {
             statements.push(stmt);
+            lines.push(index + 1);
         }
     }
 
-    let block = ToposBlock { statements };
+    let block = ToposBlock { statements, lines };
     validate_space_declarations(&block)?;
     validate_dimension_shapes(&block)?;
     validate_flow_equilibrium(&block)?;
@@ -108,6 +104,9 @@ fn remove_comments(input: &str) -> String {
             if c == '*' && chars.peek() == Some(&'/') {
                 chars.next();
                 in_block_comment = false;
+            } else if c == '\n' {
+                // Keep the line structure intact for diagnostics.
+                result.push(c);
             }
             continue;
         }
@@ -362,16 +361,17 @@ pub fn validate_space_declarations(block: &ToposBlock) -> Result<()> {
         }
     }
 
-    for stmt in &block.statements {
+    for (index, stmt) in block.statements.iter().enumerate() {
+        let line = block.line_of(index);
         match stmt {
             Statement::Flow { src, target } => {
-                check_expr_spaces(src, &declared_spaces)?;
+                check_expr_spaces(src, &declared_spaces, line)?;
                 if let FlowTarget::Var(var_name) = target {
                     declared_spaces.insert(var_name.clone());
                 }
             }
             Statement::Constraint(expr) | Statement::AuditTrace(expr) => {
-                check_expr_spaces(expr, &declared_spaces)?;
+                check_expr_spaces(expr, &declared_spaces, line)?;
             }
             _ => {}
         }
@@ -380,21 +380,22 @@ pub fn validate_space_declarations(block: &ToposBlock) -> Result<()> {
     Ok(())
 }
 
-fn check_expr_spaces(expr: &Expr, declared: &HashSet<String>) -> Result<()> {
+fn check_expr_spaces(expr: &Expr, declared: &HashSet<String>, line: usize) -> Result<()> {
     match expr {
         Expr::Var(name) => {
             if name != "𝜏" && name != "τ" && !declared.contains(name) {
                 return Err(HarmonyDisruption::SpaceErr {
                     space_name: name.clone(),
+                    line,
                 });
             }
         }
         Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
-            check_expr_spaces(inner, declared)?;
+            check_expr_spaces(inner, declared, line)?;
         }
         Expr::BinaryOp { lhs, rhs, .. } => {
-            check_expr_spaces(lhs, declared)?;
-            check_expr_spaces(rhs, declared)?;
+            check_expr_spaces(lhs, declared, line)?;
+            check_expr_spaces(rhs, declared, line)?;
         }
         Expr::Number(_) => {}
     }
@@ -461,7 +462,7 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
     }
 
     // 2. Validate shapes across flows
-    for stmt in &block.statements {
+    for (index, stmt) in block.statements.iter().enumerate() {
         if let Statement::Flow { src, target } = stmt {
             let src_shape = get_expr_shape(src, &space_shapes);
             match target {
@@ -474,6 +475,7 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
                                     shape_a: s_shape.clone(),
                                     space_b: var_name.clone(),
                                     shape_b: target_shape,
+                                    line: block.line_of(index),
                                 });
                             }
                         }

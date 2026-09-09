@@ -199,3 +199,35 @@ Still outside the model, and so still assumptions on any proof:
 - NaN inputs and NaN propagation
 - the order in which `clang` contracts operations (e.g. into an FMA)
 
+
+---
+
+## 5. The Kernel's Contract ✅
+
+A proof that only appears in a build log cannot be relied on by whoever loads the
+kernel. Everything the solver establishes is therefore compiled into the artifact
+and returned by `rho_kernel_metadata()`:
+
+```json
+"contract": {
+  "backend": "z3",
+  "output_range": [0, null],
+  "divisions_proven_safe": true,
+  "output_proven_finite": false,
+  "open_obligations": 0,
+  "assumes": ["no overflow to infinity", "no underflow to subnormals",
+              "no NaN input", "no operation contraction, e.g. into an FMA"]
+}
+```
+
+`output_range` bounds every cell the kernel writes; a `null` end means that side
+is not bounded. It is always computed by interval arithmetic, which is cheap and
+sound — asking an SMT solver for a range needs an optimiser rather than a
+decision procedure.
+
+`assumes` is not decoration. It states what the claims rest on, so a reader can
+tell a proof from a proof-under-conditions.
+
+`rhoc --require-contract` refuses to emit a kernel with an incomplete contract,
+and `RhoEngine.require_contract()` refuses to load one. Together they let a
+system draw a line that unproven kernels cannot cross.

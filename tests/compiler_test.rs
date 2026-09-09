@@ -47,8 +47,9 @@ fn test_space_disruption_err() {
     let res = parse_rho_program(source);
     assert!(res.is_err());
     match res.err().unwrap() {
-        HarmonyDisruption::SpaceErr { space_name } => {
+        HarmonyDisruption::SpaceErr { space_name, line } => {
             assert_eq!(space_name, "UNDECLARED_SPACE");
+            assert_eq!(line, 2, "the diagnostic should point at the offending flow");
         }
         err => panic!("Unexpected error: {:?}", err),
     }
@@ -994,4 +995,156 @@ fn test_tau_binds_the_threshold_symbol() {
         unsafe { func(input.as_ptr(), out.as_mut_ptr()) };
         assert_eq!(out, expected, "tau = {tau}");
     }
+}
+
+// --------------------------------------------------------------------------
+// Diagnostics. An error that cannot say where it happened is hard to act on.
+// --------------------------------------------------------------------------
+
+#[test]
+fn test_diagnostics_point_at_the_offending_line() {
+    // The block comment spans two lines: line numbering has to survive it.
+    let source = "{\n    INPUT:◯ □ 4 1\n\n    /* a comment\n       over two lines */\n    (INPUT + 1.0) → A\n    (UNDECLARD + A) → OUTPUT\n    OUTPUT → =\n}";
+    let err = parse_rho_program(source).unwrap_err();
+    assert_eq!(err.line(), Some(7), "got {err:?}");
+
+    let rendered = err.render(source);
+    assert!(rendered.contains("7 |     (UNDECLARD + A) → OUTPUT"), "{rendered}");
+    assert!(rendered.contains('^'), "{rendered}");
+}
+
+#[test]
+fn test_shape_mismatch_names_its_line() {
+    let source = "{\n    INPUT:◯ □ 2 2\n    TEMP:◯ □ 3 3\n    INPUT → TEMP\n    TEMP → =\n}";
+    let err = parse_rho_program(source).unwrap_err();
+    assert!(matches!(err, HarmonyDisruption::DimensionErr { .. }), "{err:?}");
+    assert_eq!(err.line(), Some(4));
+}
+
+#[test]
+fn test_lowering_failure_names_its_line() {
+    let source = "{\n    INPUT:◯ □ 8 1\n    (INPUT + 1.0) → A\n    (▷(A + INPUT)) → OUTPUT\n    OUTPUT → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let err = LlvmCodeGen::new("span_lowering")
+        .generate_llvm_ir(&block)
+        .unwrap_err();
+    assert!(matches!(err, HarmonyDisruption::LoweringErr { .. }), "{err:?}");
+    assert_eq!(err.line(), Some(4));
+}
+
+#[test]
+fn test_constraint_failure_names_its_line() {
+    let source = "{\n    INPUT:◯ □ 4 1\n    ((INPUT ^ 2) + 1.0) → OUTPUT\n    ! (OUTPUT < 0)\n    OUTPUT → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let err = ConstraintSolver::verify(&block, 0.0).unwrap_err();
+    assert!(matches!(err, HarmonyDisruption::LogicErr { .. }), "{err:?}");
+    assert_eq!(err.line(), Some(4));
+}
+
+#[test]
+fn test_statements_record_their_source_line() {
+    let source = "{\n    INPUT:◯ □ 4 1\n\n    (INPUT + 1.0) → OUTPUT\n\n    OUTPUT → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    assert_eq!(block.lines, vec![2, 4, 6]);
+}
+
+// --------------------------------------------------------------------------
+// Contracts. What the solver proves has to reach whoever loads the kernel,
+// not just whoever watched the build.
+// --------------------------------------------------------------------------
+
+#[test]
+fn test_contract_states_the_output_range() {
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        (INPUT ^ 2) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let contract = ConstraintSolver::analyze(&block, 0.0).contract;
+
+    assert_eq!(contract.output_range.lo, 0.0, "a square is never negative");
+    assert!(contract.output_range.hi.is_infinite());
+    assert!(!contract.output_proven_finite);
+    assert!(contract.divisions_proven_safe, "there are no divisions to fail");
+}
+
+#[test]
+fn test_contract_flags_a_division_that_can_vanish() {
+    let source = r#"{
+        INPUT:◯ □ 8 1
+        (▷INPUT - INPUT) → D
+        (INPUT / D) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let contract = ConstraintSolver::analyze(&block, 0.0).contract;
+
+    assert!(!contract.divisions_proven_safe);
+    assert!(!contract.is_complete());
+    assert!(contract.open_obligations >= 1);
+}
+
+#[test]
+fn test_contract_is_complete_when_everything_is_proved() {
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        (INPUT ^ 2) → SQ
+        (SQ / ((INPUT ^ 2) + 1.0)) → OUTPUT
+        ! (OUTPUT >= 0)
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let contract = ConstraintSolver::analyze(&block, 0.0).contract;
+
+    assert!(contract.divisions_proven_safe, "x^2 + 1 is never zero");
+    assert_eq!(contract.open_obligations, 0);
+    assert!(contract.is_complete());
+    assert_eq!(contract.output_range.lo, 0.0);
+}
+
+#[test]
+fn test_contract_travels_inside_the_shared_library() {
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        (INPUT ^ 2) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let contract = ConstraintSolver::analyze(&block, 0.0).contract;
+
+    let mut codegen = LlvmCodeGen::new("contract_abi").with_contract(contract.to_json());
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    let so_path = "target/contract_abi.so";
+    assert!(codegen.compile_to_so(&ir, so_path).is_ok());
+
+    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
+    let meta: libloading::Symbol<unsafe extern "C" fn() -> *const std::os::raw::c_char> =
+        unsafe { lib.get(b"rho_kernel_metadata").unwrap() };
+    let json = unsafe { std::ffi::CStr::from_ptr(meta()) }
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // A caller can read the guarantee without having watched the build.
+    assert!(json.contains("\"contract\""), "{json}");
+    assert!(json.contains("\"divisions_proven_safe\":true"), "{json}");
+    assert!(json.contains("\"output_range\":[0,null]"), "{json}");
+    assert!(json.contains("no NaN input"), "assumptions must ship too: {json}");
+}
+
+#[test]
+fn test_division_by_a_square_plus_one_is_proved_safe() {
+    // inf / inf is NaN, so endpoint arithmetic alone gave up here and reported
+    // an unbounded range. The sign of the quotient is still known.
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        ((INPUT ^ 2) / ((INPUT ^ 2) + 1.0)) → OUTPUT
+        ! (OUTPUT >= 0)
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let report = ConstraintSolver::analyze(&block, 0.0);
+    assert_eq!(report.constraints[0].verdict, Verdict::Proved);
+    assert_eq!(report.contract.output_range.lo, 0.0);
 }

@@ -80,12 +80,16 @@ pub struct Obligation {
     pub cmp: Cmp,
     pub lhs: Sym,
     pub rhs: Sym,
+    pub line: usize,
 }
 
 pub struct Expansion {
     pub obligations: Vec<Obligation>,
-    /// Every division that appears in a lowered flow, with its denominator.
-    pub divisions: Vec<(String, Sym)>,
+    /// Every division that appears in a lowered flow: text, denominator, line.
+    pub divisions: Vec<(String, Sym, usize)>,
+    /// The value written at the equilibrium point, expanded through every flow
+    /// that produced it. This is what a caller of the kernel actually receives.
+    pub output: Option<Sym>,
 }
 
 struct Builder<'a> {
@@ -206,8 +210,9 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
 
     // Flow definitions in order, and where each constraint sits among them.
     let mut defs: Vec<(String, Expr)> = Vec::new();
-    let mut constraints: Vec<(usize, Expr)> = Vec::new();
-    for stmt in &block.statements {
+    let mut def_lines: Vec<usize> = Vec::new();
+    let mut constraints: Vec<(usize, Expr, usize)> = Vec::new();
+    for (index, stmt) in block.statements.iter().enumerate() {
         match stmt {
             Statement::Flow { src, target } => {
                 let name = match target {
@@ -218,8 +223,11 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
                     .entry(name.clone())
                     .or_insert_with(|| fallback_shape.clone());
                 defs.push((name, src.clone()));
+                def_lines.push(block.line_of(index));
             }
-            Statement::Constraint(expr) => constraints.push((defs.len(), expr.clone())),
+            Statement::Constraint(expr) => {
+                constraints.push((defs.len(), expr.clone(), block.line_of(index)))
+            }
             _ => {}
         }
     }
@@ -237,11 +245,12 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
     // expanded in the context of the flow that performs it.
     let mut divisions = Vec::new();
     for (idx, (_, expr)) in defs_snapshot.iter().enumerate() {
-        collect_divisions(expr, idx, &mut builder, &mut divisions);
+        let line = def_lines.get(idx).copied().unwrap_or(0);
+        collect_divisions(expr, idx, line, &mut builder, &mut divisions);
     }
 
     let mut obligations = Vec::new();
-    for (at, expr) in &constraints {
+    for (at, expr, line) in &constraints {
         let source = format!("{}", ExprGlyphs(expr));
         let (cmp, lhs, rhs) = match expr {
             Expr::BinaryOp { op, lhs, rhs } if Cmp::from_op(op).is_some() => (
@@ -256,12 +265,21 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
             cmp,
             lhs,
             rhs,
+            line: *line,
         });
     }
+
+    // The last flow is what the caller sees; expand it so its range can be
+    // stated as part of the kernel's contract.
+    let output = defs_snapshot
+        .len()
+        .checked_sub(1)
+        .map(|last| builder.build(&defs_snapshot[last].1, last, 0));
 
     Expansion {
         obligations,
         divisions,
+        output,
     }
 }
 
@@ -270,20 +288,21 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
 fn collect_divisions(
     expr: &Expr,
     at: usize,
+    line: usize,
     builder: &mut Builder,
-    out: &mut Vec<(String, Sym)>,
+    out: &mut Vec<(String, Sym, usize)>,
 ) {
     match expr {
         Expr::BinaryOp { op, lhs, rhs } => {
             if matches!(op, BinaryOpKind::Div) {
                 let denom = builder.build(rhs, at, 0);
-                out.push((format!("{}", ExprGlyphs(expr)), denom));
+                out.push((format!("{}", ExprGlyphs(expr)), denom, line));
             }
-            collect_divisions(lhs, at, builder, out);
-            collect_divisions(rhs, at, builder, out);
+            collect_divisions(lhs, at, line, builder, out);
+            collect_divisions(rhs, at, line, builder, out);
         }
         Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
-            collect_divisions(inner, at, builder, out)
+            collect_divisions(inner, at, line, builder, out)
         }
         Expr::Var(_) | Expr::Number(_) => {}
     }

@@ -108,6 +108,25 @@ pub enum Statement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToposBlock {
     pub statements: Vec<Statement>,
+    /// Source line of each statement, parallel to `statements`, so a diagnostic
+    /// can point at the line the reader actually wrote.
+    pub lines: Vec<usize>,
+}
+
+impl ToposBlock {
+    /// Source line of statement `index`, or 0 when it is not known.
+    pub fn line_of(&self, index: usize) -> usize {
+        self.lines.get(index).copied().unwrap_or(0)
+    }
+
+    /// Source line of the first statement matching `pred`.
+    pub fn line_where(&self, pred: impl Fn(&Statement) -> bool) -> usize {
+        self.statements
+            .iter()
+            .position(pred)
+            .map(|i| self.line_of(i))
+            .unwrap_or(0)
+    }
 }
 
 /// Geometry of one axis of a row-major shape: `(stride, extent)`.

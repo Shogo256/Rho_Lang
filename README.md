@@ -28,6 +28,8 @@ Working prototype. What runs today:
 - Zero-copy binding: compile a kernel against a buffer the host already owns
 - Emits a native shared library (`.so`) with a documented C ABI
 - Deterministic output: the same source always produces byte-identical IR
+- A machine-readable contract compiled into the `.so`, so a caller can check what
+  was proved at load time
 
 See [Implementation Status](#implementation-status) for what is designed but not
 yet built. The implementation is deliberately a small verifiable core, not a
@@ -71,6 +73,7 @@ with what the constraint solver could prove.
 | `--tau <v>` | Bind the threshold symbol `𝜏` (default `0.0`) |
 | `--bind NAME=0x…` | Point a space at an address the caller owns |
 | `--no-simd` | Emit only scalar loops |
+| `--require-contract` | Refuse to emit a kernel with unproven obligations |
 
 Build with `--features z3-solver` to discharge `!` constraints with SMT instead
 of interval arithmetic.
@@ -126,6 +129,32 @@ print(list(buf))          # [2.0, 4.0, 6.0, 8.0] — written in place
 
 ---
 
+## The kernel carries its contract
+
+What the solver proves is compiled into the artifact, not just printed during the
+build. A host can check it before it runs anything:
+
+```python
+engine.compile_rho_file("kernel.rho")
+engine.require_contract()          # raises if anything is unproven
+```
+
+```json
+{
+  "backend": "interval",
+  "output_range": [0, null],
+  "divisions_proven_safe": true,
+  "output_proven_finite": false,
+  "open_obligations": 0,
+  "assumes": ["no overflow to infinity", "no NaN input", ...]
+}
+```
+
+`rhoc --require-contract` refuses to emit a kernel whose contract is incomplete,
+so an unproven kernel cannot reach production by accident.
+
+---
+
 ## C ABI
 
 | Symbol | Signature | Purpose |
@@ -133,7 +162,7 @@ print(list(buf))          # [2.0, 4.0, 6.0, 8.0] — written in place
 | `rho_kernel_element_count` | `int64_t (void)` | Cells the kernel sweeps; the minimum buffer length |
 | `rho_kernel_exec_with_args` | `void (const double *in, double *out)` | Run the kernel. Buffers **must** hold `element_count()` doubles |
 | `rho_kernel_exec_bounded` | `void (const double *in, double *out, int64_t n)` | Same, but clamps the sweep to `n` cells |
-| `rho_kernel_metadata` | `const char * (void)` | JSON: element count and every space's shape |
+| `rho_kernel_metadata` | `const char * (void)` | JSON: element count, every space's shape, and the proven contract |
 | `rho_kernel_exec` | `void (void)` | Zero-copy: runs against the addresses compiled in via `&[0x…]` or `--bind`. Returns immediately if `INPUT` is unbound |
 
 Passing `NULL` as the output pointer makes the kernel write in place. Passing
@@ -184,6 +213,8 @@ smooth input drives it to zero and the kernel returns infinities.
 | Explicit `<4 x double>` vector lowering | ✅ implemented — see the note below |
 | Zero-copy binding (`&[0x…]`, `--bind`) | ✅ implemented |
 | `!` constraint solver | ✅ interval arithmetic; Z3 with `--features z3-solver`. Models binary64 rounding, not ℝ |
+| Proven contract embedded in the artifact | ✅ implemented |
+| Diagnostics with source lines | ✅ implemented |
 | C ABI, JSON metadata, Python FFI | ✅ implemented |
 | AVX-512 / NEON width selection, GPU backends | 📋 planned — the vector width is fixed at four lanes |
 | Tiling and cache blocking | 📋 planned — a sweep is one linear pass |

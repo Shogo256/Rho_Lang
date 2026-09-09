@@ -32,6 +32,10 @@ struct Args {
     #[arg(long)]
     dump_dag: bool,
 
+    /// Refuse to emit a kernel whose contract has unproven obligations
+    #[arg(long)]
+    require_contract: bool,
+
     /// Emit only scalar loops, skipping vector lowering
     #[arg(long)]
     no_simd: bool,
@@ -43,6 +47,32 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    match run(&args) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            // A parse or lowering failure knows its line; show it under a caret.
+            if let Some(disruption) = err.downcast_ref::<rho_lang::error::HarmonyDisruption>() {
+                if let Ok(source) = fs::read_to_string(&args.input) {
+                    eprintln!("{}", disruption.render(&source));
+                    std::process::exit(1);
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
+fn fmt_bound(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v}")
+    } else if v > 0.0 {
+        "+inf".to_string()
+    } else {
+        "-inf".to_string()
+    }
+}
+
+fn run(args: &Args) -> anyhow::Result<()> {
 
     println!("=====================================================");
     println!("  ρ (RHO) Language Compiler v{}", env!("CARGO_PKG_VERSION"));
@@ -87,9 +117,31 @@ fn main() -> anyhow::Result<()> {
         println!("  └─ Passed with {open_questions} unproven obligation(s)");
     }
 
+    let contract = &report.contract;
+    println!(
+        "  └─ Contract: output ∈ [{}, {}], divisions {}",
+        fmt_bound(contract.output_range.lo),
+        fmt_bound(contract.output_range.hi),
+        if contract.divisions_proven_safe {
+            "proven safe"
+        } else {
+            "not proven safe"
+        }
+    );
+    if args.require_contract && !contract.is_complete() {
+        anyhow::bail!(
+            "--require-contract: {} obligation(s) unproven and divisions {}. \
+             Refusing to emit a kernel whose contract is incomplete.",
+            contract.open_obligations,
+            if contract.divisions_proven_safe { "safe" } else { "unproven" }
+        );
+    }
+
     // 4. CodeGen & Native Compilation
     println!("[Phase 4] LLVM Hardware Mapping...");
-    let mut codegen = LlvmCodeGen::new("rho_kernel").with_tau(args.tau);
+    let mut codegen = LlvmCodeGen::new("rho_kernel")
+        .with_tau(args.tau)
+        .with_contract(report.contract.to_json());
     if args.no_simd {
         codegen = codegen.without_simd();
     }

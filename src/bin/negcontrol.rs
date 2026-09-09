@@ -2,10 +2,26 @@
 //!
 //! A checker that never fails proves nothing about the thing it checks, so this
 //! damages the emitted IR in a few small ways and insists the validator notices.
+//! Each entrypoint is damaged and checked on its own: a proof of the two-pointer
+//! form says nothing about the plumbing of the table form, and the other way
+//! round.
 
-use rho_lang::parser::parse_rho_program;
-use rho_lang::validate::{compare, expressions_of, Verdict};
 use rho_lang::codegen::LlvmCodeGen;
+use rho_lang::parser::parse_rho_program;
+use rho_lang::validate::{compare, expressions_via, Entrypoint, Verdict};
+
+/// Apply one replacement inside the body of `entry` only, or None if the text
+/// does not occur there.
+fn damage_in(ir: &str, entry: Entrypoint, from: &str, to: &str) -> Option<String> {
+    let marker = format!("define void @{}(", entry.symbol());
+    let start = ir.find(&marker)?;
+    let end = start + ir[start..].find("\n}\n")?;
+    let body = &ir[start..end];
+    if !body.contains(from) {
+        return None;
+    }
+    Some(format!("{}{}{}", &ir[..start], body.replacen(from, to, 1), &ir[end..]))
+}
 
 fn main() {
     let source = "{\n    INPUT:◯ □ 6 1\n    (▷INPUT - INPUT) → D\n    ((D × D) + 1.0) → OUTPUT\n    OUTPUT → =\n}\n";
@@ -24,40 +40,45 @@ fn main() {
         ("a boundary test flipped", "icmp eq i64 %v1, 0", "icmp ne i64 %v1, 0"),
         ("a constant shifted", "0x3FF0000000000000", "0x4000000000000000"),
     ];
+    let entrypoints = [Entrypoint::WithArgs, Entrypoint::Spaces];
 
     let mut caught = 0usize;
     let mut missed = 0usize;
 
     for (label, from, to) in damage {
-        if !ir.contains(from) {
-            println!("  n/a      {label} (no `{from}` in this kernel)");
-            continue;
-        }
-        let broken = ir.replacen(from, to, 1);
-        match expressions_of(&block, &shape, 0.0, &broken) {
-            Ok((left, right)) => match compare(&left, &right) {
-                Verdict::Differs { cell, .. } => {
-                    caught += 1;
-                    println!("  caught   {label} (cell {cell})");
-                }
-                other => {
+        for entry in entrypoints {
+            let Some(broken) = damage_in(&ir, entry, from, to) else {
+                println!("  n/a      {label} (no `{from}` in {})", entry.symbol());
+                continue;
+            };
+            match expressions_via(&block, &shape, 0.0, &broken, entry) {
+                Ok((left, right)) => match compare(&left, &right) {
+                    Verdict::Differs { cell, .. } => {
+                        caught += 1;
+                        println!("  caught   {label} in {} (cell {cell})", entry.symbol());
+                    }
+                    other => {
+                        missed += 1;
+                        println!("  MISSED   {label} in {} -> {other:?}", entry.symbol());
+                    }
+                },
+                Err(why) => {
                     missed += 1;
-                    println!("  MISSED   {label} -> {other:?}");
+                    println!("  MISSED   {label} in {} (IR unreadable: {why})", entry.symbol());
                 }
-            },
-            Err(why) => {
-                missed += 1;
-                println!("  MISSED   {label} (IR unreadable: {why})");
             }
         }
     }
 
-    // And the undamaged kernel must still come out clean.
-    let (left, right) = expressions_of(&block, &shape, 0.0, &ir).unwrap();
-    let clean = compare(&left, &right);
-    println!("\n  undamaged kernel: {clean:?}");
+    // And the undamaged kernel must still come out clean, both ways in.
+    let mut clean = true;
+    for entry in entrypoints {
+        let (left, right) = expressions_via(&block, &shape, 0.0, &ir, entry).unwrap();
+        let verdict = compare(&left, &right);
+        println!("\n  undamaged kernel via {}: {verdict:?}", entry.symbol());
+        clean &= verdict == Verdict::Equivalent;
+    }
 
     println!("caught {caught}, missed {missed}");
-    let sound = missed == 0 && clean == Verdict::Equivalent;
-    std::process::exit(if sound { 0 } else { 1 });
+    std::process::exit(if missed == 0 && clean { 0 } else { 1 });
 }

@@ -32,6 +32,29 @@ pub struct Validation {
     /// Nodes in the two expression graphs, as a sense of the problem's size.
     pub source_nodes: usize,
     pub target_nodes: usize,
+    /// How many entrypoints were proved: the two-pointer form and the table
+    /// form for a program that reads INPUT alone, the table form otherwise.
+    pub entrypoints: usize,
+}
+
+/// Which C entrypoint the IR is read through. The two share the body a flow
+/// lowers to but not the plumbing that hands it its buffers, so a proof of one
+/// says nothing about the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entrypoint {
+    /// `rho_kernel_exec_with_args(in, out)`: INPUT and OUTPUT only.
+    WithArgs,
+    /// `rho_kernel_exec_spaces(void **)`: one pointer per space.
+    Spaces,
+}
+
+impl Entrypoint {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Entrypoint::WithArgs => "rho_kernel_exec_with_args",
+            Entrypoint::Spaces => "rho_kernel_exec_spaces",
+        }
+    }
 }
 
 /// Build the source and IR expression graphs for a program at one shape.
@@ -47,7 +70,8 @@ pub fn expressions(
     expressions_of(block, shape, tau, &ir)
 }
 
-/// As [`expressions`], against IR supplied by the caller.
+/// As [`expressions`], against IR supplied by the caller, read through the
+/// two-pointer entrypoint.
 ///
 /// A validator has to be shown catching something, so a test needs a way to
 /// hand it IR that is deliberately wrong.
@@ -57,12 +81,45 @@ pub fn expressions_of(
     tau: f64,
     ir: &str,
 ) -> Result<(Vec<Term>, Vec<Term>), String> {
-    let cells: usize = shape.iter().product::<usize>().max(1);
-    let inputs: Vec<Term> = (0..cells).map(Term::input).collect();
+    expressions_via(block, shape, tau, ir, Entrypoint::WithArgs)
+}
+
+/// As [`expressions_of`], through the entrypoint of the caller's choice.
+///
+/// Every space the kernel reads gets one symbol per cell, so a program with a
+/// second input is as provable as one with INPUT alone — through the table
+/// entrypoint, the only one that can carry it.
+pub fn expressions_via(
+    block: &ToposBlock,
+    shape: &[usize],
+    tau: f64,
+    ir: &str,
+    entry: Entrypoint,
+) -> Result<(Vec<Term>, Vec<Term>), String> {
+    // How the generator lays the spaces out. Generation is deterministic, so
+    // this is the layout of the IR the caller hands in, damaged or not.
+    let mut layout = LlvmCodeGen::new("layout").with_tau(tau);
+    layout.generate_llvm_ir(block).map_err(|e| e.to_string())?;
+
+    // One symbol per cell of every space the kernel reads, numbered across
+    // the spaces so that no two cells share a name.
+    let mut env: Env<Term> = Env::new();
+    let mut symbols: std::collections::BTreeMap<String, Vec<Term>> = Default::default();
+    let mut next = 0usize;
+    for name in layout.input_spaces() {
+        let space_shape = if name == "INPUT" {
+            shape.to_vec()
+        } else {
+            layout.space_shapes[&name].clone()
+        };
+        let count = space_shape.iter().product::<usize>().max(1);
+        let terms: Vec<Term> = (next..next + count).map(Term::input).collect();
+        next += count;
+        env.insert(name.clone(), Grid::from(space_shape, terms.clone()));
+        symbols.insert(name, terms);
+    }
 
     // What the source means.
-    let mut env: Env<Term> = Env::new();
-    env.insert("INPUT".to_string(), Grid::from(shape.to_vec(), inputs.clone()));
     let interpreted = interpret(block, &env, tau).map_err(|e| e.to_string())?;
     let source = interpreted
         .get("OUTPUT")
@@ -72,15 +129,39 @@ pub fn expressions_of(
 
     // What the generator emitted.
     let functions = parse_module(ir);
-    let entry = functions
+    let function = functions
         .iter()
-        .find(|f| f.name == "rho_kernel_exec_with_args")
-        .ok_or("no rho_kernel_exec_with_args in the module")?;
+        .find(|f| f.name == entry.symbol())
+        .ok_or_else(|| format!("no {} in the module", entry.symbol()))?;
 
     let mut machine: Machine<Term> = Machine::new();
-    let in_handle = machine.add_buffer(inputs);
-    let out_handle = machine.add_buffer(vec![Term::constant(0.0); source.len().max(cells)]);
-    machine.run(entry, &[Value::P(in_handle, 0), Value::P(out_handle, 0)])?;
+    let out_handle = machine.add_buffer(vec![Term::constant(0.0); source.len().max(1)]);
+    match entry {
+        Entrypoint::WithArgs => {
+            if symbols.len() != 1 || !symbols.contains_key("INPUT") {
+                return Err(format!(
+                    "the program reads {:?}; {} carries INPUT alone",
+                    symbols.keys().collect::<Vec<_>>(),
+                    entry.symbol()
+                ));
+            }
+            let in_handle = machine.add_buffer(symbols["INPUT"].clone());
+            machine.run(function, &[Value::P(in_handle, 0), Value::P(out_handle, 0)])?;
+        }
+        Entrypoint::Spaces => {
+            let mut table = Vec::new();
+            for name in layout.space_shapes.keys() {
+                table.push(match symbols.get(name) {
+                    Some(terms) => Value::P(machine.add_buffer(terms.clone()), 0),
+                    None if name == "OUTPUT" => Value::P(out_handle, 0),
+                    // An intermediate the kernel owns.
+                    None => Value::null(),
+                });
+            }
+            let handle = machine.add_table(table);
+            machine.run(function, &[Value::T(handle, 0)])?;
+        }
+    }
     let target = machine.buffer(out_handle)[..source.len()].to_vec();
 
     Ok((source, target))
@@ -286,27 +367,67 @@ pub fn compare(source: &[Term], target: &[Term]) -> Verdict {
     }
 }
 
-/// Prove that the emitted IR agrees with the source for every input at `shape`.
+/// Prove that the emitted IR agrees with the source for every input at `shape`,
+/// through every entrypoint that can carry the program.
 pub fn validate(block: &ToposBlock, shape: &[usize], tau: f64) -> Validation {
-    let (source, target) = match expressions(block, shape, tau) {
-        Ok(pair) => pair,
-        Err(why) => {
-            return Validation {
-                verdict: Verdict::NotChecked(why),
-                source_nodes: 0,
-                target_nodes: 0,
-            }
-        }
+    let not_checked = |why: String| Validation {
+        verdict: Verdict::NotChecked(why),
+        source_nodes: 0,
+        target_nodes: 0,
+        entrypoints: 0,
     };
 
-    let source_nodes = source.iter().map(Term::size).sum();
-    let target_nodes = target.iter().map(Term::size).sum();
+    let mut codegen = LlvmCodeGen::new("validate").with_tau(tau);
+    let ir = match codegen.generate_llvm_ir(block) {
+        Ok(ir) => ir,
+        Err(e) => return not_checked(e.to_string()),
+    };
+    // The two-pointer form cannot carry a second input.
+    let entries: &[Entrypoint] = if codegen.input_spaces() == ["INPUT"] {
+        &[Entrypoint::WithArgs, Entrypoint::Spaces]
+    } else {
+        &[Entrypoint::Spaces]
+    };
 
-    let verdict = compare(&source, &target);
+    let mut source_nodes = 0usize;
+    let mut target_nodes = 0usize;
+    let mut entrypoints = 0usize;
+    for &entry in entries {
+        let (source, target) = match expressions_via(block, shape, tau, &ir, entry) {
+            Ok(pair) => pair,
+            Err(why) => return not_checked(why),
+        };
+        source_nodes = source.iter().map(Term::size).sum();
+        target_nodes = target_nodes.max(target.iter().map(Term::size).sum());
+
+        match compare(&source, &target) {
+            Verdict::Equivalent => entrypoints += 1,
+            Verdict::Differs { cell, witness } => {
+                return Validation {
+                    verdict: Verdict::Differs {
+                        cell,
+                        witness: format!("{}: {witness}", entry.symbol()),
+                    },
+                    source_nodes,
+                    target_nodes,
+                    entrypoints,
+                }
+            }
+            other => {
+                return Validation {
+                    verdict: other,
+                    source_nodes,
+                    target_nodes,
+                    entrypoints,
+                }
+            }
+        }
+    }
 
     Validation {
-        verdict,
+        verdict: Verdict::Equivalent,
         source_nodes,
         target_nodes,
+        entrypoints,
     }
 }

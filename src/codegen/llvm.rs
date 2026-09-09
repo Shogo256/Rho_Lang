@@ -1083,9 +1083,20 @@ impl LlvmCodeGen {
             .collect()
     }
 
+    /// The spaces a caller has to supply — those no flow writes — in the
+    /// order `rho_kernel_exec_spaces` takes them. Meaningful once IR has been
+    /// generated.
+    pub fn input_spaces(&self) -> Vec<String> {
+        self.space_shapes
+            .keys()
+            .filter(|name| self.role_of(name) == "input")
+            .cloned()
+            .collect()
+    }
+
     /// What a caller does with a space: supply it, read the result from it,
     /// or leave it to the kernel.
-    fn role_of(&self, name: &str) -> &'static str {
+    pub fn role_of(&self, name: &str) -> &'static str {
         if name == "OUTPUT" {
             "output"
         } else if self.written_spaces.contains(name) {

@@ -11,6 +11,7 @@ use rho_lang::interp::{interpret, Env, Grid};
 use rho_lang::irvm::{parse_module, Machine, Value};
 use rho_lang::numeric::{Numeric, Precision};
 use rho_lang::parser::parse_rho_program;
+use std::collections::BTreeMap;
 
 
 /// Run the emitted IR directly, without going through clang.
@@ -35,6 +36,81 @@ fn run_ir<S: Numeric>(
     let target = machine.add_buffer(vec![S::constant(0.0); cells]);
     machine.run(entry, &[Value::P(source, 0), Value::P(target, 0)])?;
     Ok(machine.buffer(target).iter().map(&widen).collect())
+}
+
+/// As [`run_ir`], through `rho_kernel_exec_spaces`: one pointer per space in
+/// `order`, the caller's inputs and the output filled in and every space the
+/// kernel owns left null.
+fn run_ir_spaces<S: Numeric>(
+    ir: &str,
+    order: &[String],
+    inputs: &BTreeMap<String, Vec<S>>,
+    cells: usize,
+    widen: impl Fn(&S) -> f64,
+) -> Result<Vec<f64>, String> {
+    let functions = parse_module(ir);
+    let entry = functions
+        .iter()
+        .find(|f| f.name == "rho_kernel_exec_spaces")
+        .ok_or("no rho_kernel_exec_spaces in the module")?;
+
+    let mut machine: Machine<S> = Machine::new();
+    let target = machine.add_buffer(vec![S::constant(0.0); cells]);
+    let mut table = Vec::new();
+    for name in order {
+        table.push(match inputs.get(name) {
+            Some(data) => Value::P(machine.add_buffer(data.clone()), 0),
+            None if name == "OUTPUT" => Value::P(target, 0),
+            None => Value::null(),
+        });
+    }
+    let handle = machine.add_table(table);
+    machine.run(entry, &[Value::T(handle, 0)])?;
+    Ok(machine.buffer(target).iter().map(&widen).collect())
+}
+
+/// Run the shared object through the table entrypoint and, when the program
+/// reads INPUT alone, through the two-pointer one as well.
+fn run_so(
+    so: &str,
+    order: &[String],
+    inputs: &BTreeMap<String, Vec<f64>>,
+    cells: usize,
+    single_input: bool,
+) -> (Vec<f64>, Option<Vec<f64>>) {
+    let mut copies = inputs.clone();
+    let mut output = vec![0.0f64; cells];
+    let mut table: Vec<*mut f64> = Vec::new();
+    for name in order {
+        table.push(match copies.get_mut(name) {
+            Some(buf) => buf.as_mut_ptr(),
+            None if name == "OUTPUT" => output.as_mut_ptr(),
+            None => std::ptr::null_mut(),
+        });
+    }
+    let mut via_args = single_input.then(|| vec![0.0f64; cells]);
+    unsafe {
+        let lib = libloading::Library::new(so).unwrap();
+        let spaces: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> =
+            lib.get(b"rho_kernel_exec_spaces").unwrap();
+        spaces(table.as_ptr());
+        if let Some(out) = via_args.as_mut() {
+            let run: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
+                lib.get(b"rho_kernel_exec_with_args").unwrap();
+            run(inputs["INPUT"].as_ptr(), out.as_mut_ptr());
+        }
+    }
+    (output, via_args)
+}
+
+/// The first cell where two results disagree on the bits. NaN compares unequal
+/// to itself and the payload of a propagated NaN is not architecturally fixed,
+/// so two NaNs count as agreeing however they are spelled.
+fn first_gap(expected: &[f64], actual: &[f64]) -> Option<usize> {
+    expected
+        .iter()
+        .zip(actual)
+        .position(|(a, b)| !(a.is_nan() && b.is_nan()) && a.to_bits() != b.to_bits())
 }
 
 /// Deterministic xorshift, so any failure is reproducible from its seed.
@@ -128,6 +204,25 @@ fn expression(
         _ => {
             let op = ["+", "-", "×", "/", ">", "<"][rng.below(6)];
             let lhs = expression(rng, depth - 1, spaces, want);
+            // A space whose shape stretches against `want` — a length-1 axis
+            // against a longer one — exercises broadcasting. The other side
+            // has to carry the wanted shape itself, so a bare literal is
+            // replaced by a space that does.
+            let stretching: Vec<&(String, Vec<usize>)> = spaces
+                .iter()
+                .filter(|(_, shape)| {
+                    shape != want
+                        && rho_lang::ast::broadcast_shapes(shape, want).as_deref() == Some(want)
+                })
+                .collect();
+            if !stretching.is_empty() && !matching.is_empty() && rng.below(2) == 0 {
+                let anchored = if spaces.iter().any(|(n, _)| lhs.contains(n.as_str())) {
+                    lhs
+                } else {
+                    matching[rng.below(matching.len())].0.clone()
+                };
+                return format!("({anchored} {op} {})", stretching[rng.below(stretching.len())].0);
+            }
             let rhs = expression(rng, depth - 1, spaces, want);
             // Anchor the pair to a space if neither side reached one.
             if !matching.is_empty()
@@ -159,8 +254,40 @@ fn fold_down_to(rng: &mut Rng, spaces: &[(String, Vec<usize>)], want: &[usize]) 
     Some(format!("({glyph}{axis} {name})"))
 }
 
-fn program(rng: &mut Rng, dims: &str, shape: &[usize]) -> String {
+/// Spell a shape as a declaration's dimension list.
+fn dims_of(shape: &[usize]) -> String {
+    shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(" ")
+}
+
+/// A random program over INPUT and, in one round of three, a second input
+/// AUX. Returns the source and AUX's shape when it has one.
+fn program(rng: &mut Rng, dims: &str, shape: &[usize]) -> (String, Option<Vec<usize>>) {
     let mut spaces: Vec<(String, Vec<usize>)> = vec![("INPUT".to_string(), shape.to_vec())];
+    let mut decls = format!("    INPUT:◯ □ {dims}\n");
+
+    // The second input takes INPUT's shape, one that stretches against it —
+    // a length-1 axis broadcasts — or one an axis shorter, which a fold of
+    // INPUT can meet.
+    let aux = if rng.below(3) == 0 {
+        let aux_shape = match rng.below(3) {
+            1 if shape.len() > 1 => {
+                let mut stretched = shape.to_vec();
+                let axis = rng.below(stretched.len());
+                stretched[axis] = 1;
+                stretched
+            }
+            2 if shape.len() > 1 => {
+                rho_lang::ast::shape_without_axis(shape, rng.below(shape.len()))
+            }
+            _ => shape.to_vec(),
+        };
+        decls.push_str(&format!("    AUX:◯ □ {}\n", dims_of(&aux_shape)));
+        spaces.push(("AUX".to_string(), aux_shape.clone()));
+        Some(aux_shape)
+    } else {
+        None
+    };
+
     let mut body = String::new();
 
     for k in 0..=rng.below(3) {
@@ -185,7 +312,7 @@ fn program(rng: &mut Rng, dims: &str, shape: &[usize]) -> String {
         expression(rng, 3, &spaces, &final_shape)
     ));
     body.push_str("    OUTPUT → =\n");
-    format!("{{\n    INPUT:◯ □ {dims}\n{body}}}\n")
+    (format!("{{\n{decls}{body}}}\n"), aux)
 }
 
 /// The first line of a diagnostic, for tallying why programs were skipped.
@@ -210,12 +337,13 @@ fn main() {
 
     let mut rng = Rng(seed);
     let (mut compared, mut skipped, mut mismatches) = (0usize, 0usize, 0usize);
+    let mut two_inputs = 0usize;
     let (mut ir_mismatches, mut ir_unsupported) = (0usize, 0usize);
     let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
 
     for round in 0..rounds {
         let (dims, shape) = &shapes[rng.below(shapes.len())];
-        let source = program(&mut rng, dims, shape);
+        let (source, aux) = program(&mut rng, dims, shape);
 
         let block = match parse_rho_program(&source) {
             Ok(b) => b,
@@ -227,10 +355,19 @@ fn main() {
         };
 
         let cells: usize = shape.iter().product();
-        let input: Vec<f64> = (0..cells).map(|_| rng.value()).collect();
+        let single_input = aux.is_none();
+        let mut inputs: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        inputs.insert("INPUT".to_string(), (0..cells).map(|_| rng.value()).collect());
+        if let Some(aux_shape) = &aux {
+            let n: usize = aux_shape.iter().product();
+            inputs.insert("AUX".to_string(), (0..n).map(|_| rng.value()).collect());
+        }
 
         let mut env = Env::new();
-        env.insert("INPUT".to_string(), Grid::from(shape.clone(), input.clone()));
+        env.insert("INPUT".to_string(), Grid::from(shape.clone(), inputs["INPUT"].clone()));
+        if let Some(aux_shape) = &aux {
+            env.insert("AUX".to_string(), Grid::from(aux_shape.clone(), inputs["AUX"].clone()));
+        }
         let interpreted = match interpret(&block, &env, 0.0) {
             Ok(i) => i,
             Err(e) => {
@@ -254,77 +391,109 @@ fn main() {
                 continue;
             }
         };
+        // The table entrypoint takes the spaces in this order.
+        let order: Vec<String> = codegen.space_shapes.keys().cloned().collect();
         let so = format!("target/diff{round}.so");
         if codegen.compile_to_so(&ir, &so).is_err() {
             skipped += 1;
             *reasons.entry("clang".to_string()).or_insert(0) += 1;
             continue;
         }
+        let out_cells = cells.max(expected.len());
 
-        // The IR, read back and run without clang.
-        match run_ir(&ir, &input, cells.max(expected.len()), |v: &f64| *v) {
-            Ok(from_ir) => {
-                let gap = expected
-                    .cells
-                    .iter()
-                    .zip(&from_ir)
-                    .position(|(a, b)| !(a.is_nan() && b.is_nan()) && a.to_bits() != b.to_bits());
-                if let Some(cell) = gap {
-                    ir_mismatches += 1;
-                    println!("IR MISMATCH at cell {cell} (round {round}, shape {shape:?})");
-                    println!("{source}");
-                    println!("  input       {input:?}");
-                    println!("  interpreted {:?}", expected.cells[cell]);
-                    println!("  from IR     {:?}\n", from_ir[cell]);
+        // The IR, read back and run without clang — through the table of
+        // spaces always, and through the two-pointer form when it applies.
+        let mut ir_runs = vec![(
+            "exec_spaces",
+            run_ir_spaces(&ir, &order, &inputs, out_cells, |v: &f64| *v),
+        )];
+        if single_input {
+            ir_runs.push((
+                "exec_with_args",
+                run_ir(&ir, &inputs["INPUT"], out_cells, |v: &f64| *v),
+            ));
+        }
+        for (entry, outcome) in ir_runs {
+            match outcome {
+                Ok(from_ir) => {
+                    if let Some(cell) = first_gap(&expected.cells, &from_ir) {
+                        ir_mismatches += 1;
+                        println!(
+                            "IR MISMATCH at cell {cell} via {entry} (round {round}, shape {shape:?})"
+                        );
+                        println!("{source}");
+                        println!("  inputs      {inputs:?}");
+                        println!("  interpreted {:?}", expected.cells[cell]);
+                        println!("  from IR     {:?}\n", from_ir[cell]);
+                    }
                 }
-            }
-            Err(why) => {
-                ir_unsupported += 1;
-                if ir_unsupported <= 2 {
-                    println!("IR NOT READ (round {round}): {why}");
+                Err(why) => {
+                    ir_unsupported += 1;
+                    if ir_unsupported <= 2 {
+                        println!("IR NOT READ via {entry} (round {round}): {why}");
+                    }
                 }
             }
         }
 
-        let mut output = vec![0.0f64; cells.max(expected.len())];
-        unsafe {
-            let lib = libloading::Library::new(&so).unwrap();
-            let run: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
-                lib.get(b"rho_kernel_exec_with_args").unwrap();
-            run(input.as_ptr(), output.as_mut_ptr());
-        }
+        // The shared object, through the same entrypoints.
+        let (output, output_args) = run_so(&so, &order, &inputs, out_cells, single_input);
         let _ = std::fs::remove_file(&so);
 
         // Every other round is repeated at single precision, where the same
         // three representations must still agree with one another.
         if round % 2 == 0 {
-            let narrow: Vec<f32> = input.iter().map(|v| *v as f32).collect();
+            let narrow: BTreeMap<String, Vec<f32>> = inputs
+                .iter()
+                .map(|(name, data)| (name.clone(), data.iter().map(|v| *v as f32).collect()))
+                .collect();
             let mut narrow_env: rho_lang::interp::Env<f32> = rho_lang::interp::Env::new();
             narrow_env.insert(
                 "INPUT".to_string(),
-                Grid::from(shape.clone(), narrow.clone()),
+                Grid::from(shape.clone(), narrow["INPUT"].clone()),
             );
+            if let Some(aux_shape) = &aux {
+                narrow_env.insert(
+                    "AUX".to_string(),
+                    Grid::from(aux_shape.clone(), narrow["AUX"].clone()),
+                );
+            }
             if let Ok(narrow_out) = interpret(&block, &narrow_env, 0.0) {
                 if let Some(meant) = narrow_out.get("OUTPUT") {
                     let mut narrow_codegen = LlvmCodeGen::new(&format!("diff{round}f32"))
                         .with_precision(Precision::F32);
                     if let Ok(narrow_ir) = narrow_codegen.generate_llvm_ir(&block) {
-                        match run_ir(&narrow_ir, &narrow, meant.len(), |v: &f32| *v as f64) {
-                            Ok(from_ir) => {
-                                let gap = meant.cells.iter().zip(&from_ir).position(|(a, b)| {
-                                    let a = *a as f64;
-                                    !(a.is_nan() && b.is_nan()) && a.to_bits() != b.to_bits()
-                                });
-                                if let Some(cell) = gap {
-                                    ir_mismatches += 1;
-                                    println!("F32 IR MISMATCH at cell {cell} (round {round})");
-                                    println!("{source}");
+                        let meant_wide: Vec<f64> = meant.cells.iter().map(|v| *v as f64).collect();
+                        let mut runs = vec![(
+                            "exec_spaces",
+                            run_ir_spaces(&narrow_ir, &order, &narrow, meant.len(), |v: &f32| {
+                                *v as f64
+                            }),
+                        )];
+                        if single_input {
+                            runs.push((
+                                "exec_with_args",
+                                run_ir(&narrow_ir, &narrow["INPUT"], meant.len(), |v: &f32| {
+                                    *v as f64
+                                }),
+                            ));
+                        }
+                        for (entry, outcome) in runs {
+                            match outcome {
+                                Ok(from_ir) => {
+                                    if let Some(cell) = first_gap(&meant_wide, &from_ir) {
+                                        ir_mismatches += 1;
+                                        println!(
+                                            "F32 IR MISMATCH at cell {cell} via {entry} (round {round})"
+                                        );
+                                        println!("{source}");
+                                    }
                                 }
-                            }
-                            Err(why) => {
-                                ir_unsupported += 1;
-                                if ir_unsupported <= 2 {
-                                    println!("F32 IR NOT READ (round {round}): {why}");
+                                Err(why) => {
+                                    ir_unsupported += 1;
+                                    if ir_unsupported <= 2 {
+                                        println!("F32 IR NOT READ via {entry} (round {round}): {why}");
+                                    }
                                 }
                             }
                         }
@@ -334,34 +503,32 @@ fn main() {
         }
 
         compared += 1;
-        // NaN compares unequal to itself, so agreement is judged on the bits —
-        // except that the payload of a propagated NaN is not architecturally
-        // fixed, so two NaNs count as agreeing however they are spelled.
-        let disagreement = expected.cells.iter().zip(&output).position(|(a, b)| {
-            if a.is_nan() && b.is_nan() {
-                false
-            } else {
-                a.to_bits() != b.to_bits()
+        if !single_input {
+            two_inputs += 1;
+        }
+        let mut so_runs = vec![("exec_spaces", output)];
+        if let Some(via_args) = output_args {
+            so_runs.push(("exec_with_args", via_args));
+        }
+        for (entry, actual) in so_runs {
+            if let Some(cell) = first_gap(&expected.cells, &actual) {
+                mismatches += 1;
+                let (a, b) = (expected.cells[cell], actual[cell]);
+                println!("MISMATCH at cell {cell} via {entry} (round {round}, shape {shape:?})");
+                println!("{source}");
+                println!("  inputs      {inputs:?}");
+                println!("  interpreted {a:?}  bits {:#018x}", a.to_bits());
+                println!("  compiled    {b:?}  bits {:#018x}", b.to_bits());
+                println!("  ulp gap     {}\n", (a.to_bits() as i64 - b.to_bits() as i64).abs());
             }
-        });
-
-        if let Some(cell) = disagreement {
-            mismatches += 1;
-            let (a, b) = (expected.cells[cell], output[cell]);
-            println!("MISMATCH at cell {cell} (round {round}, shape {shape:?})");
-            println!("{source}");
-            println!("  input       {input:?}");
-            println!("  interpreted {a:?}  bits {:#018x}", a.to_bits());
-            println!("  compiled    {b:?}  bits {:#018x}", b.to_bits());
-            println!("  ulp gap     {}\n", (a.to_bits() as i64 - b.to_bits() as i64).abs());
-            if mismatches >= 3 {
-                break;
-            }
+        }
+        if mismatches >= 3 {
+            break;
         }
     }
 
     println!(
-        "seed {seed}: compared {compared}, skipped {skipped}, \
+        "seed {seed}: compared {compared} ({two_inputs} with two inputs), skipped {skipped}, \
          mismatches {mismatches}, ir mismatches {ir_mismatches}, ir unread {ir_unsupported}"
     );
     if std::env::var("DIFFTEST_VERBOSE").is_ok() {

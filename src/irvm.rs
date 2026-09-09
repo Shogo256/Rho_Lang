@@ -32,12 +32,19 @@ where
     B(S::Bool),
     /// A buffer and an element offset into it.
     P(usize, i64),
+    /// A table of pointers and a slot offset into it: what a `void **` is.
+    T(usize, i64),
     VF(Vec<S>),
     VI(Vec<i64>),
     VB(Vec<S::Bool>),
 }
 
 impl<S: Numeric> Value<S> {
+    /// The null pointer. Never a buffer the machine owns.
+    pub fn null() -> Value<S> {
+        Value::P(usize::MAX, 0)
+    }
+
     fn f(&self) -> S {
         match self {
             Value::F(v) => v.clone(),
@@ -168,6 +175,8 @@ pub struct Machine<S: Numeric = f64> {
     buffers: Vec<Vec<S>>,
     /// Buffers reached through `inttoptr`, keyed by the address in the source.
     external: BTreeMap<i64, usize>,
+    /// Tables of pointers, one per `void **` argument.
+    tables: Vec<Vec<Value<S>>>,
     names: BTreeMap<String, Value<S>>,
     /// A stop so a generator bug cannot hang the validator.
     budget: usize,
@@ -178,6 +187,7 @@ impl<S: Numeric> Machine<S> {
         Machine {
             buffers: Vec::new(),
             external: BTreeMap::new(),
+            tables: Vec::new(),
             names: BTreeMap::new(),
             budget: 20_000_000,
         }
@@ -188,6 +198,13 @@ impl<S: Numeric> Machine<S> {
     pub fn add_buffer(&mut self, cells: Vec<S>) -> usize {
         self.buffers.push(cells);
         self.buffers.len() - 1
+    }
+
+    /// Register a table of pointers — buffers or [`Value::null`] — returning
+    /// the handle to pass as a `void **` argument.
+    pub fn add_table(&mut self, entries: Vec<Value<S>>) -> usize {
+        self.tables.push(entries);
+        self.tables.len() - 1
     }
 
     pub fn bind_address(&mut self, address: i64, buffer: usize) {
@@ -428,10 +445,12 @@ impl<S: Numeric> Machine<S> {
                     .map(|f| split_typed(f).1)
                     .ok_or_else(|| format!("malformed gep: {body}"))?
                     .trim();
-                let Value::P(handle, offset) = self.value(base) else {
-                    return Err(format!("gep from a non-pointer: {base}"));
-                };
-                Ok(Value::P(handle, offset + self.value(index).i()))
+                let step = self.value(index).i();
+                match self.value(base) {
+                    Value::P(handle, offset) => Ok(Value::P(handle, offset + step)),
+                    Value::T(handle, offset) => Ok(Value::T(handle, offset + step)),
+                    _ => Err(format!("gep from a non-pointer: {base}")),
+                }
             }
 
             "load" => {
@@ -447,6 +466,16 @@ impl<S: Numeric> Machine<S> {
                     .and_then(|s| s.split(',').next())
                     .ok_or_else(|| format!("malformed load: {body}"))?
                     .trim();
+                // A load of a pointer reads a slot of a table, not a cell.
+                if ty == "ptr" {
+                    let Value::T(handle, offset) = self.value(source) else {
+                        return Err(format!("load of a pointer from a non-table: {source}"));
+                    };
+                    return self.tables[handle]
+                        .get(offset.max(0) as usize)
+                        .cloned()
+                        .ok_or_else(|| format!("load past the end of a pointer table: {body}"));
+                }
                 let Value::P(handle, offset) = self.value(source) else {
                     return Err(format!("load from a non-pointer: {source}"));
                 };

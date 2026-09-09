@@ -19,7 +19,9 @@ fn main() {
         ("3 4", vec![3, 4]),
     ];
 
-    let programs: [&str; 14] = [
+    // `{dims}` and `{rows}` are filled in per shape, so a second input can be
+    // declared to match INPUT or to stretch against it.
+    let programs: [&str; 17] = [
         "(INPUT + 1.0) → OUTPUT\n    OUTPUT → =",
         "(▷INPUT - INPUT) → OUTPUT\n    OUTPUT → =",
         "(▽INPUT) → OUTPUT\n    OUTPUT → =",
@@ -34,6 +36,10 @@ fn main() {
         "(abs INPUT) → OUTPUT\n    OUTPUT → =",
         "(ind (INPUT > 1.0)) → OUTPUT\n    OUTPUT → =",
         "(ind (INPUT > 0.0)) → M\n    ◇+ M → OUTPUT\n    OUTPUT → =",
+        // Two inputs: only the table entrypoint can carry these.
+        "AUX:◯ □ {dims}\n    ((INPUT - AUX) × AUX) → OUTPUT\n    OUTPUT → =",
+        "AUX:◯ □ {rows} 1\n    ((INPUT × AUX) > AUX) → OUTPUT\n    OUTPUT → =",
+        "A:◯ □ 2 3 1\n    B:◯ □ 1 3 4\n    ◇+1 (A × B) → OUTPUT\n    OUTPUT → =",
     ];
 
     let mut proved = 0usize;
@@ -44,6 +50,9 @@ fn main() {
 
     for (dims, shape) in shapes.iter() {
         for body in programs.iter().take(rounds) {
+            let body = body
+                .replace("{dims}", dims)
+                .replace("{rows}", &shape[0].to_string());
             let source = format!("{{\n    INPUT:◯ □ {dims}\n    {body}\n}}\n");
             let Ok(block) = parse_rho_program(&source) else {
                 continue;
@@ -55,8 +64,11 @@ fn main() {
                 Verdict::Equivalent => {
                     proved += 1;
                     println!(
-                        "  proved   [{dims}] {headline}   ({} / {} nodes)",
-                        result.source_nodes, result.target_nodes
+                        "  proved   [{dims}] {headline}   ({} / {} nodes, {} entrypoint{})",
+                        result.source_nodes,
+                        result.target_nodes,
+                        result.entrypoints,
+                        if result.entrypoints == 1 { "" } else { "s" }
                     );
                 }
                 Verdict::Differs { cell, witness } => {

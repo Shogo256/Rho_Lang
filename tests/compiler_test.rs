@@ -2486,3 +2486,175 @@ fn test_equilibrium_target_declares_output_in_the_metadata() {
         ]
     );
 }
+
+// --------------------------------------------------------------------------
+// The table entrypoint, read back and proved. The two entrypoints share the
+// lowered body but not the plumbing that hands it buffers, so each is checked
+// on its own — and only the table form can carry a program with two inputs.
+// --------------------------------------------------------------------------
+
+use rho_lang::validate::{expressions_via, validate, Entrypoint};
+
+/// Run the emitted IR through `rho_kernel_exec_spaces` without clang, with the
+/// named inputs supplied and every other space left to the kernel.
+fn run_emitted_ir_spaces(
+    name: &str,
+    source: &str,
+    inputs: &[(&str, Vec<f64>)],
+    out_cells: usize,
+) -> Vec<f64> {
+    let block = parse_rho_program(source).unwrap();
+    let mut codegen = LlvmCodeGen::new(name);
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+
+    let functions = parse_module(&ir);
+    let entry = functions
+        .iter()
+        .find(|f| f.name == "rho_kernel_exec_spaces")
+        .expect("the table entrypoint");
+
+    let mut machine = Machine::new();
+    let dst = machine.add_buffer(vec![0.0; out_cells]);
+    let table: Vec<Value<f64>> = codegen
+        .space_shapes
+        .keys()
+        .map(|space| match inputs.iter().find(|(n, _)| n == space) {
+            Some((_, data)) => Value::P(machine.add_buffer(data.clone()), 0),
+            None if space == "OUTPUT" => Value::P(dst, 0),
+            None => Value::null(),
+        })
+        .collect();
+    let handle = machine.add_table(table);
+    machine
+        .run(entry, &[Value::T(handle, 0)])
+        .unwrap_or_else(|why| panic!("{name}: {why}\n{ir}"));
+    machine.buffer(dst).to_vec()
+}
+
+#[test]
+fn test_the_ir_reader_runs_the_table_entrypoint() {
+    // Two inputs, which the two-pointer form could never have carried.
+    let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b = vec![1.0, 0.0, 2.0, 1.0, 0.0, 1.0, 1.0, 2.0, 3.0, 1.0, 0.0, 1.0];
+    let block = parse_rho_program(MATMUL_2_3_4).unwrap();
+    let mut env = Env::new();
+    env.insert("A".to_string(), Grid::from(vec![2, 3, 1], a.clone()));
+    env.insert("B".to_string(), Grid::from(vec![1, 3, 4], b.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    assert_eq!(meant, vec![10.0, 5.0, 4.0, 8.0, 22.0, 11.0, 13.0, 20.0]);
+
+    let emitted = run_emitted_ir_spaces(
+        "ir_spaces_matmul",
+        MATMUL_2_3_4,
+        &[("A", a), ("B", b)],
+        8,
+    );
+    assert_eq!(emitted, meant);
+
+    // Intermediates left null are the kernel's own, and the answer is the one
+    // the two-pointer entrypoint gives.
+    let input: Vec<f64> = (0..16).map(|i| (i as f64 * 0.7).sin() * 3.0).collect();
+    let via_args = run_emitted_ir("ir_spaces_gradient_ref", GRADIENT_4_4, &input, 16);
+    let via_table = run_emitted_ir_spaces(
+        "ir_spaces_gradient",
+        GRADIENT_4_4,
+        &[("INPUT", input)],
+        16,
+    );
+    assert_eq!(
+        via_table.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        via_args.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_the_table_entrypoint_is_equivalent_to_the_source() {
+    let cases: [(&str, &[usize]); 4] = [
+        // INPUT alone: both entrypoints apply.
+        ("(▷INPUT - INPUT) → D\n        ((D × D) + 1.0) → OUTPUT\n        OUTPUT → =", &[2, 3]),
+        // A second input of the same shape.
+        ("AUX:◯ □ 2 3\n        ((INPUT - AUX) × AUX) → OUTPUT\n        OUTPUT → =", &[2, 3]),
+        // A second input that stretches against INPUT.
+        ("AUX:◯ □ 2 1\n        ((INPUT × AUX) > AUX) → OUTPUT\n        OUTPUT → =", &[2, 3]),
+        // The matrix product, which reads nothing called INPUT at all.
+        (
+            "A:◯ □ 2 3 1\n        B:◯ □ 1 3 4\n        ◇+1 (A × B) → OUTPUT\n        OUTPUT → =",
+            &[2, 3],
+        ),
+    ];
+
+    for (body, shape) in cases {
+        let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+        let source = format!(
+            "{{\n        INPUT:◯ □ {}\n        {body}\n    }}",
+            dims.join(" ")
+        );
+        let block = parse_rho_program(&source).unwrap();
+        let ir = LlvmCodeGen::new("table_equiv").generate_llvm_ir(&block).unwrap();
+
+        let (left, right) =
+            expressions_via(&block, shape, 0.0, &ir, Entrypoint::Spaces).unwrap();
+        assert_eq!(left.len(), right.len(), "{body}");
+        match compare(&left, &right) {
+            Equivalence::Equivalent | Equivalence::NotChecked(_) => {}
+            other => panic!("{body}: {other:?}"),
+        }
+
+        // validate() proves through every entrypoint that can carry the
+        // program, and says how many that was.
+        let result = validate(&block, shape, 0.0);
+        let reads_input_alone = !body.contains("AUX") && !body.contains("A:");
+        match result.verdict {
+            Equivalence::Equivalent => {
+                assert_eq!(result.entrypoints, if reads_input_alone { 2 } else { 1 }, "{body}");
+            }
+            Equivalence::NotChecked(_) => {}
+            other => panic!("{body}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_the_two_pointer_entrypoint_refuses_a_second_input() {
+    // Asking it to carry a program it cannot is an error, not a silent pass.
+    let block = parse_rho_program(MATMUL_2_3_4).unwrap();
+    let ir = LlvmCodeGen::new("two_pointer_refuses").generate_llvm_ir(&block).unwrap();
+    let Err(why) = expressions_via(&block, &[2, 3], 0.0, &ir, Entrypoint::WithArgs) else {
+        panic!("the two-pointer form cannot carry A and B");
+    };
+    assert!(why.contains("carries INPUT alone"), "{why}");
+}
+
+#[test]
+fn test_the_validator_catches_damage_to_the_table_entrypoint_alone() {
+    // Damage inside rho_kernel_exec_spaces leaves the two-pointer form intact,
+    // so a validator that only read the latter would wave it through.
+    let source = "{\n    INPUT:◯ □ 6 1\n    (▷INPUT - INPUT) → D\n    ((D × D) + 1.0) → OUTPUT\n    OUTPUT → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let shape = vec![6usize, 1];
+    let ir = LlvmCodeGen::new("table_control").generate_llvm_ir(&block).unwrap();
+
+    let start = ir.find("define void @rho_kernel_exec_spaces(").unwrap();
+    let end = start + ir[start..].find("\n}\n").unwrap();
+    let broken = format!(
+        "{}{}{}",
+        &ir[..start],
+        ir[start..end].replacen("fadd double", "fsub double", 1),
+        &ir[end..]
+    );
+    assert_ne!(broken, ir, "the table entrypoint should contain an fadd");
+
+    // The two-pointer form still validates...
+    let (left, right) = expressions_of(&block, &shape, 0.0, &broken).unwrap();
+    assert!(matches!(
+        compare(&left, &right),
+        Equivalence::Equivalent | Equivalence::NotChecked(_)
+    ));
+    // ...and the table form is caught.
+    let (left, right) =
+        expressions_via(&block, &shape, 0.0, &broken, Entrypoint::Spaces).unwrap();
+    match compare(&left, &right) {
+        Equivalence::Differs { .. } | Equivalence::NotChecked(_) => {}
+        other => panic!("damage to the table entrypoint went unnoticed: {other:?}"),
+    }
+}

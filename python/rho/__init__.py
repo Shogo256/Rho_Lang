@@ -1,7 +1,61 @@
+"""Python side of ρ (Rho): compile a .rho file with rhoc and call the kernel.
+
+The compiler is found in this order: the RHOC environment variable, `cargo run`
+when this module is imported from a checkout of the repository, and otherwise
+the `rhoc` that `pip install rho-lang` puts next to the interpreter. clang is
+still needed at run time — rhoc emits LLVM IR and asks clang to build the
+shared library.
+"""
+
 import ctypes
 import json
 import os
+import shutil
 import subprocess
+import sys
+import sysconfig
+
+
+def _checkout_root():
+    """The repository this module is imported from, or None once installed."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(os.path.dirname(here))
+    return root if os.path.isfile(os.path.join(root, "Cargo.toml")) else None
+
+
+def rhoc_command():
+    """The command that runs the compiler, as a list for subprocess.
+
+    `RHOC=/path/to/rhoc` overrides everything. Inside a checkout the compiler
+    is built and run with cargo, so an edit to the source is what runs. Once
+    installed from a wheel, the `rhoc` binary shipped in it is used.
+    """
+    explicit = os.environ.get("RHOC")
+    if explicit:
+        return [explicit]
+
+    root = _checkout_root()
+    if root is not None:
+        return [
+            "cargo", "run", "--quiet",
+            "--manifest-path", os.path.join(root, "Cargo.toml"),
+            "--bin", "rhoc", "--",
+        ]
+
+    suffix = ".exe" if sys.platform == "win32" else ""
+    candidates = [
+        os.path.join(sysconfig.get_path("scripts"), "rhoc" + suffix),
+        os.path.join(os.path.dirname(sys.executable), "rhoc" + suffix),
+        shutil.which("rhoc"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return [candidate]
+
+    raise FileNotFoundError(
+        "no rhoc compiler found: `pip install rho-lang`, set RHOC=/path/to/rhoc, "
+        "or import this module from a checkout of the repository"
+    )
 
 
 def _buffer_length(buf):
@@ -40,8 +94,7 @@ class RhoEngine:
         kernel, which is what makes rho_kernel_exec() a genuine zero-copy call
         rather than a read of whatever the .rho source happened to write.
         """
-        cmd = ["cargo", "run", "--quiet", "--bin", "rhoc", "--",
-               rho_file_path, "-o", self.kernel_so_path]
+        cmd = rhoc_command() + [rho_file_path, "-o", self.kernel_so_path]
         if tau is not None:
             cmd += ["--tau", str(tau)]
         if require_contract:

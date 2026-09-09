@@ -1,0 +1,41 @@
+[build-system]
+requires = ["maturin>=1.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "rho-lang"
+description = "Compiler for ρ (Rho): a total, index-free stencil language whose kernels carry their proof"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+authors = [{ name = "Shogo Toda" }]
+keywords = ["stencil", "compiler", "llvm", "verification", "dataflow"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Scientific/Engineering",
+]
+# The version is the crate's, read from Cargo.toml.
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/Escoffier1156/Rho_Lang"
+
+[tool.maturin]
+# The wheel carries the `rhoc` binary as a script and the pure-Python `rho`
+# package; nothing links against Python, so one wheel serves every version.
+bindings = "bin"
+python-source = "python"
+module-name = "rho"
+strip = true
+
+# Only the compiler ships. The differential tester, the validator and the
+# negative control are development tools that stay in the repository.
+[[tool.maturin.targets]]
+name = "rhoc"
+kind = "bin"

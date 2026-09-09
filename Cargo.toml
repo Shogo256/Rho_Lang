@@ -3,6 +3,9 @@ name = "rho-lang"
 version = "0.1.0"
 edition = "2021"
 description = "Compiler for ρ (RHO) Language: Time-eliminated topological dataflow language"
+license = "Apache-2.0"
+repository = "https://github.com/Escoffier1156/Rho_Lang"
+readme = "README.md"
 
 [[bin]]
 name = "rhoc"

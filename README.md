@@ -56,9 +56,26 @@ full language runtime.
 
 ## Quick Start
 
-### 1. Build
+### 1. Install or build
 
-Local toolchain (Rust 1.80+, and clang with LLVM 15 or newer):
+The Python package ships the compiler, so a Rust toolchain is not needed to
+use it. clang (LLVM 15 or newer) is: `rhoc` emits LLVM IR and asks clang to
+build the shared library.
+
+```bash
+pip install rho-lang          # once a release is published to PyPI
+```
+
+Until then, or to install your own build, make the wheel with
+[maturin](https://www.maturin.rs) — CI builds it for Linux, macOS and Windows
+on every push, and uploads it as an artifact:
+
+```bash
+maturin build --release
+pip install target/wheels/rho_lang-*.whl
+```
+
+To work on the compiler itself, build from source (Rust 1.80+ and clang):
 
 ```bash
 git clone https://github.com/Escoffier1156/Rho_Lang.git
@@ -119,7 +136,9 @@ lib.rho_kernel_exec_with_args(src, dst)
 print(list(dst))          # [2.0, 4.0, 6.0, 8.0]
 ```
 
-Or through the wrapper, which checks buffer lengths for you:
+Or through the wrapper, which checks buffer lengths for you. Installed from
+the wheel it runs the `rhoc` it shipped; imported from a checkout it runs
+`cargo run`, so an edit to the compiler is what executes:
 
 ```python
 from rho import RhoEngine
@@ -296,6 +315,7 @@ smooth input drives it to zero and the kernel returns infinities.
 | Reference interpreter + differential testing | ✅ implemented |
 | IR proved equivalent to the source, per shape | ✅ implemented — `--features z3-solver` |
 | C ABI, JSON metadata, Python FFI | ✅ implemented |
+| `pip install rho-lang` | ✅ wheel built in CI for Linux, macOS, Windows; publishing to PyPI waits on a tagged release |
 | AVX-512 / NEON width selection, GPU backends | 📋 planned — the vector width is fixed at four lanes |
 | Tiling and cache blocking | 📋 planned — a sweep is one linear pass |
 | Parallel execution of independent flows | 📋 planned — flows run in source order on one thread |

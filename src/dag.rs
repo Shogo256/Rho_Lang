@@ -102,28 +102,6 @@ impl RhoDag {
         }
     }
 
-    /// Extract independent nodes that can be executed in parallel
-    pub fn extract_parallel_nodes(&self) -> Vec<Vec<String>> {
-        let mut parallel_groups = Vec::new();
-
-        let root_nodes: Vec<String> = self
-            .graph
-            .node_indices()
-            .filter(|&idx| {
-                self.graph
-                    .neighbors_directed(idx, petgraph::Direction::Incoming)
-                    .count()
-                    == 0
-            })
-            .map(|idx| self.graph[idx].label.clone())
-            .collect();
-
-        if !root_nodes.is_empty() {
-            parallel_groups.push(root_nodes);
-        }
-
-        parallel_groups
-    }
 }
 
 fn extract_dependencies(expr: &Expr) -> Vec<String> {

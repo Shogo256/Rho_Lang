@@ -900,3 +900,96 @@ fn test_distinct_shifts_keep_distinct_boundaries() {
     // A = [0,1,2,3,4,5,6,7], B = [2,3,4,5,6,7,8,0]
     assert_eq!(out, vec![-2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0, 7.0]);
 }
+
+#[test]
+fn test_zero_copy_binding_writes_the_supplied_address() {
+    // --bind bakes a caller's address into the kernel, which is what makes
+    // rho_kernel_exec() — the no-argument entrypoint — reachable at all.
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        (INPUT + 100.0) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+
+    let mut grid: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0];
+    let address = grid.as_ptr() as u64;
+
+    let mut codegen = LlvmCodeGen::new("zero_copy").bind("INPUT", address);
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    let so_path = "target/zero_copy.so";
+    assert!(codegen.compile_to_so(&ir, so_path).is_ok());
+
+    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
+    let func: libloading::Symbol<unsafe extern "C" fn()> =
+        unsafe { lib.get(b"rho_kernel_exec").unwrap() };
+    unsafe { func() };
+
+    // No pointer was passed, yet the caller's buffer changed in place.
+    assert_eq!(grid, vec![101.0, 102.0, 103.0, 104.0]);
+}
+
+#[test]
+fn test_unbound_input_makes_the_zero_copy_entrypoint_inert() {
+    // Without an address there is nothing to read, so the entrypoint must
+    // return rather than dereference whatever the source literal happened to be.
+    let source = r#"{
+        &[0x7A4F]:INPUT:◯ □ 4 1
+        (INPUT + 1.0) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let ir = LlvmCodeGen::new("literal_addr")
+        .generate_llvm_ir(&block)
+        .unwrap();
+
+    // The literal from the source is still honoured; only an unbound INPUT is inert.
+    assert!(ir.contains("inttoptr i64 31311"), "{ir}");
+
+    let no_binding = r#"{
+        INPUT:◯ □ 4 1
+        (INPUT + 1.0) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(no_binding).unwrap();
+    let ir = LlvmCodeGen::new("no_addr").generate_llvm_ir(&block).unwrap();
+    let exec = ir
+        .split("define void @rho_kernel_exec()")
+        .nth(1)
+        .and_then(|s| s.split("\n}").next())
+        .expect("exec entrypoint");
+    assert!(
+        exec.contains("has no & binding"),
+        "unbound INPUT should make the entrypoint inert:\n{exec}"
+    );
+}
+
+#[test]
+fn test_tau_binds_the_threshold_symbol() {
+    // 𝜏 defaults to 0.0; --tau moves the threshold the mask compares against.
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        INPUT > 𝜏 → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let input = [1.0, 2.0, 3.0, 4.0];
+
+    for (tau, expected) in [
+        (0.0, vec![1.0, 2.0, 3.0, 4.0]),
+        (2.0, vec![0.0, 0.0, 3.0, 4.0]),
+        (10.0, vec![0.0, 0.0, 0.0, 0.0]),
+    ] {
+        let name = format!("tau_{}", tau as i64);
+        let mut codegen = LlvmCodeGen::new(&name).with_tau(tau);
+        let ir = codegen.generate_llvm_ir(&block).unwrap();
+        let so_path = format!("target/{name}.so");
+        assert!(codegen.compile_to_so(&ir, &so_path).is_ok());
+
+        let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
+        let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
+            unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+        let mut out = vec![0.0; 4];
+        unsafe { func(input.as_ptr(), out.as_mut_ptr()) };
+        assert_eq!(out, expected, "tau = {tau}");
+    }
+}

@@ -67,8 +67,10 @@ Marks reflect what the compiler does today, not what a step describes.
 * Extend `rho.py` and the C-ABI integration, allowing deep learning frameworks (PyTorch, TensorFlow, NumPy) to pass raw memory buffer pointers straight to RHO shared libraries (`.so`).
 * Provide runtime Metadata API mapping so Python can automatically verify tensor layouts.
 
-### ✅ Step 5.2: Benchmark Suites & Case Studies
-* Include concrete performance comparisons (e.g., Convolution 2D, FFT, Matrix Mul) benchmarking ρ (RHO) against raw NumPy and BLAS libraries.
+### 🚧 Step 5.2: Benchmark Suites & Case Studies
+* ✅ `benches/benchmark.py` runs one expression over the same element count in pure Python, NumPy and RHO, and checks the kernel against the Python baseline before reporting a ratio.
+* 📋 Convolution 2D, FFT and matrix multiplication are not benchmarked. Matrix multiplication is not expressible yet — it needs a reduction operator.
+* 📋 Nothing is compared against BLAS.
 
 ### ✅ Step 5.3: Inline `@rho.compile` Decorator for Python
 * Allow developers to write inline ρ language blocks directly inside Python function docstrings.

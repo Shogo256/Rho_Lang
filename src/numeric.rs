@@ -35,6 +35,9 @@ pub trait Numeric: Clone + fmt::Debug {
     fn power(&self, other: &Self) -> Self;
     /// A named function over one value.
     fn unary(&self, op: BuiltinOp) -> Self;
+    /// The largest whole number not above the value. What a residue is built
+    /// from; not a named function of the language.
+    fn floor(&self) -> Self;
 
     fn compare(&self, other: &Self, how: Compare) -> Self::Bool;
     fn select(condition: &Self::Bool, when_true: &Self, when_false: &Self) -> Self;
@@ -67,6 +70,9 @@ impl Numeric for f64 {
     }
     fn power(&self, other: &Self) -> Self {
         f64::powf(*self, *other)
+    }
+    fn floor(&self) -> Self {
+        f64::floor(*self)
     }
     fn unary(&self, op: BuiltinOp) -> Self {
         match op {
@@ -189,6 +195,9 @@ impl Numeric for f32 {
     }
     fn power(&self, other: &Self) -> Self {
         f32::powf(*self, *other)
+    }
+    fn floor(&self) -> Self {
+        f32::floor(*self)
     }
     fn unary(&self, op: BuiltinOp) -> Self {
         match op {

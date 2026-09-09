@@ -61,6 +61,12 @@ pub enum Sym {
     Mul(Box<Sym>, Box<Sym>),
     Div(Box<Sym>, Box<Sym>),
     Pow(Box<Sym>, Box<Sym>),
+    /// The greater and the lesser of two values.
+    Max(Box<Sym>, Box<Sym>),
+    Min(Box<Sym>, Box<Sym>),
+    /// APL's residue of the right by the left: the sign of the left, or the
+    /// right itself when the left is zero.
+    Residue(Box<Sym>, Box<Sym>),
     /// `lhs` where the comparison holds, `0` elsewhere.
     Mask {
         cmp: Cmp,
@@ -244,6 +250,9 @@ impl Builder<'_> {
                     BinaryOpKind::Mul => Sym::Mul(Box::new(l), Box::new(r)),
                     BinaryOpKind::Div => Sym::Div(Box::new(l), Box::new(r)),
                     BinaryOpKind::Pow => Sym::Pow(Box::new(l), Box::new(r)),
+                    BinaryOpKind::Max => Sym::Max(Box::new(l), Box::new(r)),
+                    BinaryOpKind::Min => Sym::Min(Box::new(l), Box::new(r)),
+                    BinaryOpKind::Residue => Sym::Residue(Box::new(l), Box::new(r)),
                     other => Sym::Mask {
                         cmp: Cmp::from_op(other).unwrap_or(Cmp::Eq),
                         lhs: Box::new(l),

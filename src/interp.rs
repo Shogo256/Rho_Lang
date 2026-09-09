@@ -405,12 +405,47 @@ fn eval_cell<S: Numeric>(
                 BinaryOpKind::Gte => mask(Compare::Gte),
                 BinaryOpKind::Lte => mask(Compare::Lte),
                 BinaryOpKind::Eq => mask(Compare::Eq),
+                // The greater and the lesser, as IEEE 754-2019 defines them.
+                BinaryOpKind::Max => extreme(&l, &r, true),
+                BinaryOpKind::Min => extreme(&l, &r, false),
+                // APL's residue: B - A × ⌊B ÷ A⌋, so the result takes the
+                // sign of A, and 0 | B is B.
+                BinaryOpKind::Residue => {
+                    let quotient = r.div(&l).floor();
+                    let remainder = r.sub(&l.mul(&quotient));
+                    S::select(&l.compare(&zero, Compare::Eq), &r, &remainder)
+                }
             })
         }
     }
 }
 
 
+
+/// IEEE 754-2019 `maximum` (`greater`) or `minimum`: a NaN on either side is
+/// the answer, -0 orders below +0, and otherwise the greater or the lesser.
+/// These are the rules the kernel's intrinsics follow, spelled out with the
+/// operations the trait has: a value that is not equal to itself is a NaN,
+/// and the sign of a zero shows in its reciprocal.
+fn extreme<S: Numeric>(l: &S, r: &S, greater: bool) -> S {
+    let one = S::constant(1.0);
+    let by_value = if greater {
+        S::select(&l.compare(r, Compare::Gt), l, r)
+    } else {
+        S::select(&l.compare(r, Compare::Lt), l, r)
+    };
+    // Equal values that differ in the sign of zero: order by the reciprocal,
+    // which is -inf for -0 and +inf for +0.
+    let (inv_l, inv_r) = (one.div(l), one.div(r));
+    let by_sign = if greater {
+        S::select(&inv_l.compare(&inv_r, Compare::Gt), l, r)
+    } else {
+        S::select(&inv_l.compare(&inv_r, Compare::Lt), l, r)
+    };
+    let ordered = S::select(&l.compare(r, Compare::Eq), &by_sign, &by_value);
+    let r_or_ordered = S::select(&r.compare(r, Compare::Ne), r, &ordered);
+    S::select(&l.compare(l, Compare::Ne), l, &r_or_ordered)
+}
 
 /// Evaluate an expression at one cell of its own shape.
 fn eval_at<S: Numeric>(

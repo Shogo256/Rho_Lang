@@ -31,6 +31,8 @@ Working prototype. What runs today:
 - Scans `◈+` `◈×` `◈>` `◈<` for running totals, which keep the shape they walk
 - Named functions `exp` `log` `sqrt` `sin` `cos` `abs`, with their domains
   checked, and `ind` so a program can count
+- APL's dyadic `⌈` `⌊` `|` — the greater, the lesser and the residue — so a
+  ReLU is `X ⌈ 0.0`, a clamp is `(X ⌊ 1.0) ⌈ -1.0`, and `3.0 | X` is X mod 3
 - `--f32` for single precision, with the interpreter and the `!` check
   following the width
 - `□` lifting and broadcasting, so an outer product — and a matrix product — is

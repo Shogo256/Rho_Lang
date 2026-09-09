@@ -13,6 +13,13 @@ pub enum BinaryOpKind {
     Gte, // >=
     Lte, // <=
     Eq,  // ==
+    /// `⌈` — the greater of the two, element-wise (APL's dyadic ⌈)
+    Max,
+    /// `⌊` — the lesser of the two, element-wise (APL's dyadic ⌊)
+    Min,
+    /// `|` — APL's residue: `A | B` is B modulo A, with the sign of A,
+    /// and `0 | B` is B
+    Residue,
 }
 
 impl fmt::Display for BinaryOpKind {
@@ -28,6 +35,9 @@ impl fmt::Display for BinaryOpKind {
             BinaryOpKind::Gte => write!(f, ">="),
             BinaryOpKind::Lte => write!(f, "<="),
             BinaryOpKind::Eq => write!(f, "=="),
+            BinaryOpKind::Max => write!(f, "⌈"),
+            BinaryOpKind::Min => write!(f, "⌊"),
+            BinaryOpKind::Residue => write!(f, "|"),
         }
     }
 }

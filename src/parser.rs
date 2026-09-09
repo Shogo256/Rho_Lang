@@ -7,7 +7,7 @@ pub fn validate_symbols(input: &str) -> Result<()> {
     let code_only = remove_comments(input);
 
     let allowed_unicode: HashSet<char> = [
-        '◯', '□', '▷', '▽', '△', '◇', '◈', '+', '-', '×', '*', '/', '^', '→', '⇒', '<', '>', '=', ':', '{', '}', '$', '&', '!',
+        '◯', '□', '▷', '▽', '△', '◇', '◈', '+', '-', '×', '*', '/', '^', '⌈', '⌊', '|', '→', '⇒', '<', '>', '=', ':', '{', '}', '$', '&', '!',
         '(', ')', '[', ']', ';', ',', '.', ' ', '\t', '\r', '\n', '_', '𝜏', 'τ'
     ].iter().cloned().collect();
 
@@ -59,6 +59,10 @@ pub fn normalize_ascii_aliases(input: &str) -> String {
         // <.> before <>, and both before << and >>, so a scan is not read as a
         // fold and neither is read as two shifts.
         .replace("<.>", "◈")
+        // The greater and the lesser of two, spelled after the fold glyphs
+        // `◇>` and `◇<` that mean the same thing.
+        .replace(">.", "⌈")
+        .replace("<.", "⌊")
         .replace("<>", "◇")
         // [] never appears in an address binding, which is always &[0x...].
         .replace("[]", "□")
@@ -289,6 +293,11 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         ("<", BinaryOpKind::Lt),
         ("+", BinaryOpKind::Add),
         ("-", BinaryOpKind::Sub),
+        // Tighter than a sum, looser than a product: `A + B ⌈ C × D` is
+        // `A + (B ⌈ (C × D))`.
+        ("⌈", BinaryOpKind::Max),
+        ("⌊", BinaryOpKind::Min),
+        ("|", BinaryOpKind::Residue),
         ("×", BinaryOpKind::Mul),
         ("*", BinaryOpKind::Mul),
         ("/", BinaryOpKind::Div),
@@ -480,8 +489,8 @@ fn is_sign_position(before: &str) -> bool {
         None => true,
         Some(c) => matches!(
             c,
-            '+' | '-' | '×' | '*' | '/' | '^' | '>' | '<' | '=' | '(' | ':' | '→'
-                | '◇' | '◈' | '▷' | '▽' | '□' | '!' | '$'
+            '+' | '-' | '×' | '*' | '/' | '^' | '⌈' | '⌊' | '|' | '>' | '<' | '=' | '('
+                | ':' | '→' | '◇' | '◈' | '▷' | '▽' | '□' | '!' | '$'
         ),
     }
 }

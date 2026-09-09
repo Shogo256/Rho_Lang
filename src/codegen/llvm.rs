@@ -266,7 +266,23 @@ impl LlvmCodeGen {
                 w = VECTOR_WIDTH
             ));
         }
-        for name in ["exp", "log", "sqrt", "sin", "cos", "fabs"] {
+        // The greater and the lesser are IEEE 754-2019 maximum and minimum:
+        // a NaN propagates and -0 orders below +0. Both are fully specified,
+        // which a compare-and-select is not once the optimiser treats it as
+        // a NaN-free minimum: at -O2 that folding turned `NaN < 0 ? NaN : 0`
+        // into NaN. An intrinsic cannot be re-read that way.
+        for name in ["maximum", "minimum"] {
+            ir.push_str(&format!(
+                "declare {elem} @llvm.{name}.{suffix}({elem}, {elem})\n"
+            ));
+            if self.simd {
+                ir.push_str(&format!(
+                    "declare <{w} x {elem}> @llvm.{name}.v{w}{suffix}(<{w} x {elem}>, <{w} x {elem}>)\n",
+                    w = VECTOR_WIDTH
+                ));
+            }
+        }
+        for name in ["exp", "log", "sqrt", "sin", "cos", "fabs", "floor"] {
             ir.push_str(&format!(
                 "declare {elem} @llvm.{name}.{suffix}({elem})\n"
             ));
@@ -1867,6 +1883,47 @@ impl LlvmCodeGen {
                             "  {out} = select {} {flag}, {ty} {l}, {ty} {}\n",
                             mode.bool_ty(),
                             mode.zero()
+                        ));
+                    }
+                    // The greater and the lesser: IEEE maximum and minimum, so
+                    // a NaN propagates as it does through every other operation
+                    // and -0 orders below +0. See the declarations for why a
+                    // compare-and-select would not do.
+                    BinaryOpKind::Max | BinaryOpKind::Min => {
+                        let name = if matches!(op, BinaryOpKind::Max) {
+                            "maximum"
+                        } else {
+                            "minimum"
+                        };
+                        ir.push_str(&format!(
+                            "  {out} = call {ty} {}({ty} {l}, {ty} {r})\n",
+                            mode.unary_intrinsic(name)
+                        ));
+                    }
+                    // APL's residue, computed as written: B - A × ⌊B ÷ A⌋, with
+                    // 0 | B being B. Every step rounds once, as the interpreter's
+                    // does; `frem` would round differently and take the sign of
+                    // B rather than of A.
+                    BinaryOpKind::Residue => {
+                        let quotient = Self::fresh(counter);
+                        let floored = Self::fresh(counter);
+                        let product = Self::fresh(counter);
+                        let remainder = Self::fresh(counter);
+                        let zero_modulus = Self::fresh(counter);
+                        ir.push_str(&format!("  {quotient} = fdiv {ty} {r}, {l}\n"));
+                        ir.push_str(&format!(
+                            "  {floored} = call {ty} {}({ty} {quotient})\n",
+                            mode.unary_intrinsic("floor")
+                        ));
+                        ir.push_str(&format!("  {product} = fmul {ty} {l}, {floored}\n"));
+                        ir.push_str(&format!("  {remainder} = fsub {ty} {r}, {product}\n"));
+                        ir.push_str(&format!(
+                            "  {zero_modulus} = fcmp oeq {ty} {l}, {}\n",
+                            mode.zero()
+                        ));
+                        ir.push_str(&format!(
+                            "  {out} = select {} {zero_modulus}, {ty} {r}, {ty} {remainder}\n",
+                            mode.bool_ty()
                         ));
                     }
                 }

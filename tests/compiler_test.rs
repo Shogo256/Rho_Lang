@@ -2705,3 +2705,135 @@ fn test_a_running_sum_of_ones_is_an_index() {
         vec![1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0]
     );
 }
+
+// --------------------------------------------------------------------------
+// The greater, the lesser and the residue: APL's dyadic ⌈ ⌊ |, element-wise.
+// --------------------------------------------------------------------------
+
+use rho_lang::ast::{BinaryOpKind, Expr};
+use rho_lang::parser::parse_expr;
+
+#[test]
+fn test_max_min_and_residue_parse_with_their_aliases_and_precedence() {
+    // `>.` and `<.` spell the greater and the lesser, after the fold glyphs
+    // `◇>` and `◇<` that mean the same thing; `|` is itself.
+    let block = parse_rho_program(
+        "{\n    INPUT:◯ □ 4 1\n    ((INPUT >. 0.0) <. 1.0) → C\n    (3.0 | C) → =\n}",
+    )
+    .unwrap();
+    let rho_lang::ast::Statement::Flow { src, .. } = &block.statements[1] else {
+        panic!("a flow")
+    };
+    assert!(matches!(src, Expr::BinaryOp { op: BinaryOpKind::Min, .. }));
+    let rho_lang::ast::Statement::Flow { src, .. } = &block.statements[2] else {
+        panic!("a flow")
+    };
+    assert!(matches!(src, Expr::BinaryOp { op: BinaryOpKind::Residue, .. }));
+
+    // Tighter than a sum, looser than a product.
+    let e = parse_expr("A + B ⌈ C × D").unwrap();
+    let Expr::BinaryOp { op: BinaryOpKind::Add, rhs, .. } = e else {
+        panic!("{e:?}")
+    };
+    let Expr::BinaryOp { op: BinaryOpKind::Max, rhs, .. } = *rhs else {
+        panic!("{rhs:?}")
+    };
+    assert!(matches!(*rhs, Expr::BinaryOp { op: BinaryOpKind::Mul, .. }));
+
+    // A sign after any of them is a sign.
+    let e = parse_expr("A ⌈ -1.0").unwrap();
+    assert!(matches!(e, Expr::BinaryOp { op: BinaryOpKind::Max, .. }));
+}
+
+#[test]
+fn test_max_min_and_residue_compute_as_apl_says_in_kernel_and_interpreter() {
+    let input: Vec<f64> = vec![-7.5, -3.0, -0.5, 0.0, 0.5, 2.0, 7.0, 9.25];
+    type Case = (&'static str, &'static str, fn(f64) -> f64);
+    let cases: [Case; 6] = [
+        ("relu", "(INPUT ⌈ 0.0) → =", |x| if x > 0.0 { x } else { 0.0 }),
+        ("clamp", "((INPUT ⌊ 1.0) ⌈ -1.0) → =", |x| x.clamp(-1.0, 1.0)),
+        // B modulo A, with the sign of A: 3 | -7.5 is 1.5, -3 | 7 is -2.
+        ("residue", "(3.0 | INPUT) → =", |x| x - 3.0 * (x / 3.0).floor()),
+        ("negative_modulus", "(-3.0 | INPUT) → =", |x| x - (-3.0) * (x / -3.0).floor()),
+        // A zero modulus hands the right side through.
+        ("zero_modulus", "((INPUT × 0.0) | INPUT) → =", |x| x),
+        // The modulus taken from the grid, including 0.
+        ("grid_modulus", "(INPUT | 5.0) → =", |x| if x == 0.0 { 5.0 } else { 5.0 - x * (5.0 / x).floor() }),
+    ];
+    for (name, body, expected) in cases {
+        let source = format!("{{\n    INPUT:◯ □ 8 1\n    {body}\n}}");
+        let block = parse_rho_program(&source).unwrap();
+        let mut env: Env<f64> = Env::new();
+        env.insert("INPUT".to_string(), Grid::from(vec![8, 1], input.clone()));
+        let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+        let want: Vec<f64> = input.iter().map(|x| expected(*x)).collect();
+        assert_eq!(meant, want, "{name}: the interpreter");
+
+        let out = run_kernel(&format!("apl_{name}"), &source, &input);
+        assert_eq!(bits(&out[..8]), bits(&meant), "{name}: the kernel against the interpreter");
+    }
+}
+
+#[test]
+fn test_max_and_min_propagate_nan_and_order_the_zeros() {
+    // IEEE maximum and minimum: a NaN on either side is the answer, and -0
+    // orders below +0. The kernel and the interpreter agree bit for bit.
+    let input = vec![f64::NAN, 1.0, -2.0, 0.0, -0.0, f64::NAN, 0.0, -0.0];
+    let cases: [(&str, &str); 4] = [
+        ("nan_left", "(INPUT ⌈ 0.0) → ="),
+        ("nan_right", "(0.0 ⌊ INPUT) → ="),
+        ("zero_max", "(INPUT ⌈ -0.0) → ="),
+        ("zero_min", "(0.0 ⌊ INPUT) → ="),
+    ];
+    for (name, body) in cases {
+        let source = format!("{{\n    INPUT:◯ □ 8 1\n    {body}\n}}");
+        let block = parse_rho_program(&source).unwrap();
+        let mut env: Env<f64> = Env::new();
+        env.insert("INPUT".to_string(), Grid::from(vec![8, 1], input.clone()));
+        let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+        let out = run_kernel(&format!("apl_{name}"), &source, &input);
+        for (i, (a, b)) in out[..8].iter().zip(&meant).enumerate() {
+            assert!(
+                (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits(),
+                "{name} cell {i}: kernel {a:?} interpreter {b:?}"
+            );
+        }
+        match name {
+            "nan_left" | "nan_right" => assert!(meant[0].is_nan() && meant[5].is_nan()),
+            "zero_max" => {
+                // 0 ⌈ -0 and -0 ⌈ -0: +0 wins wherever it appears.
+                assert_eq!(meant[3].to_bits(), 0.0f64.to_bits());
+                assert_eq!(meant[4].to_bits(), (-0.0f64).to_bits());
+            }
+            _ => {
+                // 0 ⌊ 0 is +0, 0 ⌊ -0 is -0.
+                assert_eq!(meant[3].to_bits(), 0.0f64.to_bits());
+                assert_eq!(meant[4].to_bits(), (-0.0f64).to_bits());
+            }
+        }
+    }
+
+    // The case the optimiser once folded wrong: a NaN through a minimum with
+    // a boundary zero, then a mask.
+    let source = "{\n    INPUT:◯ □ 4 1\n    INPUT → T1\n    (((▽T1) ⌊ T1) < (▽T1)) → =\n}";
+    let nan = vec![f64::NAN; 4];
+    let out = run_kernel("apl_folded_nan", source, &nan);
+    assert!(out[..4].iter().all(|v| *v == 0.0), "{out:?}");
+}
+
+#[test]
+fn test_the_intervals_know_max_min_and_residue() {
+    // ReLU is never negative; a residue by a positive modulus is never
+    // negative and never reaches the modulus.
+    let report = analyze("{\n    INPUT:◯ □ 4 1\n    (INPUT ⌈ 0.0) → OUTPUT\n    ! (OUTPUT >= 0)\n    OUTPUT → =\n}");
+    assert_eq!(report.constraints[0].verdict, rho_lang::solver::Verdict::Proved);
+    assert_eq!(report.output_range.lo, 0.0);
+
+    let report = analyze("{\n    INPUT:◯ □ 4 1\n    (2.0 | INPUT) → OUTPUT\n    ! (OUTPUT >= 0)\n    ! (OUTPUT <= 3.0)\n    OUTPUT → =\n}");
+    assert_eq!(report.constraints[0].verdict, rho_lang::solver::Verdict::Proved);
+    assert_eq!(report.constraints[1].verdict, rho_lang::solver::Verdict::Proved);
+
+    // A clamp bounds both ends.
+    let report = analyze("{\n    INPUT:◯ □ 4 1\n    ((INPUT ⌊ 1.0) ⌈ -1.0) → OUTPUT\n    OUTPUT → =\n}");
+    assert_eq!((report.output_range.lo, report.output_range.hi), (-1.0, 1.0));
+}

@@ -366,6 +366,40 @@ pub fn eval_interval(sym: &Sym) -> Interval {
         Sym::Mul(a, b) => rounded(mul(eval_interval(a), eval_interval(b))),
         Sym::Div(a, b) => rounded(div(eval_interval(a), eval_interval(b))),
         Sym::Pow(a, b) => rounded(pow(eval_interval(a), eval_interval(b))),
+        // Exact: a select never rounds.
+        Sym::Max(a, b) => {
+            let (a, b) = (eval_interval(a), eval_interval(b));
+            Interval {
+                lo: a.lo.max(b.lo),
+                hi: a.hi.max(b.hi),
+            }
+        }
+        Sym::Min(a, b) => {
+            let (a, b) = (eval_interval(a), eval_interval(b));
+            Interval {
+                lo: a.lo.min(b.lo),
+                hi: a.hi.min(b.hi),
+            }
+        }
+        // The residue takes the sign of the modulus and stays below it in
+        // magnitude; a modulus that can be zero hands the right side through.
+        Sym::Residue(a, b) => {
+            let (a, b) = (eval_interval(a), eval_interval(b));
+            let within = if a.lo > 0.0 {
+                Interval { lo: 0.0, hi: a.hi }
+            } else if a.hi < 0.0 {
+                Interval { lo: a.lo, hi: 0.0 }
+            } else {
+                Interval::hull(
+                    b,
+                    Interval {
+                        lo: a.lo.min(0.0),
+                        hi: a.hi.max(0.0),
+                    },
+                )
+            };
+            rounded(within)
+        }
         // A boundary cell contributes 0; an interior one contributes its value.
         Sym::Boundary { interior, .. } => {
             Interval::hull(Interval::point(0.0), eval_interval(interior))

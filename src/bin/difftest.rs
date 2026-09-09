@@ -13,9 +13,10 @@
 //!
 //!     cargo run --release --bin difftest -- [seed] [rounds]
 
+use rho_lang::ast::BuiltinOp;
 use rho_lang::codegen::LlvmCodeGen;
 use rho_lang::interp::{interpret_with, Env, Grid, Options};
-use rho_lang::numeric::Precision;
+use rho_lang::numeric::{Compare, Numeric, Precision};
 use rho_lang::parser::parse_rho_program;
 use rho_lang::solver::{ConstraintSolver, Verdict};
 use std::collections::BTreeMap;
@@ -64,6 +65,90 @@ fn run_so<T: Copy + Default>(
         }
     }
     (output, via_args)
+}
+
+/// A number that remembers whether anything non-finite went into it.
+///
+/// The `!` analysis assumes no overflow and no NaN. A run that broke that
+/// assumption is not a counterexample to anything the analysis said — but
+/// whether it broke it cannot be read off the output, since a mask, a `⌈`
+/// or an `ind` turns a NaN back into a finite number. So the interpreter is
+/// run once more on values that carry a taint: any operation that sees or
+/// produces an infinity or a NaN poisons its result, and poison flows through
+/// every operation including a select, because the kernel computes both arms.
+#[derive(Clone, Copy, Debug)]
+struct Traced<S> {
+    value: S,
+    poisoned: bool,
+}
+
+impl<S: Numeric + Copy> Traced<S> {
+    fn of(value: S, from: &[bool]) -> Traced<S> {
+        let finite = value.as_constant().is_some_and(f64::is_finite);
+        Traced {
+            value,
+            poisoned: !finite || from.iter().any(|p| *p),
+        }
+    }
+}
+
+impl<S: Numeric + Copy> Numeric for Traced<S> {
+    type Bool = bool;
+
+    fn constant(value: f64) -> Self {
+        Traced::of(S::constant(value), &[])
+    }
+    fn as_constant(&self) -> Option<f64> {
+        self.value.as_constant()
+    }
+    fn add(&self, o: &Self) -> Self {
+        Traced::of(self.value.add(&o.value), &[self.poisoned, o.poisoned])
+    }
+    fn sub(&self, o: &Self) -> Self {
+        Traced::of(self.value.sub(&o.value), &[self.poisoned, o.poisoned])
+    }
+    fn mul(&self, o: &Self) -> Self {
+        Traced::of(self.value.mul(&o.value), &[self.poisoned, o.poisoned])
+    }
+    fn div(&self, o: &Self) -> Self {
+        Traced::of(self.value.div(&o.value), &[self.poisoned, o.poisoned])
+    }
+    fn power(&self, o: &Self) -> Self {
+        Traced::of(self.value.power(&o.value), &[self.poisoned, o.poisoned])
+    }
+    fn unary(&self, op: BuiltinOp) -> Self {
+        Traced::of(self.value.unary(op), &[self.poisoned])
+    }
+    fn floor(&self) -> Self {
+        Traced::of(self.value.floor(), &[self.poisoned])
+    }
+    fn compare(&self, o: &Self, how: Compare) -> bool {
+        S::truth(&self.value.compare(&o.value, how))
+    }
+    fn select(condition: &bool, a: &Self, b: &Self) -> Self {
+        let chosen = if *condition { a.value } else { b.value };
+        Traced::of(chosen, &[a.poisoned, b.poisoned])
+    }
+    fn truth(flag: &bool) -> bool {
+        *flag
+    }
+}
+
+/// Whether the interpreter, run on tainted values at width `S`, reaches the
+/// output without any operation on its way having touched a non-finite
+/// number. `None` when the run fails outright.
+fn stays_within_assumptions<S: Numeric + Copy>(
+    block: &rho_lang::ast::ToposBlock,
+    inputs: &BTreeMap<String, Vec<S>>,
+    shapes: &BTreeMap<String, Vec<usize>>,
+) -> Option<bool> {
+    let mut env: Env<Traced<S>> = Env::new();
+    for (name, data) in inputs {
+        let cells = data.iter().map(|v| Traced::of(*v, &[])).collect();
+        env.insert(name.clone(), Grid::from(shapes[name].clone(), cells));
+    }
+    let out = interpret_with(block, &env, &RUN).ok()?;
+    Some(out.get("OUTPUT")?.cells.iter().all(|c| !c.poisoned))
 }
 
 /// A number whose agreement is judged on its bits.
@@ -189,7 +274,7 @@ fn expression(
         }
 
         _ => {
-            let op = ["+", "-", "×", "/", ">", "<"][rng.below(6)];
+            let op = ["+", "-", "×", "/", ">", "<", "⌈", "⌊", "|"][rng.below(9)];
             let lhs = expression(rng, depth - 1, spaces, want);
             // A space whose shape stretches against `want` — a length-1 axis
             // against a longer one — exercises broadcasting. The other side
@@ -486,7 +571,12 @@ fn main() {
         // either is not a counterexample to anything.
         let report = ConstraintSolver::analyze_at(&block, RUN.tau, Precision::F64);
         let produced = &output[..expected.len()];
-        if produced.iter().all(|v| v.is_finite()) {
+        let mut input_shapes: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        input_shapes.insert("INPUT".to_string(), shape.clone());
+        if let Some(aux_shape) = &aux {
+            input_shapes.insert("AUX".to_string(), aux_shape.clone());
+        }
+        if stays_within_assumptions(&block, &inputs, &input_shapes) == Some(true) {
             claims_checked += 1;
             let (lo, hi) = (report.output_range.lo, report.output_range.hi);
             if let Some(cell) = produced.iter().position(|v| *v < lo || *v > hi) {
@@ -558,7 +648,9 @@ fn main() {
                                 ConstraintSolver::analyze_at(&block, RUN.tau, Precision::F32);
                             let produced: Vec<f64> =
                                 got[..meant.len()].iter().map(|v| *v as f64).collect();
-                            if produced.iter().all(|v| v.is_finite()) {
+                            if stays_within_assumptions(&block, &narrow, &input_shapes)
+                                == Some(true)
+                            {
                                 let (lo, hi) =
                                     (narrow_report.output_range.lo, narrow_report.output_range.hi);
                                 if let Some(cell) =

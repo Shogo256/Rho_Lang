@@ -48,6 +48,9 @@ principle.
 | `×` / `*` | Multiplication | Scaling | Element-wise product | ✅ |
 | `/` | Division | Distortion | Element-wise division | ✅ |
 | `^` | Exponentiation | Expansion | Element-wise power; a whole exponent is repeated multiplication | ✅ |
+| `⌈` / `>.` | Greater | — | The greater of two, element-wise (APL's dyadic `⌈`) | ✅ |
+| `⌊` / `<.` | Lesser | — | The lesser of two, element-wise (APL's dyadic `⌊`) | ✅ |
+| `\|` | Residue | — | `A \| B` is B modulo A, with the sign of A; `0 \| B` is B (APL's `\|`) | ✅ |
 | `→` | Flow | Ruten (流転) | One full sweep of the grid into the target | ✅ |
 | `⇒` | Fixed Point | Iteration | Repeats a flow until no cell moves by more than 𝜏, or the cap is reached, see §3.3 | ✅ |
 | `<` `>` | Threshold | Boundary Condition | Masking compare, see §3.3 | ✅ |
@@ -60,8 +63,30 @@ principle.
 | `!` | Constraint | Invariant Check | Statically verified, see §4 | ✅ |
 | `→ =` | Convergence | — | Writes the caller's output buffer | ✅ |
 
-ASCII aliases: `->` for `→`, `=>` for `⇒`, `>>` for `▷`, `<<` for `▽`, `@` for `&`,
+ASCII aliases: `->` for `→`, `=>` for `⇒`, `>>` for `▷`, `<<` for `▽`, `>.` for `⌈`, `<.` for `⌊`, `@` for `&`,
 `<>` for `◇`, `<.>` for `◈`, `[]` for `□`.
+
+### The greater, the lesser and the residue
+
+`A ⌈ B` and `A ⌊ B` are the greater and the lesser of two cells, so `X ⌈ 0.0`
+is a ReLU and `(X ⌊ 1.0) ⌈ -1.0` a clamp. They are written as APL writes them,
+and their ASCII forms `>.` and `<.` follow the fold glyphs `◇>` and `◇<`, which
+mean the same thing over an axis. Both bind tighter than `+ -` and looser than
+`× /`.
+
+They are IEEE 754-2019's `maximum` and `minimum`: a NaN on either side is the
+answer, as it is for every other operation, and `-0` orders below `+0`, so
+`0.0 ⌈ -0.0` is `+0` and `0.0 ⌊ -0.0` is `-0`. The kernel calls the intrinsics
+of that name rather than lowering a compare and a select, because the
+optimiser reads a compare-and-select as a NaN-free minimum: at `-O2` it turned
+`NaN < 0 ? NaN : 0` into NaN. The differential test found that within a few
+hundred programs of the operators arriving.
+
+`A | B` is APL's residue: B modulo A, computed as `B - A × ⌊B ÷ A⌋`, so the
+result takes the sign of A — `3 | -7.5` is `1.5`, `-3 | 7` is `-2` — and
+`0 | B` is B. The modulus is on the left, as in APL, which is what makes
+`n | ⍳X` read as it should. It is computed as written, one rounding per step;
+`frem` would round differently and take the sign of B.
 
 ### Named functions
 

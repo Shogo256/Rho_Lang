@@ -246,11 +246,13 @@ fn dims_of(shape: &[usize]) -> String {
     shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(" ")
 }
 
-/// A constraint the generator put on OUTPUT: the comparison and the bound.
+/// A constraint the generator put on OUTPUT: the comparison and the bound,
+/// and whether it was derived from the range the analysis believed in.
 #[derive(Clone, Copy)]
 struct Claim {
     op: &'static str,
     bound: f64,
+    derived: bool,
 }
 
 impl Claim {
@@ -266,9 +268,9 @@ impl Claim {
 }
 
 /// A random program over INPUT and, in one round of three, a second input
-/// AUX, with a `!` constraint on OUTPUT in one program of two. Returns the
-/// source, AUX's shape when it has one, and the constraint when there is one.
-fn program(rng: &mut Rng, dims: &str, shape: &[usize]) -> (String, Option<Vec<usize>>, Option<Claim>) {
+/// AUX. Returns the source and AUX's shape when it has one. A `!` on OUTPUT is
+/// added afterwards, once the analysis has said what range it believes in.
+fn program(rng: &mut Rng, dims: &str, shape: &[usize]) -> (String, Option<Vec<usize>>) {
     let mut spaces: Vec<(String, Vec<usize>)> = vec![("INPUT".to_string(), shape.to_vec())];
     let mut decls = format!("    INPUT:◯ □ {dims}\n");
 
@@ -328,18 +330,45 @@ fn program(rng: &mut Rng, dims: &str, shape: &[usize]) -> (String, Option<Vec<us
         "    {} → OUTPUT\n",
         expression(rng, 3, &spaces, &final_shape)
     ));
-    // A constraint the analysis has to judge. Most are unprovable and a few
-    // are false; the ones it calls proved are held to the runs.
-    let claim = if rng.below(2) == 0 {
-        let op = [">=", "<=", ">", "<"][rng.below(4)];
-        let bound = (rng.value() / 4.0).trunc();
-        body.push_str(&format!("    ! (OUTPUT {op} {bound:.1})\n"));
-        Some(Claim { op, bound })
-    } else {
-        None
-    };
     body.push_str("    OUTPUT → =\n");
-    (format!("{{\n{decls}{body}}}\n"), aux, claim)
+    (format!("{{\n{decls}{body}}}\n"), aux)
+}
+
+/// A `!` on OUTPUT the analysis ought to settle, and a program carrying it.
+///
+/// A constraint picked blindly is almost never proved, and an unproved claim
+/// says nothing when it turns out true. So the analysis is asked first what
+/// range it believes OUTPUT has, and the constraint is placed just outside
+/// that range: `OUTPUT >= lo - margin` when the low end is known, `<= hi +
+/// margin` when the high end is. The analysis then has to prove it through
+/// the constraint's own expansion — a different path from the range — and the
+/// run has to bear it out. One program in five keeps a blind constraint, so
+/// the unproved and the false are still exercised.
+fn constrain(rng: &mut Rng, source: &str, range: (f64, f64)) -> Option<(String, Claim)> {
+    let (lo, hi) = range;
+    let blind = rng.below(5) == 0;
+    let claim = if !blind && lo.is_finite() && (hi.is_infinite() || rng.below(2) == 0) {
+        Claim {
+            op: ">=",
+            bound: (lo - lo.abs() * 0.25 - 1.0).floor(),
+            derived: true,
+        }
+    } else if !blind && hi.is_finite() {
+        Claim {
+            op: "<=",
+            bound: (hi + hi.abs() * 0.25 + 1.0).ceil(),
+            derived: true,
+        }
+    } else {
+        Claim {
+            op: [">=", "<=", ">", "<"][rng.below(4)],
+            bound: (rng.value() / 4.0).trunc(),
+            derived: false,
+        }
+    };
+    let line = format!("    ! (OUTPUT {} {:.1})\n    OUTPUT → =\n", claim.op, claim.bound);
+    let constrained = source.replacen("    OUTPUT → =\n", &line, 1);
+    (constrained != source).then_some((constrained, claim))
 }
 
 /// The first line of a diagnostic, for tallying why programs were skipped.
@@ -373,11 +402,14 @@ fn main() {
     let mut unsound = 0usize;
     let mut claims_checked = 0usize;
     let mut proofs_checked = 0usize;
+    // Constraints placed just outside the believed range, and how many the
+    // analysis then failed to prove through the constraint's own expansion.
+    let (mut derived, mut derived_unproved) = (0usize, 0usize);
     let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
 
     for round in 0..rounds {
         let (dims, shape) = &shapes[rng.below(shapes.len())];
-        let (source, aux, claim) = program(&mut rng, dims, shape);
+        let (source, aux) = program(&mut rng, dims, shape);
 
         let block = match parse_rho_program(&source) {
             Ok(b) => b,
@@ -386,6 +418,16 @@ fn main() {
                 *reasons.entry(format!("parse: {}", short(&e))).or_insert(0) += 1;
                 continue;
             }
+        };
+
+        // Ask the analysis what it believes, then make it commit to a `!`.
+        let believed = ConstraintSolver::analyze_at(&block, RUN.tau, Precision::F64).output_range;
+        let (source, block, claim) = match constrain(&mut rng, &source, (believed.lo, believed.hi)) {
+            Some((constrained, claim)) => match parse_rho_program(&constrained) {
+                Ok(b) => (constrained, b, Some(claim)),
+                Err(_) => (source, block, None),
+            },
+            None => (source, block, None),
         };
 
         let cells: usize = shape.iter().product();
@@ -455,6 +497,12 @@ fn main() {
                 println!("  produced    {:?}\n", produced[cell]);
             }
             if let (Some(claim), Some(finding)) = (claim, report.constraints.first()) {
+                if claim.derived {
+                    derived += 1;
+                    if finding.verdict != Verdict::Proved {
+                        derived_unproved += 1;
+                    }
+                }
                 if finding.verdict == Verdict::Proved {
                     proofs_checked += 1;
                     if !claim.holds(produced) {
@@ -578,7 +626,8 @@ fn main() {
     println!(
         "seed {seed}: compared {compared} ({two_inputs} with two inputs, {iterating} iterating), \
          skipped {skipped}, mismatches {mismatches}, f32 mismatches {narrow_mismatches}, \
-         claims checked {claims_checked} ({proofs_checked} proved constraints), unsound {unsound}"
+         claims checked {claims_checked} ({proofs_checked} proved constraints, \
+         {derived_unproved} of {derived} derived ones left open), unsound {unsound}"
     );
     if std::env::var("DIFFTEST_VERBOSE").is_ok() {
         for (reason, count) in &reasons {

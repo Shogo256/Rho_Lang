@@ -6,12 +6,18 @@
 //! Every program is compiled and run at both widths, through both C
 //! entrypoints, and the bits are compared.
 //!
+//! The same runs check the `!` analysis. Whatever the intervals claimed —
+//! the range of the output, a constraint they called proved — is compared
+//! with what the kernel actually produced. That is refutation, not proof,
+//! but it catches the failure that matters: a range narrower than the truth.
+//!
 //!     cargo run --release --bin difftest -- [seed] [rounds]
 
 use rho_lang::codegen::LlvmCodeGen;
 use rho_lang::interp::{interpret_with, Env, Grid, Options};
 use rho_lang::numeric::Precision;
 use rho_lang::parser::parse_rho_program;
+use rho_lang::solver::{ConstraintSolver, Verdict};
 use std::collections::BTreeMap;
 
 /// The cap on every `⇒` a generated program contains. Small, so a loop that
@@ -240,9 +246,29 @@ fn dims_of(shape: &[usize]) -> String {
     shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(" ")
 }
 
+/// A constraint the generator put on OUTPUT: the comparison and the bound.
+#[derive(Clone, Copy)]
+struct Claim {
+    op: &'static str,
+    bound: f64,
+}
+
+impl Claim {
+    /// Whether every cell satisfies it.
+    fn holds(&self, cells: &[f64]) -> bool {
+        cells.iter().all(|v| match self.op {
+            ">=" => *v >= self.bound,
+            "<=" => *v <= self.bound,
+            ">" => *v > self.bound,
+            _ => *v < self.bound,
+        })
+    }
+}
+
 /// A random program over INPUT and, in one round of three, a second input
-/// AUX. Returns the source and AUX's shape when it has one.
-fn program(rng: &mut Rng, dims: &str, shape: &[usize]) -> (String, Option<Vec<usize>>) {
+/// AUX, with a `!` constraint on OUTPUT in one program of two. Returns the
+/// source, AUX's shape when it has one, and the constraint when there is one.
+fn program(rng: &mut Rng, dims: &str, shape: &[usize]) -> (String, Option<Vec<usize>>, Option<Claim>) {
     let mut spaces: Vec<(String, Vec<usize>)> = vec![("INPUT".to_string(), shape.to_vec())];
     let mut decls = format!("    INPUT:◯ □ {dims}\n");
 
@@ -302,8 +328,18 @@ fn program(rng: &mut Rng, dims: &str, shape: &[usize]) -> (String, Option<Vec<us
         "    {} → OUTPUT\n",
         expression(rng, 3, &spaces, &final_shape)
     ));
+    // A constraint the analysis has to judge. Most are unprovable and a few
+    // are false; the ones it calls proved are held to the runs.
+    let claim = if rng.below(2) == 0 {
+        let op = [">=", "<=", ">", "<"][rng.below(4)];
+        let bound = (rng.value() / 4.0).trunc();
+        body.push_str(&format!("    ! (OUTPUT {op} {bound:.1})\n"));
+        Some(Claim { op, bound })
+    } else {
+        None
+    };
     body.push_str("    OUTPUT → =\n");
-    (format!("{{\n{decls}{body}}}\n"), aux)
+    (format!("{{\n{decls}{body}}}\n"), aux, claim)
 }
 
 /// The first line of a diagnostic, for tallying why programs were skipped.
@@ -334,11 +370,14 @@ fn main() {
     let mut two_inputs = 0usize;
     let mut iterating = 0usize;
     let mut narrow_mismatches = 0usize;
+    let mut unsound = 0usize;
+    let mut claims_checked = 0usize;
+    let mut proofs_checked = 0usize;
     let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
 
     for round in 0..rounds {
         let (dims, shape) = &shapes[rng.below(shapes.len())];
-        let (source, aux) = program(&mut rng, dims, shape);
+        let (source, aux, claim) = program(&mut rng, dims, shape);
 
         let block = match parse_rho_program(&source) {
             Ok(b) => b,
@@ -400,6 +439,37 @@ fn main() {
         let (output, output_args) = run_so(&so, &order, &inputs, out_cells, single_input);
         let _ = std::fs::remove_file(&so);
 
+        // What the intervals claimed about this program, held to this run.
+        // The claims assume no overflow and no NaN, so a run that produced
+        // either is not a counterexample to anything.
+        let report = ConstraintSolver::analyze_at(&block, RUN.tau, Precision::F64);
+        let produced = &output[..expected.len()];
+        if produced.iter().all(|v| v.is_finite()) {
+            claims_checked += 1;
+            let (lo, hi) = (report.output_range.lo, report.output_range.hi);
+            if let Some(cell) = produced.iter().position(|v| *v < lo || *v > hi) {
+                unsound += 1;
+                println!("UNSOUND RANGE at cell {cell} (round {round}, shape {shape:?})");
+                println!("{source}");
+                println!("  claimed     [{lo}, {hi}]");
+                println!("  produced    {:?}\n", produced[cell]);
+            }
+            if let (Some(claim), Some(finding)) = (claim, report.constraints.first()) {
+                if finding.verdict == Verdict::Proved {
+                    proofs_checked += 1;
+                    if !claim.holds(produced) {
+                        unsound += 1;
+                        println!(
+                            "UNSOUND PROOF (round {round}, shape {shape:?}): {}",
+                            finding.subject
+                        );
+                        println!("{source}");
+                        println!("  produced    {produced:?}\n");
+                    }
+                }
+            }
+        }
+
         // Every other round is repeated at single precision: the interpreter
         // narrowed to f32 against a kernel compiled at f32.
         if round % 2 == 0 {
@@ -434,6 +504,27 @@ fn main() {
                                 single_input,
                             );
                             let _ = std::fs::remove_file(&narrow_so);
+                            // The analysis at f32 widens by 2^-24; the narrow
+                            // kernel must stay inside what it claimed too.
+                            let narrow_report =
+                                ConstraintSolver::analyze_at(&block, RUN.tau, Precision::F32);
+                            let produced: Vec<f64> =
+                                got[..meant.len()].iter().map(|v| *v as f64).collect();
+                            if produced.iter().all(|v| v.is_finite()) {
+                                let (lo, hi) =
+                                    (narrow_report.output_range.lo, narrow_report.output_range.hi);
+                                if let Some(cell) =
+                                    produced.iter().position(|v| *v < lo || *v > hi)
+                                {
+                                    unsound += 1;
+                                    println!(
+                                        "UNSOUND F32 RANGE at cell {cell} (round {round}, shape {shape:?})"
+                                    );
+                                    println!("{source}");
+                                    println!("  claimed     [{lo}, {hi}]");
+                                    println!("  produced    {:?}\n", produced[cell]);
+                                }
+                            }
                             let mut runs = vec![("exec_spaces", got)];
                             if let Some(g) = got_args {
                                 runs.push(("exec_with_args", g));
@@ -486,12 +577,17 @@ fn main() {
 
     println!(
         "seed {seed}: compared {compared} ({two_inputs} with two inputs, {iterating} iterating), \
-         skipped {skipped}, mismatches {mismatches}, f32 mismatches {narrow_mismatches}"
+         skipped {skipped}, mismatches {mismatches}, f32 mismatches {narrow_mismatches}, \
+         claims checked {claims_checked} ({proofs_checked} proved constraints), unsound {unsound}"
     );
     if std::env::var("DIFFTEST_VERBOSE").is_ok() {
         for (reason, count) in &reasons {
             println!("  skipped {count:4} x {reason}");
         }
     }
-    std::process::exit(if mismatches > 0 || narrow_mismatches > 0 { 1 } else { 0 });
+    std::process::exit(if mismatches > 0 || narrow_mismatches > 0 || unsound > 0 {
+        1
+    } else {
+        0
+    });
 }

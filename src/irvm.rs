@@ -177,8 +177,8 @@ pub trait Decider<S: Numeric> {
     /// Whether to leave the loop, given "no cell moved by more than 𝜏".
     /// `None` means the run cannot tell, which is reported as an error.
     fn done(&mut self, settled: &S::Bool) -> Option<bool>;
-    /// The machine's buffers, just before the loop goes round again.
-    fn next_round(&mut self, _buffers: &mut [Vec<S>]) {}
+    /// The machine, just before the loop goes round again.
+    fn next_round(&mut self, _machine: &mut Machine<S>) {}
 }
 
 /// Decide by the value, which is what a run on numbers does.
@@ -243,6 +243,20 @@ impl<S: Numeric> Machine<S> {
     /// A module-level integer, such as `@rho_sweeps`, after a run.
     pub fn global(&self, name: &str) -> i64 {
         self.globals.get(name).copied().unwrap_or(0)
+    }
+
+    /// The buffer an SSA name points at, if it names a pointer: the buffer's
+    /// handle and the element offset.
+    pub fn pointer(&self, name: &str) -> Option<(usize, i64)> {
+        match self.names.get(name) {
+            Some(Value::P(handle, offset)) if *handle != usize::MAX => Some((*handle, *offset)),
+            _ => None,
+        }
+    }
+
+    /// A buffer's cells, to be rewritten between rounds of a loop.
+    pub fn cells_mut(&mut self, handle: usize) -> &mut Vec<S> {
+        &mut self.buffers[handle]
     }
 
     fn value(&self, token: &str) -> Value<S> {
@@ -352,7 +366,7 @@ impl<S: Numeric> Machine<S> {
                 Value::B(flag) => match S::truth(&flag).or_else(|| decider.done(&flag)) {
                     Some(done) => {
                         if !done {
-                            decider.next_round(&mut self.buffers);
+                            decider.next_round(self);
                         }
                         done
                     }

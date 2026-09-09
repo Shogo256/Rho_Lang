@@ -9,11 +9,11 @@
 //! The question handed to the solver is the negation: *is there an input for
 //! which some cell differs?* `unsat` is the proof.
 
-use crate::ast::ToposBlock;
+use crate::ast::{Statement, ToposBlock};
 use crate::codegen::LlvmCodeGen;
-use crate::interp::{interpret, Env, Grid};
+use crate::interp::{interpret_with, Env, Grid, Options};
 use crate::irvm::{parse_module, Machine, Value};
-use crate::numeric::{Numeric, Term};
+use crate::numeric::{Numeric, Predicate, Term};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -65,6 +65,7 @@ pub fn expressions(
 ) -> Result<(Vec<Term>, Vec<Term>), String> {
     let ir = LlvmCodeGen::new("validate")
         .with_tau(tau)
+        .with_max_sweeps(VALIDATION_SWEEPS)
         .generate_llvm_ir(block)
         .map_err(|e| e.to_string())?;
     expressions_of(block, shape, tau, &ir)
@@ -84,11 +85,24 @@ pub fn expressions_of(
     expressions_via(block, shape, tau, ir, Entrypoint::WithArgs)
 }
 
+/// The cap every validation run compiles with. Its value never matters to
+/// the proof — the decisions are forced — as long as it leaves room for the
+/// two rounds the induction takes.
+pub const VALIDATION_SWEEPS: usize = 1000;
+
 /// As [`expressions_of`], through the entrypoint of the caller's choice.
 ///
 /// Every space the kernel reads gets one symbol per cell, so a program with a
 /// second input is as provable as one with INPUT alone — through the table
 /// entrypoint, the only one that can carry it.
+///
+/// A `⇒` loop is proved by induction rather than unrolled. Both sides are run
+/// with the loop's exit forced the same way — once round from the start, once
+/// more from a grid of fresh symbols, then out — and the test each side made
+/// at each exit is recorded. Agreement on the second round's output says the
+/// sweep agrees for *any* iterate, agreement on the recorded tests says both
+/// sides leave at the same moment, and together with the first round that
+/// covers every run of any length, whatever the tolerance decides.
 pub fn expressions_via(
     block: &ToposBlock,
     shape: &[usize],
@@ -98,7 +112,9 @@ pub fn expressions_via(
 ) -> Result<(Vec<Term>, Vec<Term>), String> {
     // How the generator lays the spaces out. Generation is deterministic, so
     // this is the layout of the IR the caller hands in, damaged or not.
-    let mut layout = LlvmCodeGen::new("layout").with_tau(tau);
+    let mut layout = LlvmCodeGen::new("layout")
+        .with_tau(tau)
+        .with_max_sweeps(VALIDATION_SWEEPS);
     layout.generate_llvm_ir(block).map_err(|e| e.to_string())?;
 
     // One symbol per cell of every space the kernel reads, numbered across
@@ -119,9 +135,27 @@ pub fn expressions_via(
         symbols.insert(name, terms);
     }
 
+    // The loops, in order, and the names their targets' buffers go by in
+    // the IR, so the reader can hand a fresh grid to the right one.
+    let loops: Vec<String> = block
+        .statements
+        .iter()
+        .filter_map(|s| match s {
+            Statement::Iterate { target, .. } => Some(target.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut on_source = Induction::new(&loops, next);
+    let mut on_ir = Induction::new(&loops, next);
+
     // What the source means.
-    let interpreted = interpret(block, &env, tau).map_err(|e| e.to_string())?;
-    let source = interpreted
+    let options = Options {
+        tau,
+        max_sweeps: VALIDATION_SWEEPS,
+    };
+    let interpreted =
+        interpret_with(block, &env, &options, &mut on_source).map_err(|e| e.to_string())?;
+    let mut source = interpreted
         .get("OUTPUT")
         .ok_or("the program produces no OUTPUT")?
         .cells
@@ -146,7 +180,11 @@ pub fn expressions_via(
                 ));
             }
             let in_handle = machine.add_buffer(symbols["INPUT"].clone());
-            machine.run(function, &[Value::P(in_handle, 0), Value::P(out_handle, 0)])?;
+            machine.run_with(
+                function,
+                &[Value::P(in_handle, 0), Value::P(out_handle, 0)],
+                &mut on_ir,
+            )?;
         }
         Entrypoint::Spaces => {
             let mut table = Vec::new();
@@ -159,12 +197,118 @@ pub fn expressions_via(
                 });
             }
             let handle = machine.add_table(table);
-            machine.run(function, &[Value::T(handle, 0)])?;
+            machine.run_with(function, &[Value::T(handle, 0)], &mut on_ir)?;
         }
     }
-    let target = machine.buffer(out_handle)[..source.len()].to_vec();
+    if let Some(name) = on_ir.lost.take() {
+        return Err(format!(
+            "the reader could not find the buffer of the iterate {name} in {}",
+            entry.symbol()
+        ));
+    }
+    let mut target = machine.buffer(out_handle)[..source.len()].to_vec();
+
+    // The decisions each side made, as cells of their own: how many, then
+    // each test as a 1-or-0 value. A kernel that left its loop at a different
+    // moment, or tested a different thing, differs here.
+    source.push(Term::constant(on_source.recorded.len() as f64));
+    target.push(Term::constant(on_ir.recorded.len() as f64));
+    let (one, zero) = (Term::constant(1.0), Term::constant(0.0));
+    for (a, b) in on_source.recorded.iter().zip(&on_ir.recorded) {
+        source.push(Term::select(a, &one, &zero));
+        target.push(Term::select(b, &one, &zero));
+    }
 
     Ok((source, target))
+}
+
+/// The policy both sides of a proof follow through a `⇒`: force each loop
+/// round once from its start and once from a grid of fresh symbols, record
+/// every exit test, and hand out the same fresh symbols in the same order.
+struct Induction {
+    forced: std::collections::VecDeque<bool>,
+    recorded: Vec<Predicate>,
+    next_symbol: usize,
+    /// The loops in order; each round of fresh symbols goes to the next.
+    targets: Vec<String>,
+    rounds: usize,
+    /// A target whose buffer the reader could not locate.
+    lost: Option<String>,
+}
+
+impl Induction {
+    fn new(targets: &[String], first_symbol: usize) -> Induction {
+        Induction {
+            forced: targets.iter().flat_map(|_| [false, true]).collect(),
+            recorded: Vec::new(),
+            next_symbol: first_symbol,
+            targets: targets.to_vec(),
+            rounds: 0,
+            lost: None,
+        }
+    }
+
+    fn fresh(&mut self) -> Term {
+        let term = Term::input(self.next_symbol);
+        self.next_symbol += 1;
+        term
+    }
+
+    /// The loop whose round is about to start.
+    fn current_target(&mut self) -> String {
+        let target = self.targets[self.rounds.min(self.targets.len() - 1)].clone();
+        self.rounds += 1;
+        target
+    }
+}
+
+impl crate::interp::Decider<Term> for Induction {
+    fn done(&mut self, settled: &Predicate) -> Option<bool> {
+        self.recorded.push(settled.clone());
+        self.forced.pop_front()
+    }
+    fn next_round(&mut self, cells: &mut [Term]) {
+        let _ = self.current_target();
+        for cell in cells {
+            *cell = self.fresh();
+        }
+    }
+}
+
+impl crate::irvm::Decider<Term> for Induction {
+    fn done(&mut self, settled: &Predicate) -> Option<bool> {
+        self.recorded.push(settled.clone());
+        self.forced.pop_front()
+    }
+    fn next_round(&mut self, machine: &mut Machine<Term>) {
+        let target = self.current_target();
+        // The names a space's buffer goes by, by entrypoint: chosen at call
+        // time, scratch, or the argument itself.
+        let candidates = [
+            format!("%{target}_eff"),
+            format!("%{target}_buf"),
+            match target.as_str() {
+                "INPUT" => "%in_ptr".to_string(),
+                "OUTPUT" => "%out_effective".to_string(),
+                _ => String::new(),
+            },
+            if target == "OUTPUT" {
+                "%b_out_effective".to_string()
+            } else {
+                String::new()
+            },
+        ];
+        for name in candidates.iter().filter(|n| !n.is_empty()) {
+            if let Some((handle, _)) = machine.pointer(name) {
+                let cells = machine.cells_mut(handle);
+                for cell in cells.iter_mut() {
+                    *cell = self.fresh();
+                }
+                return;
+            }
+        }
+        self.lost = Some(target);
+    }
 }
 
 #[cfg(feature = "z3-solver")]
@@ -377,7 +521,9 @@ pub fn validate(block: &ToposBlock, shape: &[usize], tau: f64) -> Validation {
         entrypoints: 0,
     };
 
-    let mut codegen = LlvmCodeGen::new("validate").with_tau(tau);
+    let mut codegen = LlvmCodeGen::new("validate")
+        .with_tau(tau)
+        .with_max_sweeps(VALIDATION_SWEEPS);
     let ir = match codegen.generate_llvm_ir(block) {
         Ok(ir) => ir,
         Err(e) => return not_checked(e.to_string()),

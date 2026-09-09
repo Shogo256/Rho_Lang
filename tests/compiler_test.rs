@@ -3156,3 +3156,45 @@ fn test_a_damped_average_is_proved_to_contract() {
     }
     assert_eq!(report.contract.iterations[0].factor, None);
 }
+
+#[test]
+fn test_a_loop_is_proved_by_induction_rather_than_unrolled() {
+    // The proof forces the loop round twice — from the start, then from a
+    // grid of fresh symbols — and compares the outputs and the exit tests.
+    // Two extra cells carry the number of decisions and each decision.
+    let block = parse_rho_program(JACOBI_1D).unwrap();
+    let ir = LlvmCodeGen::new("induction")
+        .with_max_sweeps(rho_lang::validate::VALIDATION_SWEEPS)
+        .generate_llvm_ir(&block)
+        .unwrap();
+
+    for entry in [Entrypoint::WithArgs, Entrypoint::Spaces] {
+        let (left, right) = expressions_via(&block, &[6, 1], 0.0, &ir, entry).unwrap();
+        assert_eq!(left.len(), 6 + 1 + 2, "{entry:?}");
+        assert_eq!(right.len(), left.len(), "{entry:?}");
+        match compare(&left, &right) {
+            Equivalence::Equivalent | Equivalence::NotChecked(_) => {}
+            other => panic!("{entry:?}: {other:?}"),
+        }
+    }
+
+    // Both entrypoints are proved, since the program reads INPUT alone.
+    let result = validate(&block, &[6, 1], 0.0);
+    match result.verdict {
+        Equivalence::Equivalent => assert_eq!(result.entrypoints, 2),
+        Equivalence::NotChecked(_) => {}
+        other => panic!("{other:?}"),
+    }
+
+    // Loosening the exit test leaves every cell alone and changes only when
+    // the loop leaves: the decision cells are what catch it.
+    let loosened = ir.replacen("fcmp ole double %it2.d", "fcmp olt double %it2.d", 1);
+    assert_ne!(loosened, ir);
+    let (left, right) =
+        expressions_via(&block, &[6, 1], 0.0, &loosened, Entrypoint::WithArgs).unwrap();
+    match compare(&left, &right) {
+        Equivalence::Differs { cell, .. } => assert!(cell >= 6, "a decision cell, not a value: {cell}"),
+        Equivalence::NotChecked(_) => {}
+        other => panic!("a changed exit test went unnoticed: {other:?}"),
+    }
+}

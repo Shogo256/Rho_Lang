@@ -7,11 +7,22 @@
 //!     cargo run --release --bin difftest -- [seed] [rounds]
 
 use rho_lang::codegen::LlvmCodeGen;
-use rho_lang::interp::{interpret, Env, Grid};
+use rho_lang::interp::{interpret_with, ByValue, Env, Grid, Options};
 use rho_lang::irvm::{parse_module, Machine, Value};
 use rho_lang::numeric::{Numeric, Precision};
 use rho_lang::parser::parse_rho_program;
 use std::collections::BTreeMap;
+
+/// The cap on every `⇒` a generated program contains. Small, so a loop that
+/// blows up to infinity or never settles costs little; the point is that all
+/// three representations stop at the same sweep with the same bits.
+const SWEEPS: usize = 8;
+
+/// A tolerance of zero: a loop settles only when a sweep changes nothing.
+const RUN: Options = Options {
+    tau: 0.0,
+    max_sweeps: SWEEPS,
+};
 
 
 /// Run the emitted IR directly, without going through clang.
@@ -303,7 +314,17 @@ fn program(rng: &mut Rng, dims: &str, shape: &[usize]) -> (String, Option<Vec<us
             "    {} → {name}\n",
             expression(rng, 3, &spaces, &target)
         ));
-        spaces.push((name, target));
+        spaces.push((name.clone(), target.clone()));
+
+        // One intermediate in four is then iterated: a body of its own shape,
+        // anchored to a space so that it has one.
+        if rng.below(4) == 0 {
+            let mut update = expression(rng, 2, &spaces, &target);
+            if !spaces.iter().any(|(n, _)| update.contains(n.as_str())) {
+                update = format!("({update} + {name})");
+            }
+            body.push_str(&format!("    {update} ⇒ {name}\n"));
+        }
     }
 
     let final_shape = spaces[rng.below(spaces.len())].1.clone();
@@ -338,6 +359,7 @@ fn main() {
     let mut rng = Rng(seed);
     let (mut compared, mut skipped, mut mismatches) = (0usize, 0usize, 0usize);
     let mut two_inputs = 0usize;
+    let mut iterating = 0usize;
     let (mut ir_mismatches, mut ir_unsupported) = (0usize, 0usize);
     let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
 
@@ -368,7 +390,7 @@ fn main() {
         if let Some(aux_shape) = &aux {
             env.insert("AUX".to_string(), Grid::from(aux_shape.clone(), inputs["AUX"].clone()));
         }
-        let interpreted = match interpret(&block, &env, 0.0) {
+        let interpreted = match interpret_with(&block, &env, &RUN, &mut ByValue) {
             Ok(i) => i,
             Err(e) => {
                 skipped += 1;
@@ -382,7 +404,7 @@ fn main() {
             continue;
         };
 
-        let mut codegen = LlvmCodeGen::new(&format!("diff{round}"));
+        let mut codegen = LlvmCodeGen::new(&format!("diff{round}")).with_max_sweeps(SWEEPS);
         let ir = match codegen.generate_llvm_ir(&block) {
             Ok(ir) => ir,
             Err(e) => {
@@ -458,10 +480,11 @@ fn main() {
                     Grid::from(aux_shape.clone(), narrow["AUX"].clone()),
                 );
             }
-            if let Ok(narrow_out) = interpret(&block, &narrow_env, 0.0) {
+            if let Ok(narrow_out) = interpret_with(&block, &narrow_env, &RUN, &mut ByValue) {
                 if let Some(meant) = narrow_out.get("OUTPUT") {
                     let mut narrow_codegen = LlvmCodeGen::new(&format!("diff{round}f32"))
-                        .with_precision(Precision::F32);
+                        .with_precision(Precision::F32)
+                        .with_max_sweeps(SWEEPS);
                     if let Ok(narrow_ir) = narrow_codegen.generate_llvm_ir(&block) {
                         let meant_wide: Vec<f64> = meant.cells.iter().map(|v| *v as f64).collect();
                         let mut runs = vec![(
@@ -506,6 +529,9 @@ fn main() {
         if !single_input {
             two_inputs += 1;
         }
+        if source.contains('⇒') {
+            iterating += 1;
+        }
         let mut so_runs = vec![("exec_spaces", output)];
         if let Some(via_args) = output_args {
             so_runs.push(("exec_with_args", via_args));
@@ -528,8 +554,9 @@ fn main() {
     }
 
     println!(
-        "seed {seed}: compared {compared} ({two_inputs} with two inputs), skipped {skipped}, \
-         mismatches {mismatches}, ir mismatches {ir_mismatches}, ir unread {ir_unsupported}"
+        "seed {seed}: compared {compared} ({two_inputs} with two inputs, {iterating} iterating), \
+         skipped {skipped}, mismatches {mismatches}, ir mismatches {ir_mismatches}, \
+         ir unread {ir_unsupported}"
     );
     if std::env::var("DIFFTEST_VERBOSE").is_ok() {
         for (reason, count) in &reasons {

@@ -21,7 +21,7 @@ fn main() {
 
     // `{dims}` and `{rows}` are filled in per shape, so a second input can be
     // declared to match INPUT or to stretch against it.
-    let programs: [&str; 17] = [
+    let programs: [&str; 20] = [
         "(INPUT + 1.0) → OUTPUT\n    OUTPUT → =",
         "(▷INPUT - INPUT) → OUTPUT\n    OUTPUT → =",
         "(▽INPUT) → OUTPUT\n    OUTPUT → =",
@@ -40,6 +40,10 @@ fn main() {
         "AUX:◯ □ {dims}\n    ((INPUT - AUX) × AUX) → OUTPUT\n    OUTPUT → =",
         "AUX:◯ □ {rows} 1\n    ((INPUT × AUX) > AUX) → OUTPUT\n    OUTPUT → =",
         "A:◯ □ 2 3 1\n    B:◯ □ 1 3 4\n    ◇+1 (A × B) → OUTPUT\n    OUTPUT → =",
+        // Iterations: proved by induction over one round from an arbitrary grid.
+        "INPUT → X\n    ((INPUT - (▷X + ▽X)) / 4.0) ⇒ X\n    X → =",
+        "INPUT → U\n    ((▷U + ▽U) / 4.0) ⇒ U\n    (U × 2.0) → OUTPUT\n    OUTPUT → =",
+        "INPUT → X\n    (X / (□1 (◇+1 (abs X)))) ⇒ X\n    X → =",
     ];
 
     let mut proved = 0usize;

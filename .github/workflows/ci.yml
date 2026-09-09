@@ -53,17 +53,6 @@ jobs:
         cargo run --quiet --bin rhoc -- examples/teichmuller.rho --dump-llvm > b.ll
         diff a.ll b.ll
 
-    - name: Set up Java for TLA+
-      uses: actions/setup-java@v4
-      with:
-        distribution: temurin
-        java-version: '21'
-
-    - name: Model Check The Generated TLA+ Spec
-      run: |
-        curl -sSL -o tla2tools.jar \
-          https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
-        TLA2TOOLS="$PWD/tla2tools.jar" ./scripts/verify_tla.sh examples/gradient_2d.rho
 
     - name: Run Python FFI Examples
       run: |

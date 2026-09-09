@@ -26,7 +26,6 @@ Working prototype. What runs today:
 - Multi-dimensional shifts `▷` / `▽`, per axis, zero-padded at each axis's boundary
 - Explicit `<4 x double>` vector lowering, verified bit-identical to the scalar path
 - Zero-copy binding: compile a kernel against a buffer the host already owns
-- TLA+ export whose `Next` models the program, and invariants from each `!`
 - Emits a native shared library (`.so`) with a documented C ABI
 - Deterministic output: the same source always produces byte-identical IR
 
@@ -69,19 +68,12 @@ with what the constraint solver could prove.
 |---|---|
 | `--dump-llvm` | Print the generated IR |
 | `--dump-dag` | Print the dataflow trace |
-| `--dump-tla` | Write `rho_harmony.tla` and a matching `rho_harmony.cfg` |
 | `--tau <v>` | Bind the threshold symbol `𝜏` (default `0.0`) |
 | `--bind NAME=0x…` | Point a space at an address the caller owns |
 | `--no-simd` | Emit only scalar loops |
 
 Build with `--features z3-solver` to discharge `!` constraints with SMT instead
 of interval arithmetic.
-
-To model check the exported specification:
-
-```bash
-TLA2TOOLS=/path/to/tla2tools.jar ./scripts/verify_tla.sh examples/gradient_2d.rho
-```
 
 ### 3. Call it from Python
 
@@ -192,13 +184,12 @@ smooth input drives it to zero and the kernel returns infinities.
 | Explicit `<4 x double>` vector lowering | ✅ implemented — see the note below |
 | Zero-copy binding (`&[0x…]`, `--bind`) | ✅ implemented |
 | `!` constraint solver | ✅ interval arithmetic; Z3 with `--features z3-solver`. Models binary64 rounding, not ℝ |
-| TLA+ export (`--dump-tla`) | ✅ real transition relation and invariants, model checked with TLC |
 | C ABI, JSON metadata, Python FFI | ✅ implemented |
 | AVX-512 / NEON width selection, GPU backends | 📋 planned — the vector width is fixed at four lanes |
 | Tiling and cache blocking | 📋 planned — a sweep is one linear pass |
 | Parallel execution of independent flows | 📋 planned — flows run in source order on one thread |
 
-Three honest caveats on the ✅ rows:
+Two honest caveats on the ✅ rows:
 
 - **Vector lowering is correct, not dramatically faster.** `clang -O3` vectorises
   no loops on the scalar IR by itself — the boundary select defeats it — and the
@@ -210,10 +201,6 @@ Three honest caveats on the ✅ rows:
   round-to-nearest — every result is the exact one times `(1 ± 2⁻⁵³)` — which is
   what stops it proving things that only hold over the reals. It does not model
   infinities, subnormals or NaN.
-- **TLC can only check the integer subset.** A program that divides or uses
-  fractional literals produces a spec over `Reals`, which SANY parses but TLC
-  cannot evaluate. `examples/teichmuller.rho` is in that category;
-  `examples/gradient_2d.rho` is not, and CI model checks it on every push.
 
 ---
 

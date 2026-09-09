@@ -1,7 +1,6 @@
 use rho_lang::codegen::LlvmCodeGen;
 use rho_lang::error::HarmonyDisruption;
 use rho_lang::parser::parse_rho_program;
-use rho_lang::tla::generate_tla_spec;
 
 #[test]
 fn test_parse_teichmuller() {
@@ -19,11 +18,6 @@ fn test_parse_teichmuller() {
 
     let block = res.unwrap();
     assert_eq!(block.statements.len(), 6);
-
-    let tla = generate_tla_spec("teichmuller_test", &block);
-    assert!(tla.contains("MODULE teichmuller_test"));
-    assert!(tla.contains("Flow1"));
-    assert!(tla.contains("pc' = 1"));
 }
 
 #[test]
@@ -400,57 +394,7 @@ fn test_axis_out_of_range_is_rejected() {
     assert!(matches!(err, HarmonyDisruption::LoweringErr { .. }), "got {err:?}");
 }
 
-#[test]
-fn test_tla_next_is_a_real_transition_relation() {
-    // Next used to be `UNCHANGED <<vars>>`, i.e. a spec that modelled nothing.
-    let source = r#"{
-        INPUT:◯ □ 3 4
-        (▷INPUT - INPUT) → △
-        (△ + INPUT) → OUTPUT
-        ! (OUTPUT >= 0)
-        OUTPUT → =
-    }"#;
-    let block = parse_rho_program(source).unwrap();
-    let tla = generate_tla_spec("rho_check", &block);
 
-    // One action per flow, sequenced by a program counter.
-    for step in 1..=3 {
-        assert!(tla.contains(&format!("Flow{step} ==")), "missing Flow{step}:\n{tla}");
-    }
-    assert!(tla.contains("Next ==\n  \\/ Flow1"), "Next must dispatch flows:\n{tla}");
-    assert!(!tla.contains("Next ==\n  /\\ UNCHANGED"), "Next must not be stutter-only");
-
-    // The shift is expanded with the same geometry the code generator uses:
-    // shape [3,4] -> last axis, stride 1, extent 4.
-    assert!(tla.contains("((i - 1) % 4) = 0"), "shift boundary missing:\n{tla}");
-
-    // ! (OUTPUT >= 0) becomes an invariant rather than being dropped.
-    assert!(tla.contains("Constraint1 == \\A i \\in Cells : OUTPUT[i] >= 0"), "{tla}");
-    assert!(tla.contains("Termination == <>(pc = 3)"), "{tla}");
-}
-
-#[test]
-fn test_tla_identifiers_are_ascii() {
-    // SANY rejects non-ASCII identifiers, so glyph-named spaces must be mapped.
-    let source = r#"{
-        INPUT:◯ □ 4 1
-        (INPUT + 1.0) → △
-        △ → =
-    }"#;
-    let block = parse_rho_program(source).unwrap();
-    let tla = generate_tla_spec("rho_ascii", &block);
-
-    for line in tla.lines() {
-        if line.trim_start().starts_with("\\*") {
-            continue; // comments carry the original glyphs on purpose
-        }
-        assert!(
-            line.is_ascii(),
-            "non-ASCII identifier leaked into the spec: {line}"
-        );
-    }
-    assert!(tla.contains("u25B3"), "△ should be mapped, got:\n{tla}");
-}
 
 // --------------------------------------------------------------------------
 // Constraint solver. These assertions hold for both backends: the interval
@@ -912,4 +856,47 @@ fn test_rounding_model_still_admits_the_obvious_proofs() {
             report.backend
         );
     }
+}
+
+#[test]
+fn test_repeated_shift_shares_one_boundary_condition() {
+    // Both reads of GX are the same cell of the same space, so they sit on the
+    // row boundary together or not at all. Giving each occurrence its own
+    // boundary flag let the solver pick `edge = false` for one and `true` for
+    // the other, invent a negative square, and reject a valid program.
+    let source = r#"{
+        INPUT:◯ □ 2 3
+        (▷INPUT - INPUT) → GX
+        (GX × GX) → OUTPUT
+        ! (OUTPUT >= 0)
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let report = ConstraintSolver::analyze(&block, 0.0);
+    assert_eq!(
+        report.constraints[0].verdict,
+        Verdict::Proved,
+        "a square is non-negative; backend {} disagreed",
+        report.backend
+    );
+
+    // And the program must still compile.
+    assert!(ConstraintSolver::verify(&block, 0.0).is_ok());
+}
+
+#[test]
+fn test_distinct_shifts_keep_distinct_boundaries() {
+    // The flags are keyed by the boundary condition, so a forward and a backward
+    // shift must not collapse onto the same flag: at the first column ▷ is on a
+    // boundary and ▽ is not.
+    let source = r#"{
+        INPUT:◯ □ 8 1
+        (▷INPUT) → A
+        (▽INPUT) → B
+        (A - B) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let out = run_kernel("distinct_boundaries", source, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    // A = [0,1,2,3,4,5,6,7], B = [2,3,4,5,6,7,8,0]
+    assert_eq!(out, vec![-2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0, 7.0]);
 }

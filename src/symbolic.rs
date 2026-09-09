@@ -95,7 +95,6 @@ struct Builder<'a> {
     fallback_shape: Vec<usize>,
     elements: usize,
     tau: f64,
-    flags: usize,
 }
 
 impl Builder<'_> {
@@ -134,8 +133,20 @@ impl Builder<'_> {
                     ShiftDir::Positive => offset - stride as i64,
                     ShiftDir::Negative => offset + stride as i64,
                 };
-                self.flags += 1;
-                let flag = format!("edge{}", self.flags);
+                // The flag names a boundary *condition*, not an occurrence. Two
+                // reads of the same neighbour in one expression — `GX × GX`, say
+                // — sit on the boundary together or not at all, so they must
+                // share a flag. Giving each occurrence its own let the solver
+                // pick different answers for the same cell and reject valid
+                // programs.
+                let flag = format!(
+                    "edge_o{}_s{stride}_e{extent}_{}",
+                    offset_tag(offset),
+                    match dir {
+                        ShiftDir::Positive => "p",
+                        ShiftDir::Negative => "n",
+                    }
+                );
                 let interior = self.build(&Expr::Var(name), before, next);
                 Sym::Boundary {
                     flag,
@@ -220,7 +231,6 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
         fallback_shape,
         elements,
         tau,
-        flags: 0,
     };
 
     // One entry per division written in the source, with its denominator
@@ -276,6 +286,15 @@ fn collect_divisions(
             collect_divisions(inner, at, builder, out)
         }
         Expr::Var(_) | Expr::Number(_) => {}
+    }
+}
+
+/// Render a signed offset as an identifier fragment.
+fn offset_tag(offset: i64) -> String {
+    if offset < 0 {
+        format!("m{}", offset.unsigned_abs())
+    } else {
+        offset.to_string()
     }
 }
 

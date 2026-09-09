@@ -151,6 +151,13 @@ impl Interval {
 }
 
 fn mul(a: Interval, b: Interval) -> Interval {
+    // Multiplying by an exact zero gives zero, whatever the other side ranges
+    // over. Reaching this through the endpoint products below would compute
+    // 0 * inf = NaN and fall back to unbounded, losing the fact that a
+    // denominator like `0.0 × INPUT` can never be anything but zero.
+    if a.is_zero() || b.is_zero() {
+        return Interval::point(0.0);
+    }
     let candidates = [a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi];
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;

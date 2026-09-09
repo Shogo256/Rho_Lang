@@ -5,8 +5,7 @@
 
     (▷INPUT - INPUT) → GX
 
-    /* Squaring makes the constraint below provable, and keeps the spec in
-       Integers so TLC can model check it. */
+    /* Squaring is what makes the constraint below provable. */
     (GX × GX) → OUTPUT
     ! (OUTPUT >= 0)
 

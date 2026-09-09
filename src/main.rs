@@ -3,7 +3,6 @@ use rho_lang::codegen::LlvmCodeGen;
 use rho_lang::dag::RhoDag;
 use rho_lang::parser::parse_rho_program;
 use rho_lang::solver::{ConstraintSolver, Verdict};
-use rho_lang::tla::{generate_tla_config_with_tau, generate_tla_spec_with_tau};
 use std::fs;
 use std::path::PathBuf;
 
@@ -28,10 +27,6 @@ struct Args {
     /// e.g. --bind INPUT=0x7f2c00000000. Repeatable; overrides &[0x...].
     #[arg(long, value_name = "NAME=ADDR")]
     bind: Vec<String>,
-
-    /// Write the TLA+ specification to rho_harmony.tla
-    #[arg(long)]
-    dump_tla: bool,
 
     /// Display Active Audit DAG Trace ($)
     #[arg(long)]
@@ -69,15 +64,6 @@ fn main() -> anyhow::Result<()> {
         println!("{}", dag.print_audit_trace());
     }
 
-    if args.dump_tla {
-        let tla_code = generate_tla_spec_with_tau("rho_harmony", &block, args.tau);
-        fs::write("rho_harmony.tla", &tla_code)?;
-        fs::write(
-            "rho_harmony.cfg",
-            generate_tla_config_with_tau(&block, args.tau),
-        )?;
-        println!("  └─ TLA+ spec written to 'rho_harmony.tla' (+ .cfg for TLC)");
-    }
 
     // 3. Static Constraint Solver !
     println!("[Phase 3] Static Constraint Solver (!) Validation...");

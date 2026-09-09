@@ -1,0 +1,16 @@
+{
+    /* A Hann window over 1024 samples, from the position of each cell.
+
+       `⍳X` is the coordinate of every cell of X along its axis, counted from
+       zero — APL's ⍳ with ⎕IO←0 — so anything that depends on where a cell is
+       is written with it: a window, a distance from the centre, a decay, a
+       Vandermonde matrix. The operand is measured, never read.
+
+         w[k] = 0.5 - 0.5 cos(2πk / N)
+    */
+    INPUT:◯ □ 1024 1
+
+    (0.5 - (0.5 × (cos (0.006135923151542565 × ⍳INPUT)))) → W
+
+    (INPUT × W) → =
+}

@@ -2681,8 +2681,8 @@ fn test_an_outer_product_takes_any_operation() {
 
 #[test]
 fn test_a_running_sum_of_ones_is_an_index() {
-    // Until the language has an index generator, a scan over a grid of ones
-    // gives 1, 2, …, n along the axis it walks. It costs a sweep it should not.
+    // A scan over a grid of ones counts 1, 2, …, n along the axis it walks —
+    // how an index was written before `⍳`, at the cost of a sweep.
     let source = r#"{
         INPUT:◯ □ 3 4
         (◈+ ((INPUT × 0.0) + 1.0)) → OUTPUT
@@ -2836,4 +2836,128 @@ fn test_the_intervals_know_max_min_and_residue() {
     // A clamp bounds both ends.
     let report = analyze("{\n    INPUT:◯ □ 4 1\n    ((INPUT ⌊ 1.0) ⌈ -1.0) → OUTPUT\n    OUTPUT → =\n}");
     assert_eq!((report.output_range.lo, report.output_range.hi), (-1.0, 1.0));
+}
+
+// --------------------------------------------------------------------------
+// ⍳: the coordinate of each cell along an axis, from zero. What a program
+// reaches for whenever a value depends on where its cell is.
+// --------------------------------------------------------------------------
+
+#[test]
+fn test_index_counts_from_zero_along_an_axis() {
+    let input: Vec<f64> = (0..12).map(|i| i as f64 * 10.0).collect();
+    // Along the innermost axis with more than one cell, as ▷ and ◇ default.
+    let out = run_kernel("iota_cols", "{\n    INPUT:◯ □ 3 4\n    (⍳INPUT) → =\n}", &input);
+    assert_eq!(&out[..12], &[0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0]);
+    // Along a named axis.
+    let out = run_kernel("iota_rows", "{\n    INPUT:◯ □ 3 4\n    (⍳0INPUT) → =\n}", &input);
+    assert_eq!(&out[..12], &[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0]);
+    // On a column, the trailing axis of length 1 is skipped.
+    let out = run_kernel("iota_column", "{\n    INPUT:◯ □ 8 1\n    (⍳INPUT) → =\n}", &input[..8]);
+    assert_eq!(&out[..8], &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+    // `#` spells it in ASCII, and a sign after it is a sign.
+    let block = parse_rho_program("{\n    INPUT:◯ □ 3 4\n    (#0INPUT - -1.0) → =\n}").unwrap();
+    let rho_lang::ast::Statement::Flow { src, .. } = &block.statements[1] else { panic!() };
+    assert!(matches!(src, Expr::BinaryOp { op: BinaryOpKind::Sub, .. }));
+    // Its operand is measured, not read: an expression's shape will do.
+    let out = run_kernel("iota_expr", "{\n    INPUT:◯ □ 3 4\n    (⍳(INPUT + INPUT)) → =\n}", &input);
+    assert_eq!(&out[..4], &[0.0, 1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn test_index_agrees_on_the_vector_path_and_under_broadcasting() {
+    // Sixteen cells in a row: a vector body of four lanes, whose indices are
+    // built per lane.
+    let input: Vec<f64> = (0..16).map(|i| (i as f64 * 0.37).sin()).collect();
+    let source = "{\n    INPUT:◯ □ 16 1\n    ((⍳INPUT × 2.0) - INPUT) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![16, 1], input.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    let out = run_kernel("iota_vector", source, &input);
+    assert_eq!(bits(&out[..16]), bits(&meant));
+    assert_eq!(out[5], 10.0 - input[5]);
+
+    // A column of row numbers stretched across a grid: the index follows the
+    // operand's layout, so every cell of a row gets that row's number.
+    let source = r#"{
+        X:◯ □ 3 4
+        Y:◯ □ 3 1
+        (X + ⍳Y) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let x: Vec<f64> = (0..12).map(|i| i as f64).collect();
+    let out = run_spaces("iota_broadcast", source, &[("X", x.clone()), ("Y", vec![0.0; 3]), ("OUTPUT", vec![0.0; 12])]);
+    let expected: Vec<f64> = (0..12).map(|i| i as f64 + (i / 4) as f64).collect();
+    assert_eq!(out["OUTPUT"], expected);
+}
+
+#[test]
+fn test_index_writes_a_window_a_distance_and_a_vandermonde_matrix() {
+    // A Hann window: symmetric, zero at the start, one in the middle.
+    let source = "{\n    INPUT:◯ □ 16 1\n    (0.5 - (0.5 × (cos (0.39269908169872414 × ⍳INPUT)))) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![16, 1], vec![0.0; 16]));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    let out = run_kernel("iota_hann", source, &[0.0; 16]);
+    assert_eq!(bits(&out[..16]), bits(&meant));
+    assert_eq!(out[0], 0.0);
+    assert!((out[8] - 1.0).abs() < 1e-15);
+    for k in 1..8 {
+        assert!((out[k] - out[16 - k]).abs() < 1e-15, "k = {k}");
+    }
+
+    // The squared distance from the centre of a row of four.
+    let out = run_kernel("iota_distance", "{\n    INPUT:◯ □ 4 1\n    ((⍳INPUT - 1.5) ^ 2) → =\n}", &[0.0; 4]);
+    assert_eq!(&out[..4], &[2.25, 0.25, 0.25, 2.25]);
+
+    // A Vandermonde matrix: each x raised to each column's power.
+    let source = r#"{
+        X:◯ □ 3
+        K:◯ □ 4
+        ((□1 X) ^ (□0 (⍳K))) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let out = run_spaces("iota_vandermonde", source, &[("X", vec![2.0, 3.0, 0.5]), ("K", vec![0.0; 4]), ("OUTPUT", vec![0.0; 12])]);
+    assert_eq!(
+        out["OUTPUT"],
+        vec![1.0, 2.0, 4.0, 8.0, 1.0, 3.0, 9.0, 27.0, 1.0, 0.5, 0.25, 0.125]
+    );
+}
+
+#[test]
+fn test_a_whole_exponent_is_decided_by_spelling_not_by_value() {
+    // `X ^ 2.0` is X × X. `X ^ Y` is a library power even where Y's cells
+    // happen to be 2, in the kernel and in the interpreter alike; the
+    // interpreter once decided by the value and could differ by an ulp.
+    let x: Vec<f64> = vec![1.1, 2.3, -0.7, 9.9];
+    let source = r#"{
+        X:◯ □ 4
+        Y:◯ □ 4
+        (X ^ Y) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("X".to_string(), Grid::from(vec![4], x.clone()));
+    env.insert("Y".to_string(), Grid::from(vec![4], vec![2.0; 4]));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    let out = run_spaces("pow_by_value", source, &[("X", x.clone()), ("Y", vec![2.0; 4]), ("OUTPUT", vec![0.0; 4])]);
+    assert_eq!(bits(&out["OUTPUT"]), bits(&meant));
+
+    let squared = run_kernel("pow_by_spelling", "{\n    INPUT:◯ □ 4 1\n    (INPUT ^ 2.0) → =\n}", &x);
+    let by_multiplication: Vec<f64> = x.iter().map(|v| v * v).collect();
+    assert_eq!(bits(&squared[..4]), bits(&by_multiplication));
+}
+
+#[test]
+fn test_the_intervals_bound_an_index_by_its_axis() {
+    let report = analyze("{\n    INPUT:◯ □ 3 4\n    (⍳INPUT) → OUTPUT\n    ! (OUTPUT >= 0)\n    ! (OUTPUT <= 3.0)\n    OUTPUT → =\n}");
+    assert_eq!(report.constraints[0].verdict, rho_lang::solver::Verdict::Proved);
+    assert_eq!(report.constraints[1].verdict, rho_lang::solver::Verdict::Proved);
+    assert_eq!((report.output_range.lo, report.output_range.hi), (0.0, 3.0));
+
+    let report = analyze("{\n    INPUT:◯ □ 3 4\n    (⍳0INPUT) → OUTPUT\n    OUTPUT → =\n}");
+    assert_eq!((report.output_range.lo, report.output_range.hi), (0.0, 2.0));
 }

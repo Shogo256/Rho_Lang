@@ -489,33 +489,7 @@ impl LlvmCodeGen {
     }
 
     fn expr_shape(expr: &Expr, shapes: &BTreeMap<String, Vec<usize>>) -> Option<Vec<usize>> {
-        match expr {
-            Expr::Var(name) => shapes.get(name).cloned(),
-            Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => {
-                Self::expr_shape(inner, shapes)
-            }
-            Expr::Lift { axis, operand } => {
-                let inner = Self::expr_shape(operand, shapes)?;
-                crate::ast::shape_with_unit_axis(&inner, *axis)
-            }
-            Expr::Scan { operand, .. } | Expr::Builtin { operand, .. } => {
-                Self::expr_shape(operand, shapes)
-            }
-            Expr::Reduce { axis, operand, .. } => {
-                let inner = Self::expr_shape(operand, shapes)?;
-                let a = axis.unwrap_or_else(|| crate::ast::default_axis(&inner));
-                (a < inner.len()).then(|| crate::ast::shape_without_axis(&inner, a))
-            }
-            Expr::BinaryOp { lhs, rhs, .. } => {
-                match (Self::expr_shape(lhs, shapes), Self::expr_shape(rhs, shapes)) {
-                    (Some(l), Some(r)) => crate::ast::broadcast_shapes(&l, &r),
-                    (Some(l), None) => Some(l),
-                    (None, Some(r)) => Some(r),
-                    (None, None) => None,
-                }
-            }
-            Expr::Number(_) => None,
-        }
+        crate::ast::expr_shape(expr, shapes)
     }
 
     fn primary_shape(shapes: &BTreeMap<String, Vec<usize>>) -> Option<Vec<usize>> {
@@ -1021,7 +995,7 @@ impl LlvmCodeGen {
         counter: &mut usize,
     ) -> Result<()> {
         match expr {
-            Expr::Var(_) | Expr::Number(_) => {}
+            Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => {}
             Expr::AuditTrace(inner)
             | Expr::Shift { operand: inner, .. }
             | Expr::Builtin { operand: inner, .. }
@@ -1088,7 +1062,7 @@ impl LlvmCodeGen {
     ) -> Result<String> {
         let mut block = pred.to_string();
         match expr {
-            Expr::Var(_) | Expr::Number(_) => {}
+            Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => {}
             Expr::AuditTrace(inner)
             | Expr::Shift { operand: inner, .. }
             | Expr::Builtin { operand: inner, .. }
@@ -1465,7 +1439,9 @@ impl LlvmCodeGen {
                 .max(self.max_shift_stride(rhs)?),
             // A fold is precomputed into its own buffer before the sweep, so
             // it contributes no reach to the sweep itself.
-            Expr::Reduce { .. } | Expr::Scan { .. } => 0,
+            // Neither reads a neighbour: a fold has its own buffer, an index
+            // reads nothing at all.
+            Expr::Reduce { .. } | Expr::Scan { .. } | Expr::Index { .. } => 0,
             Expr::Lift { operand, .. } | Expr::Builtin { operand, .. } => {
                 self.max_shift_stride(operand)?
             }
@@ -1500,11 +1476,7 @@ impl LlvmCodeGen {
 
     /// A literal exponent that is a whole number small enough to unroll.
     fn whole_exponent(rhs: &Expr) -> Option<i32> {
-        let Expr::Number(v) = rhs else { return None };
-        if *v != v.trunc() || v.abs() > 64.0 {
-            return None;
-        }
-        Some(*v as i32)
+        crate::ast::whole_exponent(rhs)
     }
 
     /// `x^n` as repeated multiplication, with a reciprocal for a negative n.
@@ -1673,6 +1645,11 @@ impl LlvmCodeGen {
             Expr::Reduce { .. } | Expr::Scan { .. } => {
                 Self::lifted_shape(&self.precomputed_shape(expr), lifts) != result_shape
             }
+            // An index is laid out like the operand it measures.
+            Expr::Index { operand, .. } => match Self::expr_shape(operand, &self.space_shapes) {
+                Some(shape) => Self::lifted_shape(&shape, lifts) != result_shape,
+                None => false,
+            },
             Expr::BinaryOp { lhs, rhs, .. } => {
                 self.needs_broadcast(lhs, result_shape, lifts)
                     || self.needs_broadcast(rhs, result_shape, lifts)
@@ -1831,6 +1808,66 @@ impl LlvmCodeGen {
                     self.precision.bytes()
                 ));
                 Ok(val)
+            }
+
+            // The coordinate of the cell along one axis of the operand's
+            // shape, from zero: the same arithmetic a shift uses to find its
+            // boundary, turned into a number. The operand is measured, never
+            // read.
+            Expr::Index { axis, operand } => {
+                let shape = Self::expr_shape(operand, &self.space_shapes).ok_or_else(|| {
+                    HarmonyDisruption::LoweringErr {
+                        line: self.current_line.get(),
+                        detail: "⍳ needs an operand with a known shape".to_string(),
+                    }
+                })?;
+                let (stride, extent) = self.axis_geometry(&shape, *axis)?;
+                let view = Self::lifted_shape(&shape, lifts);
+                let read_at = self.emit_index_map(ir, idx, &view, result_shape, counter)?;
+                let int_ty = mode.int_ty();
+                let lane_idx = match mode {
+                    Mode::Scalar(_) => read_at,
+                    Mode::Vector(w, _) => {
+                        let seed = Self::fresh(counter);
+                        let splat = Self::fresh(counter);
+                        let lanes = Self::fresh(counter);
+                        let offsets: Vec<String> = (0..w).map(|l| format!("i64 {l}")).collect();
+                        ir.push_str(&format!(
+                            "  {seed} = insertelement {int_ty} poison, i64 {read_at}, i64 0\n"
+                        ));
+                        ir.push_str(&format!(
+                            "  {splat} = shufflevector {int_ty} {seed}, {int_ty} poison, <{w} x i32> zeroinitializer\n"
+                        ));
+                        ir.push_str(&format!(
+                            "  {lanes} = add {int_ty} {splat}, <{}>\n",
+                            offsets.join(", ")
+                        ));
+                        lanes
+                    }
+                };
+                let pos = if stride == 1 {
+                    let p = Self::fresh(counter);
+                    ir.push_str(&format!(
+                        "  {p} = urem {int_ty} {lane_idx}, {}\n",
+                        mode.int_splat(extent as u64)
+                    ));
+                    p
+                } else {
+                    let q = Self::fresh(counter);
+                    let p = Self::fresh(counter);
+                    ir.push_str(&format!(
+                        "  {q} = udiv {int_ty} {lane_idx}, {}\n",
+                        mode.int_splat(stride as u64)
+                    ));
+                    ir.push_str(&format!(
+                        "  {p} = urem {int_ty} {q}, {}\n",
+                        mode.int_splat(extent as u64)
+                    ));
+                    p
+                };
+                let out = Self::fresh(counter);
+                ir.push_str(&format!("  {out} = uitofp {int_ty} {pos} to {ty}\n"));
+                Ok(out)
             }
 
             Expr::BinaryOp { op, lhs, rhs } => {

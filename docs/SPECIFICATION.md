@@ -43,6 +43,7 @@ principle.
 | `◇` | Fold | Dasseki (垜積) | Collapses an axis, see §3.5 | ✅ |
 | `◈` | Scan | Dasseki (垜積) | A running fold; keeps the shape, see §3.5 | ✅ |
 | `□` | Lift | Hojin (方陣) | In an expression, inserts a length-1 axis, see §3.6 | ✅ |
+| `⍳` / `#` | Index | — | The coordinate of each cell along an axis, from zero, see §3.7 | ✅ |
 | `+` | Addition | Superposition | Element-wise addition | ✅ |
 | `-` | Subtraction | Difference | Element-wise subtraction | ✅ |
 | `×` / `*` | Multiplication | Scaling | Element-wise product | ✅ |
@@ -325,9 +326,37 @@ need no new glyph:
   relaxation step; `◇>1 (A × B)` is max-times. Any fold over any operation.
 - **Outer products.** `□1A f □0B` applies `f` to every pair of a cell of A and
   a cell of B, APL's `∘.f`, for any `f` in the language.
-- **An index by scan.** `◈+ ((X × 0.0) + 1.0)` is `1, 2, …` along the axis it
-  walks, and `◈+0` counts rows instead. It costs a sweep an index generator
-  would not, and reads worse; it is what the language has today.
+
+### 3.7 Index (`⍳`) ✅
+
+`⍳X` is the coordinate of each cell of X's shape along one axis, counted from
+zero: on `◯ □ 3 4`, `⍳X` is `0 1 2 3` down every row and `⍳0X` is the row
+number. A bare `⍳` takes the innermost axis with more than one cell, as `▷` and
+`◇` do, and a digit names the axis. It is APL's `⍳` with `⎕IO←0`, counting from
+zero because the axes are numbered from zero. `#` spells it in ASCII.
+
+The operand is measured, never read: `⍳(A + B)` is the index of that
+expression's shape and evaluates nothing. Under broadcasting the index follows
+the operand's layout, so `X + ⍳Y` with `Y:◯ □ 3 1` adds each row's number to
+every cell of the row.
+
+This is what position-dependent computation is written with, and the language
+had no way to write it before:
+
+```rho
+(0.5 - (0.5 × (cos ((6.283185307179586 / 1024.0) × ⍳X)))) → W   /* a Hann window */
+((⍳X - 1.5) ^ 2) → D                                             /* squared distance from the centre */
+((□1 X) ^ (□0 (⍳K))) → V                                          /* a Vandermonde matrix, x^j */
+(n | ⍳X) → P                                                      /* a period-n pattern */
+```
+
+To the `!` check a coordinate is a value between 0 and the axis's extent less
+one, so `! (⍳X >= 0)` and `! (⍳X <= 3.0)` on `◯ □ 3 4` are both settled.
+
+A note on `^`, which an index is often the exponent of: `x ^ 2.0` is `x × x`,
+and `x ^ Y` is a library power even where Y's cells happen to be whole. The
+rule is by spelling, and the compiler and the interpreter take it from the
+same place; the interpreter once decided by value and could differ by an ulp.
 
 ### 3.4 Zero-Copy Pointer (`&`) ✅
 

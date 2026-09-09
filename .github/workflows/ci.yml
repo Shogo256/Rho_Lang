@@ -52,10 +52,12 @@ jobs:
     - name: Run Sample Compilation (`teichmuller.rho`)
       run: cargo run --bin rhoc -- examples/teichmuller.rho --dump-dag --dump-llvm
 
-    - name: Compile The Iterating Examples
+    - name: Compile The Examples
       run: |
         cargo run --bin rhoc -- examples/jacobi.rho --tau 1e-12 --max-iter 200
         cargo run --bin rhoc -- examples/laplace.rho --tau 1e-6 --max-iter 2000
+        cargo run --bin rhoc -- examples/min_plus.rho
+        cargo run --bin rhoc -- examples/window.rho
 
     - name: Check Codegen Determinism
       run: |

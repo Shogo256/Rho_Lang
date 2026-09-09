@@ -33,6 +33,8 @@ Working prototype. What runs today:
   checked, and `ind` so a program can count
 - APL's dyadic `⌈` `⌊` `|` — the greater, the lesser and the residue — so a
   ReLU is `X ⌈ 0.0`, a clamp is `(X ⌊ 1.0) ⌈ -1.0`, and `3.0 | X` is X mod 3
+- `⍳`, the coordinate of each cell along an axis from zero, so a window, a
+  distance from the centre or a Vandermonde matrix is one line
 - `--f32` for single precision, with the interpreter and the `!` check
   following the width
 - `□` lifting and broadcasting, so an outer product — and a matrix product — is
@@ -267,9 +269,9 @@ product — one step of a shortest-path relaxation:
 }
 ```
 
-Likewise `□1A f □0B` is the outer product under any operation `f`, and
-`◈+ ((X × 0.0) + 1.0)` counts `1, 2, …` along an axis — an index by scan, which
-costs a sweep an index generator would not.
+Likewise `□1A f □0B` is the outer product under any operation `f`, and `⍳X`
+is the coordinate of each cell — `((□1 X) ^ (□0 (⍳K)))` is a Vandermonde
+matrix, `(0.5 - 0.5 × cos((2π/N) × ⍳X))` a Hann window.
 
 ```rho
 {

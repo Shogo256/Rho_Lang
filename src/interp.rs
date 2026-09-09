@@ -206,7 +206,7 @@ fn shape_of<S: Numeric>(expr: &Expr, env: &Env<S>, line: usize) -> Result<Option
         Expr::AuditTrace(inner) | Expr::Shift { operand: inner, .. } => {
             shape_of(inner, env, line)?
         }
-        Expr::Scan { operand, .. } | Expr::Builtin { operand, .. } => {
+        Expr::Scan { operand, .. } | Expr::Builtin { operand, .. } | Expr::Index { operand, .. } => {
             shape_of(operand, env, line)?
         }
         Expr::Lift { axis, operand } => match shape_of(operand, env, line)? {
@@ -318,6 +318,19 @@ fn eval_cell<S: Numeric>(
             eval_cell(operand, env, tau, line, at_shape, index, &nested)
         }
 
+        // The coordinate of this cell along one axis of the operand's shape,
+        // from zero. The operand is never evaluated, only measured.
+        Expr::Index { axis, operand } => {
+            let inner_shape = shape_of(operand, env, line)?
+                .ok_or_else(|| err(line, "⍳ needs an operand with a shape"))?;
+            let view = lifted(&inner_shape, lifts);
+            let mapped = map_index(&view, at_shape, index);
+            let a = axis.unwrap_or_else(|| default_axis(&inner_shape));
+            let (stride, extent) = axis_geometry(&inner_shape, Some(a))
+                .ok_or_else(|| err(line, format!("axis {a} is past the end of {inner_shape:?}")))?;
+            Ok(S::constant(((mapped / stride) % extent) as f64))
+        }
+
         // A shift reads the neighbour along one axis, or 0 at its boundary.
         Expr::Shift { dir, axis, operand } => {
             let inner_shape = shape_of(operand, env, line)?
@@ -399,7 +412,13 @@ fn eval_cell<S: Numeric>(
                 BinaryOpKind::Sub => l.sub(&r),
                 BinaryOpKind::Mul => l.mul(&r),
                 BinaryOpKind::Div => l.div(&r),
-                BinaryOpKind::Pow => integer_power(&l, &r),
+                // Repeated multiplication when the exponent is spelled as a
+                // whole number, a library power otherwise — the compiler's
+                // rule, taken from the same place.
+                BinaryOpKind::Pow => match whole_exponent(rhs) {
+                    Some(n) => integer_power(&l, &S::constant(n as f64)),
+                    None => l.power(&r),
+                },
                 BinaryOpKind::Gt => mask(Compare::Gt),
                 BinaryOpKind::Lt => mask(Compare::Lt),
                 BinaryOpKind::Gte => mask(Compare::Gte),

@@ -55,6 +55,9 @@ impl fmt::Display for Cmp {
 pub enum Sym {
     /// A cell of an unwritten space, named `SPACE@offset`. Ranges over all reals.
     Free(String),
+    /// A coordinate along an axis: which cell this is, the analysis does not
+    /// know, but it lies between 0 and the extent less one.
+    Coordinate { name: String, extent: usize },
     Const(f64),
     Add(Box<Sym>, Box<Sym>),
     Sub(Box<Sym>, Box<Sym>),
@@ -184,6 +187,20 @@ impl Builder<'_> {
             Expr::AuditTrace(inner) | Expr::Lift { operand: inner, .. } => {
                 self.build(inner, before, offset)
             }
+            // A constraint speaks about any cell, so its coordinate is a free
+            // value within the axis; the operand is only measured.
+            Expr::Index { axis, operand } => {
+                let extent = place_name(operand)
+                    .and_then(|name| axis_geometry(&self.shape_of(&name), *axis))
+                    .map(|(_, extent)| extent);
+                match extent {
+                    Some(extent) => Sym::Coordinate {
+                        name: format!("⍳{}@{}", axis.map(|a| a.to_string()).unwrap_or_default(), offset_tag(offset)),
+                        extent,
+                    },
+                    None => Sym::Free(format!("⍳@{}", offset_tag(offset))),
+                }
+            }
 
             // A named function keeps the cell it was applied to, so it can be
             // reasoned about pointwise. `ind` is bounded on both ends.
@@ -306,17 +323,18 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
                     FlowTarget::Var(n) => n.clone(),
                     FlowTarget::Equilibrium => "OUTPUT".to_string(),
                 };
-                shapes
-                    .entry(name.clone())
-                    .or_insert_with(|| fallback_shape.clone());
+                // The shape a flow writes is the shape of what it flows; the
+                // grid's is only a last resort. A shift's boundary flag is
+                // free either way, but an index's extent is not.
+                let inferred = expr_shape(src, &shapes).unwrap_or_else(|| fallback_shape.clone());
+                shapes.entry(name.clone()).or_insert(inferred);
                 defs.push((name, src.clone()));
                 looped.push(false);
                 def_lines.push(block.line_of(index));
             }
             Statement::Iterate { src, target } => {
-                shapes
-                    .entry(target.clone())
-                    .or_insert_with(|| fallback_shape.clone());
+                let inferred = expr_shape(src, &shapes).unwrap_or_else(|| fallback_shape.clone());
+                shapes.entry(target.clone()).or_insert(inferred);
                 defs.push((target.clone(), src.clone()));
                 looped.push(true);
                 def_lines.push(block.line_of(index));
@@ -409,7 +427,8 @@ fn collect_divisions(
         | Expr::AuditTrace(inner) => {
             collect_divisions(inner, at, line, builder, out)
         }
-        Expr::Var(_) | Expr::Number(_) => {}
+        // An index measures its operand and never evaluates it.
+        Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => {}
     }
 }
 
@@ -452,7 +471,7 @@ fn collect_domains(
         | Expr::Scan { operand: inner, .. }
         | Expr::Lift { operand: inner, .. }
         | Expr::AuditTrace(inner) => collect_domains(inner, at, line, builder, out),
-        Expr::Var(_) | Expr::Number(_) => {}
+        Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => {}
     }
 }
 
@@ -478,6 +497,10 @@ impl fmt::Display for ExprGlyphs<'_> {
             Expr::Var(name) => write!(f, "{name}"),
             Expr::AuditTrace(inner) => write!(f, "$ {}", ExprGlyphs(inner)),
             Expr::Lift { axis, operand } => write!(f, "□{axis}{}", ExprGlyphs(operand)),
+            Expr::Index { axis, operand } => match axis {
+                Some(a) => write!(f, "⍳{a}{}", ExprGlyphs(operand)),
+                None => write!(f, "⍳{}", ExprGlyphs(operand)),
+            },
             Expr::Shift { dir, axis, operand } => match axis {
                 Some(a) => write!(f, "{dir}{a}{}", ExprGlyphs(operand)),
                 None => write!(f, "{dir}{}", ExprGlyphs(operand)),

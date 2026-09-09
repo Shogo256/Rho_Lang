@@ -237,9 +237,14 @@ fn expression(
     }
 
     match rng.below(10) {
-        // A shift keeps its shape, but needs a space to read a neighbour from.
+        // A shift keeps its shape, but needs a space to read a neighbour from;
+        // an index keeps it too, and one in three of these is one.
         0 | 1 if !matching.is_empty() => {
-            let glyph = ["▷", "▽"][rng.below(2)];
+            let glyph = if rng.below(3) == 0 {
+                "⍳"
+            } else {
+                ["▷", "▽"][rng.below(2)]
+            };
             let axis = if want.len() > 1 && rng.below(2) == 0 {
                 rng.below(want.len()).to_string()
             } else {

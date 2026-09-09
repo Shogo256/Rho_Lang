@@ -190,6 +190,16 @@ pub enum Expr {
         op: BuiltinOp,
         operand: Box<Expr>,
     },
+    /// `⍳X` — the coordinate of each cell of X's shape along one axis,
+    /// counted from zero; `⍳0X` names the axis, a bare `⍳X` takes the
+    /// innermost axis with more than one cell, as `▷` and `◇` do. X is read
+    /// for its shape alone and never evaluated. APL's `⍳` with `⎕IO←0`, and
+    /// what position-dependent computation is written with: a window, a
+    /// distance from the centre, a Vandermonde matrix, a decay.
+    Index {
+        axis: Option<usize>,
+        operand: Box<Expr>,
+    },
     /// `□2X` — view X with a length-1 axis inserted at that position.
     ///
     /// A length-1 axis costs nothing and stores nothing; it exists so an
@@ -286,6 +296,56 @@ impl ToposBlock {
             .map(|i| self.line_of(i))
             .unwrap_or(0)
     }
+}
+
+/// The shape an expression produces, given the shapes of the spaces it reads,
+/// or None for an expression of literals alone. The compiler, the reference
+/// interpreter's static check and the `!` analysis all read shapes from here,
+/// so an intermediate has the same shape to each of them.
+pub fn expr_shape(
+    expr: &Expr,
+    shapes: &std::collections::BTreeMap<String, Vec<usize>>,
+) -> Option<Vec<usize>> {
+    match expr {
+        Expr::Var(name) => shapes.get(name).cloned(),
+        Expr::Shift { operand: inner, .. } | Expr::AuditTrace(inner) => expr_shape(inner, shapes),
+        Expr::Lift { axis, operand } => {
+            let inner = expr_shape(operand, shapes)?;
+            shape_with_unit_axis(&inner, *axis)
+        }
+        Expr::Scan { operand, .. }
+        | Expr::Builtin { operand, .. }
+        | Expr::Index { operand, .. } => expr_shape(operand, shapes),
+        Expr::Reduce { axis, operand, .. } => {
+            let inner = expr_shape(operand, shapes)?;
+            let a = axis.unwrap_or_else(|| default_axis(&inner));
+            (a < inner.len()).then(|| shape_without_axis(&inner, a))
+        }
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            match (expr_shape(lhs, shapes), expr_shape(rhs, shapes)) {
+                (Some(l), Some(r)) => broadcast_shapes(&l, &r),
+                (Some(l), None) => Some(l),
+                (None, Some(r)) => Some(r),
+                (None, None) => None,
+            }
+        }
+        Expr::Number(_) => None,
+    }
+}
+
+/// The exponent of `x ^ n` when `n` is written as a small whole number, in
+/// which case the power is repeated multiplication rather than a call to the
+/// maths library. Decided by spelling, not by value: `x ^ Y` with a space Y
+/// whose cells happen to be whole is still a library power. The compiler and
+/// the interpreter both take the answer from here, so they cannot disagree.
+pub fn whole_exponent(exponent: &Expr) -> Option<i32> {
+    let Expr::Number(v) = exponent else {
+        return None;
+    };
+    if *v != v.trunc() || v.abs() > 64.0 {
+        return None;
+    }
+    Some(*v as i32)
 }
 
 /// The shape with a length-1 axis inserted at `axis`.

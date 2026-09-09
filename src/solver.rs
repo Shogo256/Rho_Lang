@@ -345,6 +345,11 @@ fn pow(base: Interval, exp: Interval) -> Interval {
 pub fn eval_interval(sym: &Sym) -> Interval {
     match sym {
         Sym::Free(_) => Interval::UNBOUNDED,
+        // Exact: a small whole number converts without rounding.
+        Sym::Coordinate { extent, .. } => Interval {
+            lo: 0.0,
+            hi: extent.saturating_sub(1) as f64,
+        },
         Sym::Const(v) => Interval::point(*v),
         Sym::Add(a, b) => {
             let (a, b) = (eval_interval(a), eval_interval(b));

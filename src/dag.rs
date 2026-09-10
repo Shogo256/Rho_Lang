@@ -40,20 +40,35 @@ impl RhoDag {
             }
         }
 
-        // 2. Build directed edges from flow statements (→) and iterations (⇒)
+        // 2. Build directed edges from flow statements (→) and iterations (⇒),
+        // a loop's prelude flows included.
+        let mut edges: Vec<(&Expr, String, &str)> = Vec::new();
         for stmt in &block.statements {
-            let (src, target_label, kind) = match stmt {
-                Statement::Flow { src, target } => (
+            match stmt {
+                Statement::Flow { src, target } => edges.push((
                     src,
                     match target {
                         FlowTarget::Var(name) => name.clone(),
                         FlowTarget::Equilibrium => "EQUILIBRIUM(=)".to_string(),
                     },
                     "flow",
-                ),
-                Statement::Iterate { src, target } => (src, target.clone(), "iterate"),
-                _ => continue,
-            };
+                )),
+                Statement::Iterate { prelude, src, target } => {
+                    for flow in prelude {
+                        if let Statement::Flow {
+                            src,
+                            target: FlowTarget::Var(t),
+                        } = flow
+                        {
+                            edges.push((src, t.clone(), "iterate"));
+                        }
+                    }
+                    edges.push((src, target.clone(), "iterate"));
+                }
+                _ => {}
+            }
+        }
+        for (src, target_label, kind) in edges {
 
             let target_idx = *node_map.entry(target_label.clone()).or_insert_with(|| {
                 graph.add_node(DagNode {

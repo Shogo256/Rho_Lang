@@ -121,8 +121,8 @@ pub fn interpret_with<S: Numeric>(
                     break;
                 }
             }
-            Statement::Iterate { src, target } => {
-                iterate(src, target, &mut env, options, line)?;
+            Statement::Iterate { prelude, src, target } => {
+                iterate(prelude, src, target, &mut env, options, line)?;
             }
             _ => {}
         }
@@ -135,6 +135,7 @@ pub fn interpret_with<S: Numeric>(
 /// reached. Every sweep reads the whole previous grid, so this is a Jacobi
 /// iteration; the cap alone guarantees it ends.
 fn iterate<S: Numeric>(
+    prelude: &[Statement],
     src: &Expr,
     target: &str,
     env: &mut Env<S>,
@@ -144,6 +145,17 @@ fn iterate<S: Numeric>(
     let tau = S::constant(options.tau);
     let mut sweeps = 0usize;
     loop {
+        // The prelude first, every round: the flows a call expanded into.
+        for flow in prelude {
+            if let Statement::Flow {
+                src,
+                target: FlowTarget::Var(t),
+            } = flow
+            {
+                let value = eval(src, env, options.tau, line)?;
+                env.insert(t.clone(), value);
+            }
+        }
         let previous = env
             .get(target)
             .ok_or_else(|| HarmonyDisruption::SpaceErr {

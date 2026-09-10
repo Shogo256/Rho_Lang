@@ -139,6 +139,9 @@ struct Builder<'a> {
     defs: &'a [(String, Expr)],
     /// Which definitions are a `⇒` rather than a `→`.
     looped: &'a [bool],
+    /// For a definition evaluated inside a loop — the `⇒` itself, or a flow
+    /// of its prelude — the loop's target, which it reads as the iterate.
+    iterate_target: &'a [Option<String>],
     shapes: &'a BTreeMap<String, Vec<usize>>,
     fallback_shape: Vec<usize>,
     tau: f64,
@@ -149,7 +152,7 @@ impl Builder<'_> {
     /// Whether `name`, read while expanding definition `at`, is that
     /// definition's own iterate rather than an earlier flow's value.
     fn is_iterate_of(&self, at: usize, name: &str) -> bool {
-        self.looped.get(at).copied().unwrap_or(false) && self.defs[at].0 == name
+        matches!(self.iterate_target.get(at), Some(Some(t)) if t == name)
     }
 
     /// What a `⇒` leaves in its target. Nothing is assumed about it: the
@@ -364,6 +367,7 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
     // Flow definitions in order, and where each constraint sits among them.
     let mut defs: Vec<(String, Expr)> = Vec::new();
     let mut looped: Vec<bool> = Vec::new();
+    let mut iterate_target: Vec<Option<String>> = Vec::new();
     let mut def_lines: Vec<usize> = Vec::new();
     let mut constraints: Vec<(usize, Expr, usize)> = Vec::new();
     for (index, stmt) in block.statements.iter().enumerate() {
@@ -380,13 +384,32 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
                 shapes.entry(name.clone()).or_insert(inferred);
                 defs.push((name, src.clone()));
                 looped.push(false);
+                iterate_target.push(None);
                 def_lines.push(block.line_of(index));
             }
-            Statement::Iterate { src, target } => {
+            Statement::Iterate { prelude, src, target } => {
+                // The prelude's flows are evaluated every round, reading the
+                // iterate; they are definitions in their own right, tied to
+                // the loop.
+                for flow in prelude {
+                    if let Statement::Flow {
+                        src,
+                        target: FlowTarget::Var(t),
+                    } = flow
+                    {
+                        let inferred = expr_shape(src, &shapes).unwrap_or_else(|| fallback_shape.clone());
+                        shapes.entry(t.clone()).or_insert(inferred);
+                        defs.push((t.clone(), src.clone()));
+                        looped.push(false);
+                        iterate_target.push(Some(target.clone()));
+                        def_lines.push(block.line_of(index));
+                    }
+                }
                 let inferred = expr_shape(src, &shapes).unwrap_or_else(|| fallback_shape.clone());
                 shapes.entry(target.clone()).or_insert(inferred);
                 defs.push((target.clone(), src.clone()));
                 looped.push(true);
+                iterate_target.push(Some(target.clone()));
                 def_lines.push(block.line_of(index));
             }
             Statement::Constraint(expr) => {
@@ -400,6 +423,7 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
     let mut builder = Builder {
         defs: &defs_snapshot,
         looped: &looped,
+        iterate_target: &iterate_target,
         shapes: &shapes,
         fallback_shape,
         tau,

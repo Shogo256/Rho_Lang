@@ -4,9 +4,10 @@
    It sees its parameters, 𝜏 and constants — nothing of the caller's — and
    definitions come before their use, which is what rules recursion out.
    Nothing runs at call time: the body is copied in with the arguments bound,
-   so a function costs what its body costs and no more.
+   so a function costs what its body costs and no more. Inside a `⇒` the
+   body's flows become the loop's prelude, run again on every round.
 
-     rhoc examples/functions.rho
+     rhoc examples/functions.rho --tau 1e-12 --max-iter 200
 */
 
 smooth:{ X ((▷X + X + ▽X) / 3.0) }
@@ -19,9 +20,17 @@ norm:{ V
 
 blend:{ A B W ((A × W) + (B × (1.0 - W))) }
 
+step:{ U                    /* one Jacobi step for 4x[i] + x[i-1] + x[i+1] = b */
+    (▷U + ▽U) → S
+    (S / 4.0) → =
+}
+
 {
     INPUT:◯ □ 256 1
 
     (blend (smooth (smooth INPUT)) INPUT 0.5) → MIXED
-    (MIXED / (□0 (norm MIXED))) → =
+    (MIXED / (□0 (norm MIXED))) → B
+    B → X
+    ((B / 4.0) - (step X)) ⇒ X      /* S is refilled each round */
+    X → =
 }

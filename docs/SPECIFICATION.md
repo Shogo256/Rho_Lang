@@ -501,9 +501,28 @@ one it would call back.
 An error inside a body points at both places: the body line it arose on and
 the call that expanded it, each with a caret.
 
-Not in this version: a body of flows as the body of a `⇒` (a call there must
-be to an expression body, with names or numbers as arguments), a `⇒` inside a
-body, an infix spelling `A blend B`, and the rank operator `⍤`.
+A call inside a `⇒` expands into the loop. What it would have flowed before
+the call — a body's flows, an argument that is an expression — becomes the
+loop's prelude: flows that run on every round, before the update, reading
+the iterate as it stands. So a step written as flows iterates like one
+written as an expression, and costs the same:
+
+```rho
+step:{ U
+    (▷U + ▽U) → S
+    (S / 4.0) → =
+}
+
+{
+    INPUT:◯ □ 6 1
+    INPUT → X
+    ((INPUT / 4.0) - (step X)) ⇒ X        /* S is refilled each round */
+    X → =
+}
+```
+
+Not in this version: a `⇒` inside a body, an infix spelling `A blend B`, and
+the rank operator `⍤`.
 
 A note on `^`, which an index is often the exponent of: `x ^ 2.0` is `x × x`,
 and `x ^ Y` is a library power even where Y's cells happen to be whole. The

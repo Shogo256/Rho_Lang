@@ -481,18 +481,17 @@ fn expand_calls(statements: Vec<Statement>, lines: Vec<usize>, functions: &Funct
             },
             Statement::Constraint(expr) => Statement::Constraint(expander.expression(&expr, line, &mut out)?),
             Statement::AuditTrace(expr) => Statement::AuditTrace(expander.expression(&expr, line, &mut out)?),
-            Statement::Iterate { src, target } => {
-                // Anything hoisted would run once, before the loop, rather
-                // than on every round: not yet.
-                let before = out.len();
-                let src = expander.expression(&src, line, &mut out)?;
-                if out.len() != before {
-                    return Err(HarmonyDisruption::IterateErr {
-                        detail: "a call inside `⇒` may only be to a function with an expression body, with names or numbers as arguments, in this version".to_string(),
-                        line,
-                    });
-                }
-                Statement::Iterate { src, target }
+            Statement::Iterate { prelude, src, target } => {
+                // What a call hoists — an argument's binding, a body of flows
+                // — has to run on every round, so it goes into the loop's
+                // prelude rather than before the loop.
+                // The call's origin, which the expansion records, serves the
+                // whole statement, prelude included.
+                let mut hoisted: Vec<(Statement, usize, Option<Origin>)> = Vec::new();
+                let src = expander.expression(&src, line, &mut hoisted)?;
+                let mut prelude = prelude;
+                prelude.extend(hoisted.into_iter().map(|(stmt, _, _)| stmt));
+                Statement::Iterate { prelude, src, target }
             }
             other => other,
         };
@@ -854,6 +853,7 @@ fn parse_line(line: &str) -> Result<Option<Statement>> {
             });
         }
         return Ok(Some(Statement::Iterate {
+            prelude: Vec::new(),
             src,
             target: target.to_string(),
         }));
@@ -1434,7 +1434,18 @@ pub fn validate_space_declarations(block: &ToposBlock) -> Result<()> {
                     }
                 }
             }
-            Statement::Iterate { src, target } => {
+            Statement::Iterate { prelude, src, target } => {
+                for flow in prelude {
+                    if let Statement::Flow {
+                        src,
+                        target: FlowTarget::Var(t),
+                    } = flow
+                    {
+                        check_expr_spaces(src, &declared_spaces, line)?;
+                        declared_spaces.insert(t.clone());
+                        written.insert(t.clone());
+                    }
+                }
                 check_expr_spaces(src, &declared_spaces, line)?;
                 if !written.contains(target) {
                     return Err(HarmonyDisruption::IterateErr {
@@ -1616,9 +1627,15 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
 
     for (index, stmt) in block.statements.iter().enumerate() {
         match stmt {
-            Statement::Flow { src, .. }
-            | Statement::Iterate { src, .. }
-            | Statement::Constraint(src) => {
+            Statement::Flow { src, .. } | Statement::Constraint(src) => {
+                check_broadcast(src, &space_shapes, block.line_of(index))?
+            }
+            Statement::Iterate { prelude, src, .. } => {
+                for flow in prelude {
+                    if let Statement::Flow { src, .. } = flow {
+                        check_broadcast(src, &space_shapes, block.line_of(index))?;
+                    }
+                }
                 check_broadcast(src, &space_shapes, block.line_of(index))?
             }
             _ => {}
@@ -1629,7 +1646,19 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
     for (index, stmt) in block.statements.iter().enumerate() {
         // An iteration writes back into the space it reads, so the body has
         // to produce exactly that space's shape — nothing to infer here.
-        if let Statement::Iterate { src, target } = stmt {
+        if let Statement::Iterate { prelude, src, target } = stmt {
+            // The prelude's targets take the shapes their flows produce.
+            for flow in prelude {
+                if let Statement::Flow {
+                    src,
+                    target: FlowTarget::Var(t),
+                } = flow
+                {
+                    if let Some(shape) = get_expr_shape(src, &space_shapes) {
+                        space_shapes.entry(t.clone()).or_insert(shape);
+                    }
+                }
+            }
             let body = get_expr_shape(src, &space_shapes);
             let held = space_shapes.get(target).cloned();
             if let (Some(body), Some(held)) = (body, held) {

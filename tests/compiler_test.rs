@@ -3636,9 +3636,121 @@ relax:{ U ((▷U + ▽U) / 4.0) }
         assert!((4.0 * out[i] + left + right - b[i]).abs() < 1e-10);
     }
 
-    // A body of flows inside the loop would run once, not every round: refused
-    // for now, with the reason.
-    let source = "\nstep:{ U\n    (▷U + ▽U) → S\n    (S / 4.0) → =\n}\n{\n    INPUT:◯ □ 6 1\n    INPUT → X\n    (step X) ⇒ X\n    X → =\n}";
-    let err = parse_rho_program(source).unwrap_err();
-    assert!(matches!(err, HarmonyDisruption::IterateErr { line: 9, .. }), "{err}");
+    // The same step as a body of flows: its flows become the loop's prelude,
+    // run on every round before the update, and the bits are the same.
+    let source = r#"
+step:{ U
+    (▷U + ▽U) → S
+    (S / 4.0) → =
+}
+{
+    INPUT:◯ □ 6 1
+    INPUT → X
+    ((INPUT / 4.0) - (step X)) ⇒ X
+    X → =
+}"#;
+    let block = parse_rho_program(source).unwrap();
+    let as_flows = interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone();
+    assert_eq!(bits(&as_flows), bits(&meant));
+    let so = compile_iterating("fn_fixed_point_flows", source, options.tau, options.max_sweeps, true);
+    let (out, _, converged) = run_iterating(&so, &b, 6);
+    assert!(converged);
+    assert_eq!(bits(&out), bits(&meant));
+}
+
+#[test]
+fn test_a_call_inside_a_fixed_point_runs_its_flows_every_round() {
+    // A prelude that ran once, before the loop, would see only the starting
+    // value: the mean of INPUT, not of the iterate. X = 0.5 (X - mean X)
+    // then contracts to zero only if the mean is taken afresh each round.
+    let source = r#"
+center:{ U
+    (◇+ U) → M
+    (U - (M / 8.0)) → =
+}
+{
+    INPUT:◯ □ 8
+    INPUT → X
+    ((center X) × 0.5) ⇒ X
+    X → =
+}"#;
+    let block = parse_rho_program(source).unwrap();
+    let b: Vec<f64> = vec![1.0, -2.0, 3.0, 0.5, -1.5, 2.0, 4.0, -0.5];
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![8], b.clone()));
+    let options = Options { tau: 1e-12, max_sweeps: 500 };
+    let meant = interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone();
+    for simd in [true, false] {
+        let so = compile_iterating(
+            &format!("fn_prelude_fold_{}", if simd { "simd" } else { "scalar" }),
+            source,
+            options.tau,
+            options.max_sweeps,
+            simd,
+        );
+        let (out, sweeps, converged) = run_iterating(&so, &b, 8);
+        assert!(converged, "sweeps {sweeps}");
+        assert_eq!(bits(&out), bits(&meant));
+        assert!(out.iter().all(|v| v.abs() < 1e-11), "{out:?}");
+    }
+
+    // The prelude is inside the loop in the IR, one sweep per flow, and an
+    // argument that is an expression is bound there as well.
+    let source = r#"
+relax:{ U ((▷U + ▽U) / 4.0) }
+{
+    INPUT:◯ □ 6 1
+    INPUT → X
+    ((INPUT / 4.0) - (relax (X × 1.0))) ⇒ X
+    X → =
+}"#;
+    let block = parse_rho_program(source).unwrap();
+    let ir = LlvmCodeGen::new("fn_prelude_arg")
+        .with_tau(1e-12)
+        .with_max_sweeps(500)
+        .generate_llvm_ir(&block)
+        .unwrap();
+    assert!(ir.contains("Iterate 2 prelude 0"), "{ir}");
+    let prelude_at = ir.find("Iterate 2 prelude 0").unwrap();
+    let round_at = ir.find("Iterate 2 round").unwrap();
+    let header_at = ir.find("it2.header:").unwrap();
+    assert!(header_at < prelude_at && prelude_at < round_at, "{ir}");
+    let b: Vec<f64> = vec![1.0, -2.0, 3.0, 0.5, -1.5, 2.0];
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![6, 1], b.clone()));
+    let options = Options { tau: 1e-12, max_sweeps: 500 };
+    let meant = interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone();
+    let so = compile_iterating("fn_prelude_arg", source, options.tau, options.max_sweeps, true);
+    let (out, _, converged) = run_iterating(&so, &b, 6);
+    assert!(converged);
+    assert_eq!(bits(&out), bits(&meant));
+    for i in 0..6 {
+        let left = if i == 0 { 0.0 } else { out[i - 1] };
+        let right = if i == 5 { 0.0 } else { out[i + 1] };
+        assert!((4.0 * out[i] + left + right - b[i]).abs() < 1e-10);
+    }
+
+    // The analysis reads the prelude as part of the loop: the iterate is
+    // unknown, so a claim on it after the loop is not proved, and not
+    // wrongly refuted either.
+    let report = analyze(
+        r#"
+step:{ U
+    (U × 0.5) → S
+    (S + 1.0) → =
+}
+{
+    INPUT:◯ □ 4 1
+    INPUT → X
+    (step X) ⇒ X
+    ! (X >= 0)
+    X → =
+}"#,
+    );
+    assert_eq!(report.constraints.len(), 1);
+    assert!(
+        matches!(report.constraints[0].verdict, Verdict::Unproven(_)),
+        "{:?}",
+        report.constraints[0].verdict
+    );
 }

@@ -354,6 +354,10 @@ pub enum Statement {
     /// the loop. NAME must have been written by an earlier flow: the starting
     /// point of an iteration is part of its meaning and is spelled out.
     Iterate {
+        /// Flows that run on every round before the update, in order: what a
+        /// call to a function with a body of flows expands into inside the
+        /// loop. Their targets are spaces of their own, refilled each round.
+        prelude: Vec<Statement>,
         src: Expr,
         target: String,
     },

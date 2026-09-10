@@ -469,14 +469,32 @@ impl LlvmCodeGen {
         // guess, so temporaries are never smaller than the loop that fills them.
         // `X → =` writes OUTPUT too, and a caller that supplies every buffer
         // needs to know that space and its shape.
+        let mut flows: Vec<(&Expr, &str)> = Vec::new();
         for stmt in &block.statements {
-            let Statement::Flow { src, target } = stmt else {
-                continue;
-            };
-            let name = match target {
-                FlowTarget::Var(name) => name.as_str(),
-                FlowTarget::Equilibrium => "OUTPUT",
-            };
+            match stmt {
+                Statement::Flow { src, target } => flows.push((
+                    src,
+                    match target {
+                        FlowTarget::Var(name) => name.as_str(),
+                        FlowTarget::Equilibrium => "OUTPUT",
+                    },
+                )),
+                // A loop's prelude writes spaces of its own.
+                Statement::Iterate { prelude, .. } => {
+                    for flow in prelude {
+                        if let Statement::Flow {
+                            src,
+                            target: FlowTarget::Var(t),
+                        } = flow
+                        {
+                            flows.push((src, t.as_str()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (src, name) in flows {
             if !shapes.contains_key(name) {
                 let inferred = Self::expr_shape(src, &shapes)
                     .or_else(|| Self::primary_shape(&shapes))
@@ -776,9 +794,9 @@ impl LlvmCodeGen {
                         break;
                     }
                 }
-                Statement::Iterate { src, target } => {
+                Statement::Iterate { prelude, src, target } => {
                     loop_id += 1;
-                    pred = self.emit_iterate(src, target, ir, bufs, &pred, loop_id, counter)?;
+                    pred = self.emit_iterate(prelude, src, target, ir, bufs, &pred, loop_id, counter)?;
                 }
                 _ => {}
             }
@@ -900,6 +918,7 @@ impl LlvmCodeGen {
     #[allow(clippy::too_many_arguments)]
     fn emit_iterate(
         &self,
+        prelude: &[Statement],
         src: &Expr,
         target: &str,
         ir: &mut String,
@@ -928,6 +947,11 @@ impl LlvmCodeGen {
         let suffix = self.precision.intrinsic_suffix();
 
         let next = self.emit_scratch(ir, &format!("{label}_next"), cells, &mut bufs.heap);
+        for flow in prelude {
+            if let Statement::Flow { src, .. } = flow {
+                self.reserve_fold_buffers(src, ir, bufs, counter)?;
+            }
+        }
         self.reserve_fold_buffers(src, ir, bufs, counter)?;
 
         ir.push_str(&format!(
@@ -939,13 +963,36 @@ impl LlvmCodeGen {
         ir.push_str(&format!(
             "  %{label}.k = phi i64 [ 0, %{pred} ], [ %{label}.k.next, %{label}.decide ]\n"
         ));
+        // The prelude's flows first, every round, each a sweep of its own.
+        let mut inner_pred = format!("{label}.header");
+        for (i, flow) in prelude.iter().enumerate() {
+            let Statement::Flow {
+                src: flow_src,
+                target: FlowTarget::Var(t),
+            } = flow
+            else {
+                continue;
+            };
+            let ptr = self.lookup(bufs, t)?;
+            inner_pred = self.emit_sweep(
+                flow_src,
+                &FlowTarget::Var(t.clone()),
+                &ptr,
+                ir,
+                bufs,
+                &inner_pred,
+                &format!("{label}.p{i}"),
+                &format!("Iterate {loop_id} prelude {i}"),
+                counter,
+            )?;
+        }
         let after_sweep = self.emit_sweep(
             src,
             &flow_target,
             &next,
             ir,
             bufs,
-            &format!("{label}.header"),
+            &inner_pred,
             &format!("{label}.sweep"),
             &format!("Iterate {loop_id} round"),
             counter,
@@ -1383,6 +1430,19 @@ impl LlvmCodeGen {
                 Statement::Iterate { target, .. } => Some(target.clone()),
                 _ => None,
             })
+            .chain(block.statements.iter().flat_map(|stmt| match stmt {
+                Statement::Iterate { prelude, .. } => prelude
+                    .iter()
+                    .filter_map(|flow| match flow {
+                        Statement::Flow {
+                            target: FlowTarget::Var(t),
+                            ..
+                        } => Some(t.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            }))
             .collect()
     }
 

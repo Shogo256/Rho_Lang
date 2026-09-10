@@ -440,6 +440,8 @@ fn program(rng: &mut Rng, dims: &str, shape: &[usize]) -> (String, Option<Vec<us
     };
 
     let mut body = String::new();
+    // Definitions, which go before the program.
+    let mut defs = String::new();
 
     for k in 0..=rng.below(3) {
         // Half the intermediates keep the grid; the rest collapse an axis, so
@@ -460,6 +462,20 @@ fn program(rng: &mut Rng, dims: &str, shape: &[usize]) -> (String, Option<Vec<us
         // anchored to a space so that it has one.
         if rng.below(4) == 0 {
             let mut update = expression(rng, 2, &spaces, &target);
+            // Half of the loops step through a function with a body of
+            // flows, applied to the iterate: the flows become the loop's
+            // prelude, which the interpreter and the kernel each run every
+            // round on their own.
+            if rng.below(2) == 0 {
+                let f = format!("step{}", ["A", "B", "C"][k]);
+                let param = vec![("U".to_string(), target.clone())];
+                let first = expression(rng, 2, &param, &target);
+                let mut locals = param.clone();
+                locals.push(("S".to_string(), target.clone()));
+                let second = expression(rng, 2, &locals, &target);
+                defs.push_str(&format!("{f}:{{ U\n    {first} → S\n    {second} → =\n}}\n"));
+                update = format!("({update} + ({f} {name}))");
+            }
             if !spaces.iter().any(|(n, _)| update.contains(n.as_str())) {
                 update = format!("({update} + {name})");
             }
@@ -473,7 +489,7 @@ fn program(rng: &mut Rng, dims: &str, shape: &[usize]) -> (String, Option<Vec<us
         expression(rng, 3, &spaces, &final_shape)
     ));
     body.push_str("    OUTPUT → =\n");
-    (format!("{{\n{decls}{body}}}\n"), aux)
+    (format!("{defs}{{\n{decls}{body}}}\n"), aux)
 }
 
 /// A `!` on OUTPUT the analysis ought to settle, and a program carrying it.
@@ -540,6 +556,7 @@ fn main() {
     let (mut compared, mut skipped, mut mismatches) = (0usize, 0usize, 0usize);
     let mut two_inputs = 0usize;
     let mut iterating = 0usize;
+    let mut stepping = 0usize;
     let mut narrow_mismatches = 0usize;
     let mut unsound = 0usize;
     let mut claims_checked = 0usize;
@@ -751,6 +768,9 @@ fn main() {
         if source.contains('⇒') {
             iterating += 1;
         }
+        if source.contains(":{") {
+            stepping += 1;
+        }
         let mut so_runs = vec![("exec_spaces", output)];
         if let Some(via_args) = output_args {
             so_runs.push(("exec_with_args", via_args));
@@ -773,7 +793,8 @@ fn main() {
     }
 
     println!(
-        "seed {seed}: compared {compared} ({two_inputs} with two inputs, {iterating} iterating), \
+        "seed {seed}: compared {compared} ({two_inputs} with two inputs, {iterating} iterating, \
+         {stepping} through a function), \
          skipped {skipped}, mismatches {mismatches}, f32 mismatches {narrow_mismatches}, \
          claims checked {claims_checked} ({proofs_checked} proved constraints, \
          {derived_unproved} of {derived} derived ones left open), unsound {unsound}"

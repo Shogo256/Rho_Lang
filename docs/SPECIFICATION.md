@@ -185,20 +185,23 @@ the address is formed, so no read ever leaves the buffer.
 A sweep of known length is split into a scalar head, a `<4 x double>` vector
 body and a scalar tail. The head and tail cover exactly the cells whose
 neighbours would fall outside the buffer, so every vector load in the body is in
-bounds. Boundary tests are evaluated per lane; the neighbour window itself is one
+bounds. A shift along the outermost axis has its boundary cells in the first
+and the last line of the buffer, whole, and the head and tail are a line deep,
+so the body reads it with a plain load; a shift along an inner axis has edges
+inside the buffer and tests them per lane. The neighbour window itself is one
 contiguous load at a shifted base.
 
 `--no-simd` forces the scalar path. The two are verified to agree bit for bit.
 
-What this buys, measured rather than assumed: on a shift kernel `clang -O3`
-vectorises **no** loops on its own (the boundary select defeats it), and explicit
-lowering roughly doubles the packed-double instructions in the object file. Wall
-clock improves only 1.0–1.1x on large grids, because streaming megabytes of
-doubles is bound by memory bandwidth, not arithmetic. The gain here is that
-vectorisation is guaranteed and visible in the IR, not that it is fast.
+The kernel is compiled for the machine it is built on (`-march=native`), so
+the four-lane IR becomes whatever width the machine has; `--portable` builds
+for any x86-64 instead. Measured on a 1-D shift stencil of 4096 cells, one
+thread: 3.9 µs a sweep with the per-lane test and the baseline width, 1.5 µs
+with the test gone and the machine's width. On grids past the last cache
+level none of this shows: streaming megabytes of doubles is bound by memory
+bandwidth, not arithmetic (see §6).
 
-📋 AVX-512 and NEON widths, and GPU warp shuffles, are still future work; the
-width is fixed at four lanes and clang widens further if the target allows.
+📋 NEON widths and GPU warp shuffles are still future work.
 
 ### 3.2.2 Rotation and reversal (`⌽`) ✅
 
@@ -699,7 +702,52 @@ are compiled with `-ffp-contract=off` so the machine agrees with them.
 
 ---
 
-## 6. Precision ✅
+## 6. Threads ✅
+
+One cell is one expression, so a sweep has no order, and every `→`, every
+round of a `⇒`, every fold's lines and every comparison of a round with the
+last is handed to a pool of threads in parts. Each part is a range of cells
+`[lo, hi)` of the same code; the pool is made on the first sweep that is
+worth splitting and kept for the life of the kernel, its workers spinning
+briefly for the next sweep and then sleeping.
+
+The bits do not depend on the split. A cell's expression is the same on any
+thread; a fold walks each of its lines in order on one thread; the largest
+move of a round is the largest of the parts' largest moves, and a maximum is
+the same in any order. The differential test compiles every program with
+three threads and a grain of one cell, so every sweep it compares is split.
+
+```
+rhoc kernel.rho --threads 4      # 0, the default, is one per online CPU
+RHO_THREADS=4 ./a.out            # the kernel honours this when it runs
+RHO_GRAIN=65536 ./a.out          # do not split a sweep shorter than this
+```
+
+A sweep shorter than the grain — 16384 cells unless the kernel was compiled
+with another — runs on the calling thread: at 4096 cells the hand-off cost
+more than it saved, at 16384 it paid. `rho_kernel_exec_bounded`, whose
+length is known only when it is called, keeps its single-thread loops.
+
+Measured on four cores with two threads each, 8 MiB of last-level cache and
+about 8 GB/s of memory bandwidth, one sweep:
+
+| Kernel | Cells | 1 thread | Best | Threads |
+|---|---|---|---|---|
+| 1-D shift stencil | 16,384 | 7.3 µs | 4.0 µs | 2 |
+| 1-D shift stencil | 65,536 | 29.7 µs | 11.3 µs | 4 |
+| 1-D shift stencil | 262,144 | 230 µs | 64 µs | 4 |
+| 2-D Laplace step | 512 × 512 | 334 µs | 78 µs | 8 |
+| Jacobi, 20 rounds | 65,536 | 4.19 ms | 1.29 ms | 4 |
+| 1-D shift stencil | 1,048,576 | 2.3 ms | 2.3 ms | any |
+
+The last row is the honest one: past the cache the machine's memory bus is
+the limit, one core already fills it here, and more threads only contend. On
+a machine with more bandwidth per socket the same kernel would scale further;
+what ρ guarantees is that the split is there to use it. The second thread of
+a core rarely helped in these runs; `RHO_THREADS` set to the core count is a
+good first setting.
+
+## 7. Precision ✅
 
 `rhoc --f32` compiles the kernel at single precision. There is no syntax for it:
 the width is a property of the artifact, not of the program, and the same source

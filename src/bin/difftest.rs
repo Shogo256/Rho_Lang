@@ -635,7 +635,13 @@ fn main() {
             continue;
         };
 
-        let mut codegen = LlvmCodeGen::new(&format!("diff{round}")).with_max_sweeps(SWEEPS);
+        // Three threads and a grain of one cell: every sweep, however small,
+        // is split into parts, so the head/body/tail of each part and the
+        // partial maxima of a `⇒` are what the interpreter is held against.
+        let mut codegen = LlvmCodeGen::new(&format!("diff{round}"))
+            .with_max_sweeps(SWEEPS)
+            .with_threads(3)
+            .with_grain(1);
         let ir = match codegen.generate_llvm_ir(&block) {
             Ok(ir) => ir,
             Err(e) => {
@@ -721,6 +727,8 @@ fn main() {
             if let Ok(narrow_out) = interpret_with(&block, &narrow_env, &RUN) {
                 if let Some(meant) = narrow_out.get("OUTPUT") {
                     let mut narrow_codegen = LlvmCodeGen::new(&format!("diff{round}f32"))
+                        .with_threads(3)
+                        .with_grain(1)
                         .with_precision(Precision::F32)
                         .with_max_sweeps(SWEEPS);
                     if let Ok(narrow_ir) = narrow_codegen.generate_llvm_ir(&block) {

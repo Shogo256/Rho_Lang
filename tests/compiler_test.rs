@@ -2556,10 +2556,11 @@ fn test_a_relaxation_with_a_vector_body_and_a_fold_inside_the_loop() {
         .with_max_sweeps(20)
         .generate_llvm_ir(&block)
         .unwrap();
-    // One fold buffer per entrypoint body, reserved ahead of the loop rather
-    // than allocated afresh on every round.
+    // One fold buffer in the body, reserved ahead of the loop rather than
+    // allocated afresh on every round. (The body is emitted once and shared
+    // by the entrypoints.)
     let with_args = ir
-        .split("define void @rho_kernel_exec_with_args")
+        .split("define internal void @rho_body")
         .nth(1)
         .and_then(|s| s.split("\n}\n").next())
         .unwrap();
@@ -3672,6 +3673,69 @@ step:{ U
     let (out, _, converged) = run_iterating(&so, &b, 6);
     assert!(converged);
     assert_eq!(bits(&out), bits(&meant));
+}
+
+#[test]
+fn test_a_sweep_split_across_threads_gives_the_same_bits() {
+    // A grid large enough to be split (the grain is lowered so that even
+    // the folds' few lines are), with a shift on each axis, a fold, a scan
+    // and a `⇒` whose largest move is gathered from the parts: the bits
+    // must not depend on how many threads ran it.
+    let source = r#"{
+        INPUT:◯ □ 64 80
+        INPUT → X
+        (◇+1 X) → ROW
+        ((▷0X + ▽0X + ▷1X + ▽1X) / 4.0) → M
+        ((M × 0.5) + (INPUT × 0.25) + ((□1 ROW) / 80.0)) ⇒ X
+        (X + (◈+1 X)) → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let input: Vec<f64> = (0..64 * 80).map(|i| ((i as f64) * 0.37).sin()).collect();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![64, 80], input.clone()));
+    let options = Options { tau: 1e-10, max_sweeps: 100 };
+    let meant = interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone();
+    let mut seen: Vec<Vec<u64>> = Vec::new();
+    for (threads, grain, portable) in [(1, 16384, false), (4, 64, false), (7, 1, true), (0, 1, false)] {
+        let name = format!("threads_{threads}_{grain}_{portable}");
+        let mut codegen = LlvmCodeGen::new(&name)
+            .with_tau(options.tau)
+            .with_max_sweeps(options.max_sweeps)
+            .with_threads(threads)
+            .with_grain(grain);
+        if portable {
+            codegen = codegen.portable();
+        }
+        let ir = codegen.generate_llvm_ir(&block).unwrap();
+        assert!(ir.contains(&format!("i64 {threads}, i64 {grain})")), "{ir}");
+        let so_path = format!("target/{name}.so");
+        codegen.compile_to_so(&ir, &so_path).unwrap();
+        let (out, sweeps, converged) = run_iterating(&so_path, &input, 64 * 80);
+        assert!(converged, "{name}: {sweeps} sweeps");
+        assert_eq!(bits(&out), bits(&meant), "{name}");
+        seen.push(bits(&out));
+    }
+    assert!(seen.windows(2).all(|w| w[0] == w[1]));
+
+    // The parts are what the pool runs: one function per sweep, per fold
+    // and per comparison, each over [lo, hi). Here: the copy into X, the
+    // fold and the sweep of ROW, the sweep of M, the round of the `⇒` and
+    // its comparison, the scan and the sweep of the output — eight.
+    let ir = LlvmCodeGen::new("threads_ir")
+        .with_tau(1e-10)
+        .with_max_sweeps(100)
+        .generate_llvm_ir(&block)
+        .unwrap();
+    let parts = ir.matches("define internal void @rho_part").count();
+    assert_eq!(parts, 8, "{ir}");
+    assert!(ir.contains("@rho_partial"), "{ir}");
+    // The bounded entrypoint keeps its inline, single-thread loops.
+    let bounded = ir
+        .split("define void @rho_kernel_exec_bounded")
+        .nth(1)
+        .and_then(|s| s.split("\n}").next())
+        .unwrap();
+    assert!(!bounded.contains("rho_rt_run"), "{bounded}");
 }
 
 #[test]

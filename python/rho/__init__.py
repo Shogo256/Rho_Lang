@@ -86,7 +86,7 @@ class RhoEngine:
         self._lib = None
         self._bound = {}
 
-    def compile_rho_file(self, rho_file_path, bind=None, tau=None, max_iter=None):
+    def compile_rho_file(self, rho_file_path, bind=None, tau=None, max_iter=None, threads=None, portable=False):
         """Compile a .rho script with the rhoc driver.
 
         `bind` maps space names to the buffers (or raw addresses) the kernel
@@ -96,12 +96,20 @@ class RhoEngine:
 
         `max_iter` caps every `⇒` in the program; a program that iterates
         cannot be compiled without it. `tau` is the tolerance it stops at.
+
+        `threads` is how many threads every sweep is split across (None or
+        0: one per CPU; the kernel also honours RHO_THREADS when it runs).
+        `portable=True` builds for any x86-64 instead of this machine.
         """
         cmd = rhoc_command() + [rho_file_path, "-o", self.kernel_so_path]
         if tau is not None:
             cmd += ["--tau", str(tau)]
         if max_iter is not None:
             cmd += ["--max-iter", str(max_iter)]
+        if threads is not None:
+            cmd += ["--threads", str(threads)]
+        if portable:
+            cmd += ["--portable"]
         self._bound = {}
         for name, target in (bind or {}).items():
             address = _buffer_address(target)

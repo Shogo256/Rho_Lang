@@ -56,6 +56,8 @@ Working prototype. What runs today:
   relaxation and diffusion in one line, capped by `--max-iter`, with the kernel
   reporting how many sweeps it took and whether it settled
 - Explicit `<4 x double>` vector lowering, verified bit-identical to the scalar path
+- Every sweep split across a pool of threads (`--threads`, `RHO_THREADS`),
+  with the bits independent of the split; 3–4x on grids that fit in cache
 - Zero-copy binding: compile a kernel against a buffer the host already owns
 - One pointer per space at call time, so a kernel with several inputs — a
   matrix product — runs with nothing baked in
@@ -127,6 +129,8 @@ with what the `!` check could and could not settle.
 | `--f32` | Compute at single precision |
 | `--max-iter <N>` | Cap every `⇒` at `N` sweeps; required by a program that iterates |
 | `--no-simd` | Emit only scalar loops |
+| `--threads <N>` | Split every sweep across `N` threads; `0` (default) is one per CPU. `RHO_THREADS` overrides at run time |
+| `--portable` | Build for any x86-64 rather than this machine |
 
 ### 3. Call it from Python
 
@@ -342,23 +346,23 @@ smooth input drives it to zero and the kernel returns infinities.
 | Single precision (`--f32`) | ✅ implemented — 5.5x on a bandwidth-bound kernel |
 | Mixed precision, integer types | 📋 not planned — see the specification |
 | Explicit `<4 x double>` vector lowering | ✅ implemented — see the note below |
+| Sweeps split across threads | ✅ implemented — every `→`, `⇒` round, fold and comparison; 3–4x on cache-resident grids, bit-identical to one thread |
 | Zero-copy binding (`&[0x…]`, `--bind`) | ✅ implemented |
 | `!` constraint check | ✅ interval arithmetic that models binary64 rounding, not ℝ; its claims are held to real runs by the differential test |
 | Diagnostics with source lines | ✅ implemented |
 | Reference interpreter + differential testing | ✅ implemented — both widths, both entrypoints, on every push |
 | C ABI, JSON metadata, Python FFI | ✅ implemented |
 | `pip install rho-lang` | ✅ wheel built in CI for Linux, macOS, Windows; publishing to PyPI waits on a tagged release |
-| AVX-512 / NEON width selection, GPU backends | 📋 planned — the vector width is fixed at four lanes |
+| NEON width selection, GPU backends | 📋 planned — the kernel is built for the machine at hand (`-march=native`, or `--portable`) |
 | Tiling and cache blocking | 📋 planned — a sweep is one linear pass |
-| Parallel execution of independent flows | 📋 planned — flows run in source order on one thread |
 
 Two honest caveats on the ✅ rows:
 
-- **Vector lowering is correct, not dramatically faster.** `clang -O3` vectorises
-  no loops on the scalar IR by itself — the boundary select defeats it — and the
-  explicit path roughly doubles the packed-double instructions emitted. Wall clock
-  still only improves 1.0–1.1x on large grids, because streaming megabytes of
-  doubles is bound by memory bandwidth. `--no-simd` is verified to produce
+- **Past the cache, the memory bus is the limit.** Vector lowering and threads
+  together give 2.6x on a 4096-cell stencil and 3–4x on grids of a few hundred
+  thousand cells; on a million cells neither shows, because one core already
+  fills this machine's memory bandwidth. The numbers are in the specification,
+  §3.2.1 and §6. `--no-simd` and `--threads 1` are verified to produce
   bit-identical results.
 - **The `!` check assumes no overflow, underflow or NaN.** It models
   round-to-nearest — every result is the exact one times `(1 ± 2⁻⁵³)` — which is

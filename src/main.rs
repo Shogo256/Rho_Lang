@@ -47,6 +47,16 @@ struct Args {
     #[arg(long)]
     no_simd: bool,
 
+    /// Threads every sweep is split across; 0 takes one per CPU. The kernel
+    /// still honours RHO_THREADS in the environment when it runs.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    threads: usize,
+
+    /// Compile for any x86-64 rather than for this machine. By default the
+    /// kernel uses every vector width the machine it is built on has.
+    #[arg(long)]
+    portable: bool,
+
     /// Display generated LLVM IR
     #[arg(long)]
     dump_llvm: bool,
@@ -147,6 +157,10 @@ fn run(args: &Args) -> anyhow::Result<()> {
         .with_precision(precision);
     if args.no_simd {
         codegen = codegen.without_simd();
+    }
+    codegen = codegen.with_threads(args.threads);
+    if args.portable {
+        codegen = codegen.portable();
     }
     let iterates = block
         .statements

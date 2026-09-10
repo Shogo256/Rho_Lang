@@ -742,6 +742,45 @@ fn is_tau(name: &str) -> bool {
     name == "𝜏" || name == "τ"
 }
 
+/// The rightmost function name at the top level with an operand on each
+/// side of it, as its byte range: `A f B g C` splits at `g`. A word is
+/// between arguments when what precedes it can end an operand — a name, a
+/// number, a closing bracket; a word at the start, or after an operator, is
+/// a prefix call and is left alone.
+fn find_infix_call(text: &str) -> Option<(usize, usize, String)> {
+    let mut words: Vec<(usize, usize)> = Vec::new();
+    let mut depth = 0i32;
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        if depth == 0 && (c.is_alphanumeric() || c == '_') {
+            start.get_or_insert(i);
+            continue;
+        }
+        if let Some(begin) = start.take() {
+            words.push((begin, i));
+        }
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    if let Some(begin) = start {
+        words.push((begin, text.len()));
+    }
+    words.into_iter().rev().find_map(|(begin, end)| {
+        let word = &text[begin..end];
+        let before = text[..begin].trim_end();
+        let ends_operand = before
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ')');
+        let followed = !text[end..].trim().is_empty();
+        (is_identifier(word) && !is_tau(word) && ends_operand && followed && function_named(word).is_some())
+            .then(|| (begin, end, word.to_string()))
+    })
+}
+
 /// The word an expression starts with, and what follows it.
 fn leading_word(text: &str) -> Option<(&str, &str)> {
     let end = text
@@ -931,12 +970,14 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         return parse_expr(inner);
     }
 
-    let operators = [
+    let comparisons = [
         (">=", BinaryOpKind::Gte),
         ("<=", BinaryOpKind::Lte),
         ("==", BinaryOpKind::Eq),
         (">", BinaryOpKind::Gt),
         ("<", BinaryOpKind::Lt),
+    ];
+    let operators = [
         ("+", BinaryOpKind::Add),
         ("-", BinaryOpKind::Sub),
         // Tighter than a sum, looser than a product: `A + B ⌈ C × D` is
@@ -950,18 +991,48 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         ("^", BinaryOpKind::Pow),
     ];
 
+    let split_at = |op_str: &str, op_kind: &BinaryOpKind, pos: usize| -> Result<Expr> {
+        let lhs = parse_expr(expr_str[..pos].trim())?;
+        let rhs = parse_expr(expr_str[pos + op_str.len()..].trim())?;
+        Ok(Expr::BinaryOp {
+            op: op_kind.clone(),
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        })
+    };
+
+    for (op_str, op_kind) in &comparisons {
+        if let Some(pos) = find_binary_op_position(expr_str, op_str) {
+            return split_at(op_str, op_kind, pos);
+        }
+    }
+
+    // A function of two written between its arguments: `A mix B` is
+    // `mix A B`. Every such spelling is one level — looser than all the
+    // arithmetic, tighter than a comparison, and to the left — so
+    // `X + 1.0 mix Y × 2.0` is `(X + 1.0) mix (Y × 2.0)` and `A f B g C` is
+    // `(A f B) g C`. No function declares a precedence of its own.
+    if let Some((start, end, name)) = find_infix_call(expr_str) {
+        let params = function_named(&name).map(|f| f.params.len()).unwrap_or(0);
+        if params != 2 {
+            return Err(HarmonyDisruption::LoweringErr {
+                detail: format!(
+                    "`{name}` takes {params} argument(s); only a function of two can be written between its arguments, as `A {name} B`"
+                ),
+                line: 0,
+            });
+        }
+        let lhs = parse_expr(expr_str[..start].trim())?;
+        let rhs = parse_expr(expr_str[end..].trim())?;
+        return Ok(Expr::Call {
+            name,
+            args: vec![lhs, rhs],
+        });
+    }
+
     for (op_str, op_kind) in &operators {
         if let Some(pos) = find_binary_op_position(expr_str, op_str) {
-            let lhs_str = expr_str[..pos].trim();
-            let rhs_str = expr_str[pos + op_str.len()..].trim();
-            
-            let lhs = parse_expr(lhs_str)?;
-            let rhs = parse_expr(rhs_str)?;
-            return Ok(Expr::BinaryOp {
-                op: op_kind.clone(),
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            });
+            return split_at(op_str, op_kind, pos);
         }
     }
 

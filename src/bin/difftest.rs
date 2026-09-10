@@ -468,13 +468,31 @@ fn program(rng: &mut Rng, dims: &str, shape: &[usize]) -> (String, Option<Vec<us
             // round on their own.
             if rng.below(2) == 0 {
                 let f = format!("step{}", ["A", "B", "C"][k]);
-                let param = vec![("U".to_string(), target.clone())];
-                let first = expression(rng, 2, &param, &target);
-                let mut locals = param.clone();
+                let mut params = vec![("U".to_string(), target.clone())];
+                // Half of them take two, and are then written between their
+                // arguments; the second is any space of the same shape.
+                let partner = if rng.below(2) == 0 {
+                    let same: Vec<&(String, Vec<usize>)> =
+                        spaces.iter().filter(|(_, s)| *s == target).collect();
+                    params.push(("V".to_string(), target.clone()));
+                    Some(same[rng.below(same.len())].0.clone())
+                } else {
+                    None
+                };
+                let first = expression(rng, 2, &params, &target);
+                let mut locals = params.clone();
                 locals.push(("S".to_string(), target.clone()));
                 let second = expression(rng, 2, &locals, &target);
-                defs.push_str(&format!("{f}:{{ U\n    {first} → S\n    {second} → =\n}}\n"));
-                update = format!("({update} + ({f} {name}))");
+                let header: Vec<&str> = params.iter().map(|(p, _)| p.as_str()).collect();
+                defs.push_str(&format!(
+                    "{f}:{{ {}\n    {first} → S\n    {second} → =\n}}\n",
+                    header.join(" ")
+                ));
+                let call = match partner {
+                    Some(v) => format!("({name} {f} {v})"),
+                    None => format!("({f} {name})"),
+                };
+                update = format!("({update} + {call})");
             }
             if !spaces.iter().any(|(n, _)| update.contains(n.as_str())) {
                 update = format!("({update} + {name})");

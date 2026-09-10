@@ -20,6 +20,8 @@ norm:{ V
 
 blend:{ A B W ((A × W) + (B × (1.0 - W))) }
 
+mix:{ A B ((A + B) / 2.0) }
+
 step:{ U                    /* one Jacobi step for 4x[i] + x[i-1] + x[i+1] = b */
     (▷U + ▽U) → S
     (S / 4.0) → =
@@ -29,7 +31,7 @@ step:{ U                    /* one Jacobi step for 4x[i] + x[i-1] + x[i+1] = b *
     INPUT:◯ □ 256 1
 
     (blend (smooth (smooth INPUT)) INPUT 0.5) → MIXED
-    (MIXED / (□0 (norm MIXED))) → B
+    ((MIXED mix INPUT) / (□0 (norm MIXED))) → B    /* `A mix B` is `mix A B` */
     B → X
     ((B / 4.0) - (step X)) ⇒ X      /* S is refilled each round */
     X → =

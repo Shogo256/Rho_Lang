@@ -44,8 +44,10 @@ Working prototype. What runs today:
 - `↑` and `↓`, APL's take and drop, so a window, a tail or a difference
   without its boundary zero has the shape it should
 - Functions: `smooth:{ X ((▷X + X + ▽X) / 3.0) }` defines one, `smooth INPUT`
-  calls it, and the body is copied in at each call — nothing runs at call
-  time, and a function is written once and used at any shape
+  calls it, `A mix B` calls a function of two between its arguments, and the
+  body is copied in at each call — nothing runs at call time, a function is
+  written once and used at any shape, and a body of flows inside a `⇒` runs
+  on every round
 - `--f32` for single precision, with the interpreter and the `!` check
   following the width
 - `□` lifting and broadcasting, so an outer product — and a matrix product — is

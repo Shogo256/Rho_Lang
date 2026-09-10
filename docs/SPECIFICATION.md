@@ -484,6 +484,14 @@ parenthesised expressions, one after another; an unbracketed sum has no end
 the parser could find, and is refused with that hint. A call binds tighter
 than the arithmetic around it: `1.0 + blend A B` is `1.0 + (blend A B)`.
 
+A function of two may also be written between its arguments: `A mix B` is
+`mix A B`. Every such spelling is one level, whatever the function — looser
+than all the arithmetic, tighter than a comparison, and to the left — so
+`X + 1.0 mix Y × 2.0` is `(X + 1.0) mix (Y × 2.0)`, `A f B g C` is
+`(A f B) g C`, and `ind (A mix B > C)` compares the mix. No function
+declares a precedence of its own; a function of one or three between
+arguments is refused.
+
 **Nothing runs at call time.** The body is copied in with the arguments bound
 and its locals renamed apart, so two calls to `norm` keep two `SQ`s, and a
 function costs exactly what its body costs. An argument that is not a name or
@@ -521,8 +529,7 @@ step:{ U
 }
 ```
 
-Not in this version: a `⇒` inside a body, an infix spelling `A blend B`, and
-the rank operator `⍤`.
+Not in this version: a `⇒` inside a body, and the rank operator `⍤`.
 
 A note on `^`, which an index is often the exponent of: `x ^ 2.0` is `x × x`,
 and `x ^ Y` is a library power even where Y's cells happen to be whole. The

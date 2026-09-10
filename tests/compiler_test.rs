@@ -3659,6 +3659,88 @@ step:{ U
 }
 
 #[test]
+fn test_a_function_of_two_can_be_written_between_its_arguments() {
+    // `A mix B` is `mix A B`, bit for bit.
+    let input: Vec<f64> = (0..8).map(|i| (i as f64 * 0.9).sin()).collect();
+    let aux: Vec<f64> = (0..8).map(|i| (i as f64 * 0.7).cos()).collect();
+    let inputs = [("INPUT", vec![8, 1], input.clone()), ("AUX", vec![8, 1], aux.clone())];
+    let run = |name: &str, flow: &str| {
+        let source = format!(
+            "\nmix:{{ A B ((A × 0.25) + (B × 0.75)) }}\nsmooth:{{ X ((▷X + X + ▽X) / 3.0) }}\n{{\n    INPUT:◯ □ 8 1\n    AUX:◯ □ 8 1\n    {flow} → =\n}}"
+        );
+        let (out, meant) = kernel_and_interpreter(name, &source, &inputs);
+        assert_eq!(bits(&out), bits(&meant), "{flow}");
+        out
+    };
+    let prefix = run("infix_prefix", "(mix INPUT AUX)");
+    assert_eq!(bits(&run("infix_plain", "INPUT mix AUX")), bits(&prefix));
+    for i in 0..8 {
+        assert_eq!(prefix[i], input[i] * 0.25 + aux[i] * 0.75);
+    }
+
+    // Looser than the arithmetic on either side, and to the left.
+    assert_eq!(
+        bits(&run("infix_loose", "INPUT + 1.0 mix AUX × 2.0")),
+        bits(&run("infix_loose_explicit", "(INPUT + 1.0) mix (AUX × 2.0)"))
+    );
+    assert_eq!(
+        bits(&run("infix_left", "INPUT mix AUX mix INPUT")),
+        bits(&run("infix_left_explicit", "(INPUT mix AUX) mix INPUT"))
+    );
+    // Tighter than a comparison, so `ind (A mix B > C)` compares the mix.
+    assert_eq!(
+        bits(&run("infix_compare", "ind (INPUT mix AUX > 0.5)")),
+        bits(&run("infix_compare_explicit", "ind ((INPUT mix AUX) > 0.5)"))
+    );
+    // A prefix call keeps binding tighter than the arithmetic around it.
+    assert_eq!(
+        bits(&run("infix_prefix_tight", "1.0 + mix INPUT AUX")),
+        bits(&run("infix_prefix_tight_explicit", "1.0 + (mix INPUT AUX)"))
+    );
+    // Other operands: a shifted space, a fold, a literal.
+    assert_eq!(
+        bits(&run("infix_operands", "▷INPUT mix 2.0")),
+        bits(&run("infix_operands_explicit", "(▷INPUT) mix 2.0"))
+    );
+
+    // Only a function of two goes between its arguments.
+    let source = "\nsmooth:{ X ((▷X + X + ▽X) / 3.0) }\n{\n    INPUT:◯ □ 8 1\n    (INPUT smooth INPUT) → =\n}";
+    let err = parse_rho_program(source).unwrap_err();
+    assert!(err.to_string().contains("only a function of two"), "{err}");
+    let source = "\nblend:{ A B W ((A × W) + (B × (1.0 - W))) }\n{\n    INPUT:◯ □ 8 1\n    (INPUT blend INPUT) → =\n}";
+    let err = parse_rho_program(source).unwrap_err();
+    assert!(err.to_string().contains("`blend` takes 3"), "{err}");
+
+    // Inside a `⇒`, with a body of flows: the prelude again.
+    let source = r#"
+relax:{ U B
+    (▷U + ▽U) → S
+    ((B / 4.0) - (S / 4.0)) → =
+}
+{
+    INPUT:◯ □ 6 1
+    INPUT → X
+    (X relax INPUT) ⇒ X
+    X → =
+}"#;
+    let block = parse_rho_program(source).unwrap();
+    let b: Vec<f64> = vec![1.0, -2.0, 3.0, 0.5, -1.5, 2.0];
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![6, 1], b.clone()));
+    let options = Options { tau: 1e-12, max_sweeps: 500 };
+    let meant = interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone();
+    let so = compile_iterating("infix_fixed_point", source, options.tau, options.max_sweeps, true);
+    let (out, _, converged) = run_iterating(&so, &b, 6);
+    assert!(converged);
+    assert_eq!(bits(&out), bits(&meant));
+    for i in 0..6 {
+        let left = if i == 0 { 0.0 } else { out[i - 1] };
+        let right = if i == 5 { 0.0 } else { out[i + 1] };
+        assert!((4.0 * out[i] + left + right - b[i]).abs() < 1e-10);
+    }
+}
+
+#[test]
 fn test_a_call_inside_a_fixed_point_runs_its_flows_every_round() {
     // A prelude that ran once, before the loop, would see only the starting
     // value: the mean of INPUT, not of the iterate. X = 0.5 (X - mean X)

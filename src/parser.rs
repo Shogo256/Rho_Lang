@@ -1,6 +1,30 @@
 use crate::ast::*;
 use crate::error::{HarmonyDisruption, Result};
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashSet};
+
+/// The functions a program has defined so far, by name.
+pub type Functions = BTreeMap<String, Function>;
+
+thread_local! {
+    /// The functions in scope while a program is being parsed. `parse_expr`
+    /// is recursive and called from many places, so the table travels here
+    /// rather than through every signature; it is set for the length of one
+    /// `parse_rho_program` and holds, while a definition is being read, only
+    /// the definitions before it — which is what rules recursion out.
+    static FUNCTIONS: RefCell<Functions> = const { RefCell::new(BTreeMap::new()) };
+}
+
+fn with_functions<T>(functions: Functions, f: impl FnOnce() -> T) -> T {
+    let previous = FUNCTIONS.with(|cell| cell.replace(functions));
+    let result = f();
+    FUNCTIONS.with(|cell| cell.replace(previous));
+    result
+}
+
+fn function_named(name: &str) -> Option<Function> {
+    FUNCTIONS.with(|cell| cell.borrow().get(name).cloned())
+}
 
 /// Validate allowed RHO symbols and character set
 pub fn validate_symbols(input: &str) -> Result<()> {
@@ -86,41 +110,651 @@ pub fn parse_rho_program(input: &str) -> Result<ToposBlock> {
     let normalized_input = normalize_ascii_aliases(input);
     validate_symbols(&normalized_input)?;
     check_forbidden_keywords(&normalized_input)?;
-
-    let mut statements = Vec::new();
-    let mut lines = Vec::new();
     let clean_code = remove_comments(&normalized_input);
 
-    for (index, raw) in clean_code.lines().enumerate() {
-        // The topos braces may share a line with a statement.
-        let text = raw.trim().trim_start_matches('{').trim_end_matches('}').trim();
-        if text.is_empty() {
-            continue;
-        }
+    // Definitions come first and each sees only the ones before it.
+    let (raw_definitions, program_lines) = split_definitions(&clean_code)?;
+    let mut functions = Functions::new();
+    for raw in raw_definitions {
+        let function = with_functions(functions.clone(), || parse_definition(&raw))?;
+        functions.insert(function.name.clone(), function);
+    }
 
-        let parsed = parse_line(text).map_err(|e| match e {
-            HarmonyDisruption::IterateErr { detail, line: 0 } => HarmonyDisruption::IterateErr {
-                detail,
-                line: index + 1,
-            },
-            HarmonyDisruption::LoweringErr { detail, line: 0 } => HarmonyDisruption::LoweringErr {
-                detail,
-                line: index + 1,
-            },
-            other => other,
-        })?;
-        if let Some(stmt) = parsed {
-            statements.push(stmt);
-            lines.push(index + 1);
+    let (statements, lines) = with_functions(functions.clone(), || {
+        let mut statements = Vec::new();
+        let mut lines = Vec::new();
+        for (line_no, raw) in &program_lines {
+            // The topos braces may share a line with a statement.
+            let text = raw.trim().trim_start_matches('{').trim_end_matches('}').trim();
+            if text.is_empty() {
+                continue;
+            }
+            let parsed = parse_line(text).map_err(|e| match e {
+                HarmonyDisruption::IterateErr { detail, line: 0 } => {
+                    HarmonyDisruption::IterateErr {
+                        detail,
+                        line: *line_no,
+                    }
+                }
+                HarmonyDisruption::LoweringErr { detail, line: 0 } => {
+                    HarmonyDisruption::LoweringErr {
+                        detail,
+                        line: *line_no,
+                    }
+                }
+                other => other,
+            })?;
+            if let Some(stmt) = parsed {
+                statements.push(stmt);
+                lines.push(*line_no);
+            }
+        }
+        Ok::<_, HarmonyDisruption>((statements, lines))
+    })?;
+
+    // A space may not take a function's name: `smooth` alone would then be
+    // a space in one place and a function in another.
+    for (stmt, line) in statements.iter().zip(&lines) {
+        let named = match stmt {
+            Statement::SpaceDef(d) => Some(&d.name),
+            Statement::ExtBind(b) => Some(&b.space.name),
+            Statement::Flow {
+                target: FlowTarget::Var(n),
+                ..
+            } => Some(n),
+            _ => None,
+        };
+        if let Some(name) = named {
+            if functions.contains_key(name) {
+                return Err(HarmonyDisruption::LoweringErr {
+                    detail: format!("`{name}` is a function defined above and cannot also be a space"),
+                    line: *line,
+                });
+            }
         }
     }
 
-    let block = ToposBlock { statements, lines };
-    validate_space_declarations(&block)?;
-    validate_dimension_shapes(&block)?;
-    validate_flow_equilibrium(&block)?;
+    let (statements, lines, origins) = expand_calls(statements, lines, &functions)?;
+    let block = ToposBlock {
+        statements,
+        lines,
+        origins,
+    };
+    let checked = validate_space_declarations(&block)
+        .and_then(|_| validate_dimension_shapes(&block))
+        .and_then(|_| validate_flow_equilibrium(&block));
+    checked.map_err(|e| block.attribute(e))?;
 
     Ok(block)
+}
+
+/// A definition's text before it is parsed: its name, header line, what
+/// followed the brace on that line, and the lines of its body.
+struct RawDefinition {
+    name: String,
+    line: usize,
+    header_rest: String,
+    body: Vec<(usize, String)>,
+}
+
+/// `NAME:{ rest`, or None for a line that is not a definition header.
+fn definition_header(text: &str, line: usize) -> Option<RawDefinition> {
+    let (name, rest) = text.split_once(':')?;
+    let name = name.trim();
+    if name.is_empty()
+        || !name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        || name.starts_with(|c: char| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let rest = rest.trim_start().strip_prefix('{')?;
+    Some(RawDefinition {
+        name: name.to_string(),
+        line,
+        header_rest: rest.to_string(),
+        body: Vec::new(),
+    })
+}
+
+/// The program's lines with their numbers, once the definitions are out.
+type ProgramLines = Vec<(usize, String)>;
+
+/// Separate the function definitions from the program that follows them,
+/// keeping every line's number for diagnostics.
+fn split_definitions(code: &str) -> Result<(Vec<RawDefinition>, ProgramLines)> {
+    let mut definitions = Vec::new();
+    let mut program = Vec::new();
+    let mut current: Option<RawDefinition> = None;
+
+    for (index, raw) in code.lines().enumerate() {
+        let line_no = index + 1;
+        let text = raw.trim();
+
+        if let Some(def) = current.as_mut() {
+            if let Some(pos) = text.find('}') {
+                let before = text[..pos].trim();
+                if !before.is_empty() {
+                    def.body.push((line_no, before.to_string()));
+                }
+                if !text[pos + 1..].trim().is_empty() {
+                    return Err(HarmonyDisruption::LoweringErr {
+                        detail: "nothing may follow a definition's closing brace on its line"
+                            .to_string(),
+                        line: line_no,
+                    });
+                }
+                definitions.push(current.take().unwrap());
+            } else if !text.is_empty() {
+                def.body.push((line_no, text.to_string()));
+            }
+            continue;
+        }
+
+        if let Some(mut def) = definition_header(text, line_no) {
+            // Definitions come before the program, and each before its use.
+            if program.iter().any(|(_, l): &(usize, String)| !l.trim().is_empty()) {
+                return Err(HarmonyDisruption::LoweringErr {
+                    detail: format!(
+                        "`{}` is defined after the program began; definitions come first",
+                        def.name
+                    ),
+                    line: line_no,
+                });
+            }
+            if let Some(pos) = def.header_rest.find('}') {
+                if !def.header_rest[pos + 1..].trim().is_empty() {
+                    return Err(HarmonyDisruption::LoweringErr {
+                        detail: "nothing may follow a definition's closing brace on its line"
+                            .to_string(),
+                        line: line_no,
+                    });
+                }
+                def.header_rest = def.header_rest[..pos].to_string();
+                definitions.push(def);
+            } else {
+                current = Some(def);
+            }
+            continue;
+        }
+
+        program.push((line_no, raw.to_string()));
+    }
+
+    if let Some(def) = current {
+        return Err(HarmonyDisruption::LoweringErr {
+            detail: format!("the definition of `{}` has no closing brace", def.name),
+            line: def.line,
+        });
+    }
+    Ok((definitions, program))
+}
+
+fn is_identifier(token: &str) -> bool {
+    !token.is_empty()
+        && !token.starts_with(|c: char| c.is_ascii_digit())
+        && token.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Parse one definition. The parameters are the names at the start; what
+/// follows on the header line, and the lines below, are the body. A body
+/// without a `→` is one expression; otherwise it is flows ending in `→ =`.
+fn parse_definition(raw: &RawDefinition) -> Result<Function> {
+    let at = |detail: String| HarmonyDisruption::LoweringErr {
+        detail,
+        line: raw.line,
+    };
+    if BuiltinOp::ALL.contains(&raw.name.as_str()) || is_tau(&raw.name) {
+        return Err(at(format!("`{}` is a function of the language already", raw.name)));
+    }
+    if function_named(&raw.name).is_some() {
+        return Err(at(format!("`{}` is defined twice", raw.name)));
+    }
+
+    // Parameters: the leading new names. The list ends at the first token
+    // that is not a name, or names a parameter again — so `id:{ X X }` is
+    // the identity — and a one-line body that begins with a name nobody has
+    // seen would be read as one more parameter, so it needs parentheses.
+    let mut rest = raw.header_rest.trim_start();
+    let mut params: Vec<String> = Vec::new();
+    loop {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let token = &rest[..end];
+        if !is_identifier(token) || params.contains(&token.to_string()) {
+            break;
+        }
+        if BuiltinOp::ALL.contains(&token) || is_tau(token) || function_named(token).is_some() {
+            return Err(at(format!("a parameter cannot be called `{token}`")));
+        }
+        params.push(token.to_string());
+        rest = rest[end..].trim_start();
+    }
+    if params.is_empty() {
+        return Err(at(format!("`{}` needs at least one parameter", raw.name)));
+    }
+
+    let mut body_lines: Vec<(usize, String)> = Vec::new();
+    if !rest.is_empty() {
+        body_lines.push((raw.line, rest.to_string()));
+    }
+    body_lines.extend(raw.body.iter().cloned());
+    if body_lines.is_empty() {
+        return Err(at(format!(
+            "`{}` has no body; a one-line body that begins with a name must be parenthesised",
+            raw.name
+        )));
+    }
+
+    let mut visible: HashSet<String> = params.iter().cloned().collect();
+    visible.insert("𝜏".to_string());
+    visible.insert("τ".to_string());
+
+    let flows = body_lines.iter().any(|(_, text)| text.contains('→') || text.contains('⇒'));
+    if !flows {
+        if body_lines.len() != 1 {
+            return Err(at(format!(
+                "`{}` has several lines but no `→`: a body is one expression or flows ending in `→ =`",
+                raw.name
+            )));
+        }
+        let (line, text) = &body_lines[0];
+        let expr = parse_expr(text).map_err(|e| relined(e, *line))?;
+        check_expr_spaces(&expr, &visible, *line).map_err(|e| scoped(e, &raw.name))?;
+        return Ok(Function {
+            name: raw.name.clone(),
+            params,
+            body: FunctionBody::Expression(expr, *line),
+            line: raw.line,
+        });
+    }
+
+    let mut statements: Vec<(Statement, usize)> = Vec::new();
+    for (line, text) in &body_lines {
+        let parsed = parse_line(text).map_err(|e| relined(e, *line))?;
+        let Some(stmt) = parsed else {
+            return Err(HarmonyDisruption::LoweringErr {
+                detail: format!("`{}`: this line is not a flow", raw.name),
+                line: *line,
+            });
+        };
+        match &stmt {
+            Statement::Flow { src, target } => {
+                check_expr_spaces(src, &visible, *line).map_err(|e| scoped(e, &raw.name))?;
+                if let FlowTarget::Var(t) = target {
+                    if params.contains(t) {
+                        return Err(HarmonyDisruption::LoweringErr {
+                            detail: format!("`{}` writes to its parameter `{t}`; a function leaves its arguments as they were", raw.name),
+                            line: *line,
+                        });
+                    }
+                    visible.insert(t.clone());
+                }
+            }
+            Statement::Iterate { .. } => {
+                return Err(HarmonyDisruption::LoweringErr {
+                    detail: format!("`{}`: a `⇒` inside a function is not allowed yet", raw.name),
+                    line: *line,
+                })
+            }
+            _ => {
+                return Err(HarmonyDisruption::LoweringErr {
+                    detail: format!("`{}`: only flows may appear in a function's body", raw.name),
+                    line: *line,
+                })
+            }
+        }
+        statements.push((stmt, *line));
+    }
+    let ends_well = matches!(
+        statements.last(),
+        Some((Statement::Flow { target: FlowTarget::Equilibrium, .. }, _))
+    );
+    let early_end = statements[..statements.len().saturating_sub(1)]
+        .iter()
+        .any(|(s, _)| matches!(s, Statement::Flow { target: FlowTarget::Equilibrium, .. }));
+    if !ends_well || early_end {
+        return Err(at(format!(
+            "`{}`: a body of flows ends with `→ =`, once, naming its result",
+            raw.name
+        )));
+    }
+    Ok(Function {
+        name: raw.name.clone(),
+        params,
+        body: FunctionBody::Flows(statements),
+        line: raw.line,
+    })
+}
+
+/// Give a line to an error raised before one was known.
+fn relined(error: HarmonyDisruption, line: usize) -> HarmonyDisruption {
+    match error {
+        HarmonyDisruption::LoweringErr { detail, line: 0 } => HarmonyDisruption::LoweringErr { detail, line },
+        HarmonyDisruption::IterateErr { detail, line: 0 } => HarmonyDisruption::IterateErr { detail, line },
+        HarmonyDisruption::GlyphErr { symbol, line: 0, column } => HarmonyDisruption::GlyphErr { symbol, line, column },
+        other => other,
+    }
+}
+
+/// Say why a name is unknown inside a function: it sees nothing of the caller.
+fn scoped(error: HarmonyDisruption, function: &str) -> HarmonyDisruption {
+    match error {
+        HarmonyDisruption::SpaceErr { space_name, line } => HarmonyDisruption::LoweringErr {
+            detail: format!(
+                "`{space_name}` is not visible inside `{function}`: a function sees its parameters, 𝜏 and constants, nothing of the caller's"
+            ),
+            line,
+        },
+        other => other,
+    }
+}
+
+// ---------------------------------------------------------------- expansion
+
+/// Replace every call with the function's body, the arguments bound. An
+/// argument that is not a name or a number is flowed into a space of its own
+/// first, so the body may shift it; a body of flows is copied out with its
+/// locals renamed apart, its `=` becoming the value of the call. Each copied
+/// statement remembers its origin for diagnostics.
+struct Expander<'a> {
+    functions: &'a Functions,
+    calls: usize,
+    /// Set when an expression body was inlined into the statement being
+    /// expanded, so that statement can carry the origin.
+    inlined: Option<Origin>,
+}
+
+type Expanded = (Vec<Statement>, Vec<usize>, Vec<Option<Origin>>);
+
+fn expand_calls(statements: Vec<Statement>, lines: Vec<usize>, functions: &Functions) -> Result<Expanded> {
+    let mut expander = Expander {
+        functions,
+        calls: 0,
+        inlined: None,
+    };
+    let mut out: Vec<(Statement, usize, Option<Origin>)> = Vec::new();
+    for (stmt, line) in statements.into_iter().zip(lines) {
+        expander.inlined = None;
+        let rewritten = match stmt {
+            Statement::Flow { src, target } => Statement::Flow {
+                src: expander.expression(&src, line, &mut out)?,
+                target,
+            },
+            Statement::Constraint(expr) => Statement::Constraint(expander.expression(&expr, line, &mut out)?),
+            Statement::AuditTrace(expr) => Statement::AuditTrace(expander.expression(&expr, line, &mut out)?),
+            Statement::Iterate { src, target } => {
+                // Anything hoisted would run once, before the loop, rather
+                // than on every round: not yet.
+                let before = out.len();
+                let src = expander.expression(&src, line, &mut out)?;
+                if out.len() != before {
+                    return Err(HarmonyDisruption::IterateErr {
+                        detail: "a call inside `⇒` may only be to a function with an expression body, with names or numbers as arguments, in this version".to_string(),
+                        line,
+                    });
+                }
+                Statement::Iterate { src, target }
+            }
+            other => other,
+        };
+        let origin = expander.inlined.take();
+        out.push((rewritten, line, origin));
+    }
+    let mut statements = Vec::new();
+    let mut lines = Vec::new();
+    let mut origins = Vec::new();
+    for (s, l, o) in out {
+        statements.push(s);
+        lines.push(l);
+        origins.push(o);
+    }
+    Ok((statements, lines, origins))
+}
+
+impl Expander<'_> {
+    fn expression(
+        &mut self,
+        expr: &Expr,
+        call_line: usize,
+        out: &mut Vec<(Statement, usize, Option<Origin>)>,
+    ) -> Result<Expr> {
+        Ok(match expr {
+            Expr::Call { name, args } => {
+                let function = self.functions.get(name).cloned().ok_or_else(|| {
+                    HarmonyDisruption::LoweringErr {
+                        detail: format!("`{name}` is not a function defined above this point"),
+                        line: call_line,
+                    }
+                })?;
+                if args.len() != function.params.len() {
+                    return Err(HarmonyDisruption::LoweringErr {
+                        detail: format!(
+                            "`{name}` takes {} argument(s), not {}; an argument that is a sum or a product needs parentheses",
+                            function.params.len(),
+                            args.len()
+                        ),
+                        line: call_line,
+                    });
+                }
+                self.calls += 1;
+                let call = self.calls;
+
+                let mut binding: BTreeMap<String, Expr> = BTreeMap::new();
+                for (param, arg) in function.params.iter().zip(args) {
+                    let arg = self.expression(arg, call_line, out)?;
+                    match arg {
+                        Expr::Var(_) | Expr::Number(_) => {
+                            binding.insert(param.clone(), arg);
+                        }
+                        other => {
+                            let bound = format!("{name}·{call}·{param}");
+                            out.push((
+                                Statement::Flow {
+                                    src: other,
+                                    target: FlowTarget::Var(bound.clone()),
+                                },
+                                call_line,
+                                Some(Origin {
+                                    function: name.clone(),
+                                    body_line: function.line,
+                                }),
+                            ));
+                            binding.insert(param.clone(), Expr::Var(bound));
+                        }
+                    }
+                }
+
+                match &function.body {
+                    FunctionBody::Expression(body, body_line) => {
+                        let substituted = substitute(body, &binding, &BTreeMap::new());
+                        self.inlined = Some(Origin {
+                            function: name.clone(),
+                            body_line: *body_line,
+                        });
+                        self.expression(&substituted, call_line, out)?
+                    }
+                    FunctionBody::Flows(flows) => {
+                        let result = format!("{name}·{call}·=");
+                        let mut locals: BTreeMap<String, String> = BTreeMap::new();
+                        for (stmt, body_line) in flows {
+                            let Statement::Flow { src, target } = stmt else {
+                                continue;
+                            };
+                            let src = substitute(src, &binding, &locals);
+                            let src = self.expression(&src, call_line, out)?;
+                            let renamed = match target {
+                                FlowTarget::Var(t) => {
+                                    let fresh = format!("{name}·{call}·{t}");
+                                    locals.insert(t.clone(), fresh.clone());
+                                    fresh
+                                }
+                                FlowTarget::Equilibrium => result.clone(),
+                            };
+                            out.push((
+                                Statement::Flow {
+                                    src,
+                                    target: FlowTarget::Var(renamed),
+                                },
+                                call_line,
+                                Some(Origin {
+                                    function: name.clone(),
+                                    body_line: *body_line,
+                                }),
+                            ));
+                        }
+                        Expr::Var(result)
+                    }
+                }
+            }
+            Expr::Var(_) | Expr::Number(_) => expr.clone(),
+            Expr::Shift { dir, axis, operand } => Expr::Shift {
+                dir: *dir,
+                axis: *axis,
+                operand: Box::new(self.expression(operand, call_line, out)?),
+            },
+            Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp {
+                op: op.clone(),
+                lhs: Box::new(self.expression(lhs, call_line, out)?),
+                rhs: Box::new(self.expression(rhs, call_line, out)?),
+            },
+            Expr::Builtin { op, operand } => Expr::Builtin {
+                op: *op,
+                operand: Box::new(self.expression(operand, call_line, out)?),
+            },
+            Expr::Lift { axis, operand } => Expr::Lift {
+                axis: *axis,
+                operand: Box::new(self.expression(operand, call_line, out)?),
+            },
+            Expr::Scan { op, axis, operand } => Expr::Scan {
+                op: *op,
+                axis: *axis,
+                operand: Box::new(self.expression(operand, call_line, out)?),
+            },
+            Expr::Reduce { op, axis, operand } => Expr::Reduce {
+                op: *op,
+                axis: *axis,
+                operand: Box::new(self.expression(operand, call_line, out)?),
+            },
+            Expr::Rotate { by, axis, operand } => Expr::Rotate {
+                by: *by,
+                axis: *axis,
+                operand: Box::new(self.expression(operand, call_line, out)?),
+            },
+            Expr::Reverse { axis, operand } => Expr::Reverse {
+                axis: *axis,
+                operand: Box::new(self.expression(operand, call_line, out)?),
+            },
+            Expr::Reshape { shape, operand } => Expr::Reshape {
+                shape: shape.clone(),
+                operand: Box::new(self.expression(operand, call_line, out)?),
+            },
+            Expr::Transpose { axes, operand } => Expr::Transpose {
+                axes: axes.clone(),
+                operand: Box::new(self.expression(operand, call_line, out)?),
+            },
+            Expr::Take { count, axis, operand } => Expr::Take {
+                count: *count,
+                axis: *axis,
+                operand: Box::new(self.expression(operand, call_line, out)?),
+            },
+            Expr::Drop { count, axis, operand } => Expr::Drop {
+                count: *count,
+                axis: *axis,
+                operand: Box::new(self.expression(operand, call_line, out)?),
+            },
+            Expr::Index { axis, operand } => Expr::Index {
+                axis: *axis,
+                operand: Box::new(self.expression(operand, call_line, out)?),
+            },
+            Expr::AuditTrace(inner) => {
+                Expr::AuditTrace(Box::new(self.expression(inner, call_line, out)?))
+            }
+        })
+    }
+}
+
+/// A body with its parameters replaced by what they were bound to and its
+/// locals by their renamed selves. Nothing else in a body is a name of the
+/// caller's, since the definition was checked to see only its own.
+fn substitute(expr: &Expr, binding: &BTreeMap<String, Expr>, locals: &BTreeMap<String, String>) -> Expr {
+    let sub = |e: &Expr| Box::new(substitute(e, binding, locals));
+    match expr {
+        Expr::Var(name) => {
+            if let Some(bound) = binding.get(name) {
+                bound.clone()
+            } else if let Some(renamed) = locals.get(name) {
+                Expr::Var(renamed.clone())
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::Number(_) => expr.clone(),
+        Expr::Call { name, args } => Expr::Call {
+            name: name.clone(),
+            args: args.iter().map(|a| substitute(a, binding, locals)).collect(),
+        },
+        Expr::Shift { dir, axis, operand } => Expr::Shift { dir: *dir, axis: *axis, operand: sub(operand) },
+        Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp { op: op.clone(), lhs: sub(lhs), rhs: sub(rhs) },
+        Expr::Builtin { op, operand } => Expr::Builtin { op: *op, operand: sub(operand) },
+        Expr::Lift { axis, operand } => Expr::Lift { axis: *axis, operand: sub(operand) },
+        Expr::Scan { op, axis, operand } => Expr::Scan { op: *op, axis: *axis, operand: sub(operand) },
+        Expr::Reduce { op, axis, operand } => Expr::Reduce { op: *op, axis: *axis, operand: sub(operand) },
+        Expr::Rotate { by, axis, operand } => Expr::Rotate { by: *by, axis: *axis, operand: sub(operand) },
+        Expr::Reverse { axis, operand } => Expr::Reverse { axis: *axis, operand: sub(operand) },
+        Expr::Reshape { shape, operand } => Expr::Reshape { shape: shape.clone(), operand: sub(operand) },
+        Expr::Transpose { axes, operand } => Expr::Transpose { axes: axes.clone(), operand: sub(operand) },
+        Expr::Take { count, axis, operand } => Expr::Take { count: *count, axis: *axis, operand: sub(operand) },
+        Expr::Drop { count, axis, operand } => Expr::Drop { count: *count, axis: *axis, operand: sub(operand) },
+        Expr::Index { axis, operand } => Expr::Index { axis: *axis, operand: sub(operand) },
+        Expr::AuditTrace(inner) => Expr::AuditTrace(sub(inner)),
+    }
+}
+
+/// Split a call's arguments: names, numbers and parenthesised expressions,
+/// one after another.
+fn split_operands(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    for c in text.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(c);
+            }
+            c if c.is_whitespace() && depth == 0 => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+fn is_tau(name: &str) -> bool {
+    name == "𝜏" || name == "τ"
+}
+
+/// The word an expression starts with, and what follows it.
+fn leading_word(text: &str) -> Option<(&str, &str)> {
+    let end = text
+        .char_indices()
+        .find(|(_, c)| !(c.is_alphanumeric() || *c == '_'))
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let word = &text[..end];
+    if !is_identifier(word) {
+        return None;
+    }
+    Some((word, &text[end..]))
 }
 
 fn remove_comments(input: &str) -> String {
@@ -382,6 +1016,47 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
             op: BuiltinOp::from_name(name).unwrap(),
             operand: Box::new(parse_expr(operand)?),
         });
+    }
+
+    // A function of the program's own: `smooth X`, `blend A (B + C)`. The
+    // arguments are names, numbers or parenthesised expressions, one after
+    // another; an unbracketed sum would have no end the parser could find.
+    if let Some((word, rest)) = leading_word(expr_str) {
+        if let Some(function) = function_named(word) {
+            let operands = split_operands(rest);
+            if operands.len() != function.params.len() {
+                return Err(HarmonyDisruption::LoweringErr {
+                    detail: format!(
+                        "`{word}` takes {} argument(s), not {}; an argument that is a sum or a product needs parentheses",
+                        function.params.len(),
+                        operands.len()
+                    ),
+                    line: 0,
+                });
+            }
+            let args = operands
+                .iter()
+                .map(|o| parse_expr(o))
+                .collect::<Result<Vec<Expr>>>()?;
+            return Ok(Expr::Call {
+                name: word.to_string(),
+                args,
+            });
+        }
+        // A word applied to something is a call, and this one is to nothing
+        // defined above: say so, rather than reporting a space named `f X`.
+        if !rest.trim().is_empty()
+            && !BuiltinOp::ALL.contains(&word)
+            && !is_tau(word)
+            && rest.starts_with(|c: char| c.is_whitespace() || c == '(')
+        {
+            return Err(HarmonyDisruption::LoweringErr {
+                detail: format!(
+                    "`{word}` is not a function defined above this point (definitions come before their use)"
+                ),
+                line: 0,
+            });
+        }
     }
 
     // Lift: □2X views X with a length-1 axis inserted at position 2.
@@ -810,6 +1485,11 @@ fn check_expr_spaces(expr: &Expr, declared: &HashSet<String>, line: usize) -> Re
             check_expr_spaces(lhs, declared, line)?;
             check_expr_spaces(rhs, declared, line)?;
         }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                check_expr_spaces(arg, declared, line)?;
+            }
+        }
         Expr::Number(_) => {}
     }
     Ok(())
@@ -888,6 +1568,11 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
             | Expr::Reverse { operand: inner, .. }
             | Expr::Reshape { operand: inner, .. }
             | Expr::AuditTrace(inner) => check_broadcast(inner, shapes, line)?,
+            Expr::Call { args, .. } => {
+                for arg in args {
+                    check_broadcast(arg, shapes, line)?;
+                }
+            }
             // A take or drop that leaves nothing, or names an axis the
             // operand has not got, is an error here with a line.
             Expr::Take { count, axis, operand } | Expr::Drop { count, axis, operand } => {

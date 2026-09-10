@@ -68,6 +68,7 @@ principle.
 | `&` / `@` | Zero-Copy Pointer | Direct Coupling | Binds an external address, see §3.4 | ✅ |
 | `!` | Constraint | Invariant Check | Statically verified, see §4 | ✅ |
 | `→ =` | Convergence | — | Writes the caller's output buffer | ✅ |
+| `name:{ … }` | Function | Jutsu (術) | A named block with parameters, expanded at each call, see §3.11 | ✅ |
 
 ASCII aliases: `->` for `→`, `=>` for `⇒`, `>>` for `▷`, `<<` for `▽`, `>.` for `⌈`, `<.` for `⌊`, `#` for `⍳`, `%` for `⌽`, `\` for `⍴`, `'` for `⍉`, `^.` for `↑`, `_.` for `↓`, `@` for `&`,
 `<>` for `◇`, `<.>` for `◈`, `[]` for `□`.
@@ -450,6 +451,59 @@ value, and it binds as tightly as the prefix glyphs. Its reads keep their
 order but the result's rows are not the source's, so the sweep stays scalar
 (📋 along the outermost axis it is a plain offset and could keep the vector
 path).
+
+### 3.11 Functions (`name:{ … }`) ✅
+
+A function is a named block with parameters, written before the program:
+
+```rho
+smooth:{ X ((▷X + X + ▽X) / 3.0) }        /* an expression body */
+
+norm:{ V                                    /* a body of flows */
+    (V × V) → SQ
+    (◇+ SQ) → S
+    (S ^ 0.5) → =
+}
+
+blend:{ A B W ((A × W) + (B × (1.0 - W))) }
+
+{
+    INPUT:◯ □ 256 1
+    (blend (smooth INPUT) INPUT 0.5) → =
+}
+```
+
+The parameters are the new names after the brace, and the body follows: one
+expression, or flows ending in `→ =`, which names the result. The parameter
+list ends at the first token that is not a name or repeats one, so
+`id:{ X X }` is the identity; a one-line body that begins with a name nobody
+has seen would be read as one more parameter, so it is parenthesised.
+
+A call is the name followed by its arguments — names, numbers or
+parenthesised expressions, one after another; an unbracketed sum has no end
+the parser could find, and is refused with that hint. A call binds tighter
+than the arithmetic around it: `1.0 + blend A B` is `1.0 + (blend A B)`.
+
+**Nothing runs at call time.** The body is copied in with the arguments bound
+and its locals renamed apart, so two calls to `norm` keep two `SQ`s, and a
+function costs exactly what its body costs. An argument that is not a name or
+a number is first flowed into a space of its own, which is what lets the body
+shift it. The shapes of the parameters are the shapes of the arguments, at
+each call — a function is written once and used at any shape.
+
+A body sees its parameters, `𝜏` and constants, and nothing of the caller's;
+a name from outside is an error at the definition. A body does not write to a
+parameter: the argument may be the caller's own space. Definitions come before
+the program and each before its use, which is what rules recursion out — a
+function is not defined while its own body is being read, and neither is the
+one it would call back.
+
+An error inside a body points at both places: the body line it arose on and
+the call that expanded it, each with a caret.
+
+Not in this version: a body of flows as the body of a `⇒` (a call there must
+be to an expression body, with names or numbers as arguments), a `⇒` inside a
+body, an infix spelling `A blend B`, and the rank operator `⍤`.
 
 A note on `^`, which an index is often the exponent of: `x ^ 2.0` is `x × x`,
 and `x ^ Y` is a library power even where Y's cells happen to be whole. The

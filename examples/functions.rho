@@ -1,0 +1,27 @@
+/* Functions: a named block with parameters, expanded at each call.
+
+   A body is one expression, or flows ending in `→ =` that names its result.
+   It sees its parameters, 𝜏 and constants — nothing of the caller's — and
+   definitions come before their use, which is what rules recursion out.
+   Nothing runs at call time: the body is copied in with the arguments bound,
+   so a function costs what its body costs and no more.
+
+     rhoc examples/functions.rho
+*/
+
+smooth:{ X ((▷X + X + ▽X) / 3.0) }
+
+norm:{ V
+    (V × V) → SQ
+    (◇+ SQ) → S
+    (S ^ 0.5) → =
+}
+
+blend:{ A B W ((A × W) + (B × (1.0 - W))) }
+
+{
+    INPUT:◯ □ 256 1
+
+    (blend (smooth (smooth INPUT)) INPUT 0.5) → MIXED
+    (MIXED / (□0 (norm MIXED))) → =
+}

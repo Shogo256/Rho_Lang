@@ -3442,3 +3442,203 @@ fn test_take_keeps_a_range_and_an_overtake_admits_zero() {
     assert_ne!(report.constraints[0].verdict, rho_lang::solver::Verdict::Proved);
     assert_eq!(report.output_range.lo, 0.0);
 }
+
+// --------------------------------------------------------------------------
+// Functions: a named block with parameters, expanded at each call. A body
+// is one expression or flows ending in `→ =`; it sees its parameters, 𝜏 and
+// constants; definitions come before their use.
+// --------------------------------------------------------------------------
+
+fn kernel_and_interpreter(name: &str, source: &str, inputs: &[(&str, Vec<usize>, Vec<f64>)]) -> (Vec<f64>, Vec<f64>) {
+    let block = parse_rho_program(source).unwrap();
+    let mut env: Env<f64> = Env::new();
+    for (space, shape, data) in inputs {
+        env.insert(space.to_string(), Grid::from(shape.clone(), data.clone()));
+    }
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    let supplied: Vec<(&str, Vec<f64>)> = inputs.iter().map(|(s, _, d)| (*s, d.clone())).collect();
+    let mut all = supplied;
+    all.push(("OUTPUT", vec![0.0; meant.len()]));
+    let out = run_spaces(name, source, &all);
+    (out["OUTPUT"].clone(), meant)
+}
+
+#[test]
+fn test_a_function_with_an_expression_body_expands_at_the_call() {
+    let source = r#"
+smooth:{ X ((▷X + X + ▽X) / 3.0) }
+{
+    INPUT:◯ □ 8 1
+    ((smooth INPUT) + (smooth (INPUT × 2.0))) → =
+}"#;
+    let input: Vec<f64> = (0..8).map(|i| (i as f64 * 0.9).sin()).collect();
+    let (out, meant) = kernel_and_interpreter("fn_expr", source, &[("INPUT", vec![8, 1], input.clone())]);
+    assert_eq!(bits(&out), bits(&meant));
+    // By hand: the three-point mean of X plus that of 2X, zero past the ends.
+    let at = |v: &[f64], i: i64| if !(0..8).contains(&i) { 0.0 } else { v[i as usize] };
+    let doubled: Vec<f64> = input.iter().map(|v| v * 2.0).collect();
+    for i in 0..8 {
+        let s = |v: &[f64]| (at(v, i - 1) + at(v, i) + at(v, i + 1)) / 3.0;
+        assert_eq!(out[i as usize], s(&input) + s(&doubled), "cell {i}");
+    }
+
+    // A function may use one defined above it, and a call takes several
+    // arguments one after another.
+    let source = r#"
+smooth:{ X ((▷X + X + ▽X) / 3.0) }
+twice:{ X (smooth (smooth X)) }
+blend:{ A B W ((A × W) + (B × (1.0 - W))) }
+{
+    INPUT:◯ □ 8 1
+    (blend (twice INPUT) INPUT 0.25) → =
+}"#;
+    let (out, meant) = kernel_and_interpreter("fn_nested", source, &[("INPUT", vec![8, 1], input.clone())]);
+    assert_eq!(bits(&out), bits(&meant));
+}
+
+#[test]
+fn test_a_function_with_flows_keeps_each_calls_locals_apart() {
+    let source = r#"
+norm:{ V
+    (V × V) → SQ
+    (◇+ SQ) → S
+    (S ^ 0.5) → =
+}
+{
+    INPUT:◯ □ 4 1
+    ((norm INPUT) + (norm (INPUT × 2.0))) → =
+}"#;
+    let input = vec![1.0, 2.0, 3.0, 4.0];
+    let (out, meant) = kernel_and_interpreter("fn_flows", source, &[("INPUT", vec![4, 1], input)]);
+    assert_eq!(bits(&out), bits(&meant));
+    assert!((out[0] - 3.0 * 30f64.sqrt()).abs() < 1e-12, "{out:?}");
+
+    // The two calls' locals are distinct spaces, internal to the kernel.
+    let block = parse_rho_program(source).unwrap();
+    let mut codegen = LlvmCodeGen::new("fn_flows_meta");
+    codegen.generate_llvm_ir(&block).unwrap();
+    let names: Vec<&String> = codegen.space_shapes.keys().collect();
+    assert!(names.iter().any(|n| n.as_str() == "norm·1·SQ"), "{names:?}");
+    assert!(names.iter().any(|n| n.as_str() == "norm·2·SQ"), "{names:?}");
+    assert_eq!(codegen.role_of("norm·1·S"), "internal");
+    // The expanded statements remember where they came from.
+    assert!(block.origins.iter().flatten().any(|o| o.function == "norm" && o.body_line == 3));
+}
+
+#[test]
+fn test_a_function_body_sees_only_its_parameters() {
+    let source = "\nleak:{ X (X + INPUT) }\n{\n    INPUT:◯ □ 4 1\n    (leak INPUT) → =\n}";
+    let err = parse_rho_program(source).unwrap_err();
+    assert!(matches!(err, HarmonyDisruption::LoweringErr { line: 2, .. }), "{err}");
+    assert!(err.to_string().contains("not visible inside `leak`"), "{err}");
+
+    // Nor may it write to a parameter or reach for the loop glyph.
+    let source = "\nbad:{ X\n    (X + 1.0) → X\n    X → =\n}\n{\n    INPUT:◯ □ 4 1\n    (bad INPUT) → =\n}";
+    let err = parse_rho_program(source).unwrap_err();
+    assert!(err.to_string().contains("writes to its parameter"), "{err}");
+    let source = "\nloopy:{ X\n    X → T\n    (T / 2.0) ⇒ T\n    T → =\n}\n{\n    INPUT:◯ □ 4 1\n    (loopy INPUT) → =\n}";
+    let err = parse_rho_program(source).unwrap_err();
+    assert!(err.to_string().contains("not allowed yet"), "{err}");
+}
+
+#[test]
+fn test_definitions_come_first_which_rules_out_recursion() {
+    // Calling itself: the name is not defined while its body is read.
+    let source = "\nagain:{ X (again X) }\n{\n    INPUT:◯ □ 4 1\n    (again INPUT) → =\n}";
+    let err = parse_rho_program(source).unwrap_err();
+    assert!(err.to_string().contains("not a function defined above"), "{err}");
+    // Mutual recursion needs a forward reference, which there is not.
+    let source = "\nping:{ X (pong X) }\npong:{ X (ping X) }\n{\n    INPUT:◯ □ 4 1\n    (ping INPUT) → =\n}";
+    let err = parse_rho_program(source).unwrap_err();
+    assert!(err.to_string().contains("`pong` is not a function defined above"), "{err}");
+    // And a definition after the program began is refused.
+    let source = "{\n    INPUT:◯ □ 4 1\n    (late INPUT) → =\n}\nlate:{ X (X + 1.0) }";
+    let err = parse_rho_program(source).unwrap_err();
+    assert!(err.to_string().contains("defined after the program began"), "{err}");
+    // An unknown word applied to something says what it is.
+    let source = "{\n    INPUT:◯ □ 4 1\n    (smoothe INPUT) → =\n}";
+    let err = parse_rho_program(source).unwrap_err();
+    assert!(matches!(err, HarmonyDisruption::LoweringErr { line: 3, .. }), "{err}");
+    assert!(err.to_string().contains("`smoothe` is not a function"), "{err}");
+}
+
+#[test]
+fn test_a_call_takes_its_arguments_one_after_another() {
+    let two = "\nblend:{ A B ((A + B) / 2.0) }\n";
+    // The wrong number of arguments, and the hint about parentheses.
+    let err = parse_rho_program(&format!("{two}{{\n    INPUT:◯ □ 4 1\n    (blend INPUT) → =\n}}")).unwrap_err();
+    assert!(err.to_string().contains("takes 2 argument(s), not 1"), "{err}");
+    let err = parse_rho_program(&format!("{two}{{\n    INPUT:◯ □ 4 1\n    (blend INPUT INPUT INPUT) → =\n}}")).unwrap_err();
+    assert!(err.to_string().contains("parentheses"), "{err}");
+    // A sum after the arguments is added to the call, not passed to it.
+    let block = parse_rho_program(&format!("{two}{{\n    INPUT:◯ □ 4 1\n    (blend INPUT INPUT + 1.0) → =\n}}")).unwrap();
+    let rho_lang::ast::Statement::Flow { src, .. } = &block.statements[1] else { panic!() };
+    assert!(matches!(src, Expr::BinaryOp { op: BinaryOpKind::Add, .. }), "{src:?}");
+    // A call binds tighter than the arithmetic around it.
+    let block = parse_rho_program(&format!("{two}{{\n    INPUT:◯ □ 4 1\n    (1.0 + blend INPUT (INPUT × 2.0)) → =\n}}")).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![4, 1], vec![2.0, 4.0, 6.0, 8.0]));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    assert_eq!(meant, vec![4.0, 7.0, 10.0, 13.0]);
+
+    // The parameters end where a name repeats, so `id:{ X X }` is the
+    // identity; a one-line body that begins with a name nobody has seen is
+    // read as one more parameter and leaves no body.
+    let block = parse_rho_program("\nid:{ X X }\n{\n    INPUT:◯ □ 4 1\n    (id INPUT) → =\n}").unwrap();
+    assert_eq!(block.statements.len(), 2);
+    let err = parse_rho_program("\nid:{ X Y }\n{\n    INPUT:◯ □ 4 1\n    (id INPUT) → =\n}").unwrap_err();
+    assert!(err.to_string().contains("parenthesised"), "{err}");
+}
+
+#[test]
+fn test_an_error_inside_a_function_names_the_body_and_the_call() {
+    // Shapes that cannot meet, inside `pair`, reached from line 6.
+    let source = "\npair:{ X Y (X + Y) }\n{\n    INPUT:◯ □ 4 1\n    AUX:◯ □ 3 1\n    (pair INPUT AUX) → =\n}";
+    let err = parse_rho_program(source).unwrap_err();
+    let HarmonyDisruption::InFunction { function, defined, line, inner } = &err else {
+        panic!("{err}")
+    };
+    assert_eq!((function.as_str(), *defined, *line), ("pair", 2, 6));
+    assert!(matches!(**inner, HarmonyDisruption::DimensionErr { .. }), "{inner}");
+    let rendered = err.render(source);
+    assert!(rendered.contains("pair:{ X Y (X + Y) }"), "{rendered}");
+    assert!(rendered.contains("(pair INPUT AUX) → ="), "{rendered}");
+    assert!(rendered.contains("expanded from the call to `pair` at line 6"), "{rendered}");
+    assert_eq!(err.line(), Some(6));
+}
+
+#[test]
+fn test_a_function_can_be_the_body_of_a_fixed_point() {
+    // An expression body with names as arguments inlines into the loop.
+    let source = r#"
+relax:{ U ((▷U + ▽U) / 4.0) }
+{
+    INPUT:◯ □ 6 1
+    INPUT → X
+    ((INPUT - (relax X)) + (relax X)) → Y
+    ((INPUT / 4.0) - (relax X)) ⇒ X
+    X → =
+}"#;
+    let block = parse_rho_program(source).unwrap();
+    let b: Vec<f64> = vec![1.0, -2.0, 3.0, 0.5, -1.5, 2.0];
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![6, 1], b.clone()));
+    let options = Options { tau: 1e-12, max_sweeps: 500 };
+    let meant = interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone();
+    let so = compile_iterating("fn_fixed_point", source, options.tau, options.max_sweeps, true);
+    let (out, _, converged) = run_iterating(&so, &b, 6);
+    assert!(converged);
+    assert_eq!(bits(&out), bits(&meant));
+    // It is Jacobi again: 4x + x[i-1] + x[i+1] = b.
+    for i in 0..6 {
+        let left = if i == 0 { 0.0 } else { out[i - 1] };
+        let right = if i == 5 { 0.0 } else { out[i + 1] };
+        assert!((4.0 * out[i] + left + right - b[i]).abs() < 1e-10);
+    }
+
+    // A body of flows inside the loop would run once, not every round: refused
+    // for now, with the reason.
+    let source = "\nstep:{ U\n    (▷U + ▽U) → S\n    (S / 4.0) → =\n}\n{\n    INPUT:◯ □ 6 1\n    INPUT → X\n    (step X) ⇒ X\n    X → =\n}";
+    let err = parse_rho_program(source).unwrap_err();
+    assert!(matches!(err, HarmonyDisruption::IterateErr { line: 9, .. }), "{err}");
+}

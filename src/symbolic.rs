@@ -187,6 +187,8 @@ impl Builder<'_> {
             Expr::AuditTrace(inner) | Expr::Lift { operand: inner, .. } => {
                 self.build(inner, before, offset)
             }
+            // Expanded away before the analysis; an unknown value if not.
+            Expr::Call { .. } => Sym::Free(format!("call@{}", offset_tag(offset))),
             // A rotation reads the same space `by` cells along; which cell
             // that is after the wrap is not known for "any cell", but every
             // cell's expansion has the same range, so the relative offset
@@ -481,6 +483,11 @@ fn collect_divisions(
         | Expr::AuditTrace(inner) => {
             collect_divisions(inner, at, line, builder, out)
         }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_divisions(arg, at, line, builder, out);
+            }
+        }
         // An index measures its operand and never evaluates it.
         Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => {}
     }
@@ -531,6 +538,11 @@ fn collect_domains(
         | Expr::Take { operand: inner, .. }
         | Expr::Drop { operand: inner, .. }
         | Expr::AuditTrace(inner) => collect_domains(inner, at, line, builder, out),
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_domains(arg, at, line, builder, out);
+            }
+        }
         Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => {}
     }
 }
@@ -580,6 +592,13 @@ impl fmt::Display for ExprGlyphs<'_> {
                 }
                 None => write!(f, "⍉{}", ExprGlyphs(operand)),
             },
+            Expr::Call { name, args } => {
+                write!(f, "{name}")?;
+                for arg in args {
+                    write!(f, " {}", ExprGlyphs(arg))?;
+                }
+                Ok(())
+            }
             Expr::Take { count, axis, operand } | Expr::Drop { count, axis, operand } => {
                 let glyph = if matches!(self.0, Expr::Drop { .. }) { "↓" } else { "↑" };
                 match axis {

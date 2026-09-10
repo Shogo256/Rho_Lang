@@ -564,7 +564,7 @@ impl LlvmCodeGen {
                     None => true,
                 }
             }
-            Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => false,
+            Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } | Expr::Call { .. } => false,
             Expr::AuditTrace(inner)
             | Expr::Shift { operand: inner, .. }
             | Expr::Builtin { operand: inner, .. }
@@ -1037,7 +1037,7 @@ impl LlvmCodeGen {
         counter: &mut usize,
     ) -> Result<()> {
         match expr {
-            Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => {}
+            Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } | Expr::Call { .. } => {}
             Expr::AuditTrace(inner)
             | Expr::Shift { operand: inner, .. }
             | Expr::Rotate { operand: inner, .. }
@@ -1110,7 +1110,7 @@ impl LlvmCodeGen {
     ) -> Result<String> {
         let mut block = pred.to_string();
         match expr {
-            Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => {}
+            Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } | Expr::Call { .. } => {}
             Expr::AuditTrace(inner)
             | Expr::Shift { operand: inner, .. }
             | Expr::Rotate { operand: inner, .. }
@@ -1505,6 +1505,12 @@ impl LlvmCodeGen {
             | Expr::Transpose { .. }
             | Expr::Take { .. }
             | Expr::Drop { .. } => 0,
+            Expr::Call { name, .. } => {
+                return Err(HarmonyDisruption::LoweringErr {
+                    line: self.current_line.get(),
+                    detail: format!("the call to `{name}` was not expanded"),
+                })
+            }
             Expr::Lift { operand, .. } | Expr::Builtin { operand, .. } => {
                 self.max_shift_stride(operand)?
             }
@@ -1723,6 +1729,7 @@ impl LlvmCodeGen {
                     None => false,
                 }
             }
+            Expr::Call { .. } => false,
             Expr::BinaryOp { lhs, rhs, .. } => {
                 self.needs_broadcast(lhs, result_shape, lifts)
                     || self.needs_broadcast(rhs, result_shape, lifts)
@@ -1782,6 +1789,11 @@ impl LlvmCodeGen {
             Expr::AuditTrace(inner) => {
                 self.emit_expr(inner, ir, bufs, idx, counter, mode, result_shape, lifts)
             }
+
+            Expr::Call { name, .. } => Err(HarmonyDisruption::LoweringErr {
+                line: self.current_line.get(),
+                detail: format!("the call to `{name}` was not expanded"),
+            }),
 
             // `ind` of a comparison is that comparison's truth. Reading the
             // operand's value first would give the mask, which cannot tell a

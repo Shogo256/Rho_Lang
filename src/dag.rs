@@ -150,6 +150,11 @@ fn extract_dependencies(expr: &Expr) -> Vec<String> {
             deps.extend(extract_dependencies(lhs));
             deps.extend(extract_dependencies(rhs));
         }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                deps.extend(extract_dependencies(arg));
+            }
+        }
         Expr::Number(_) => {}
     }
     deps

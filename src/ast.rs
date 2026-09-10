@@ -276,6 +276,45 @@ pub enum Expr {
         operand: Box<Expr>,
     },
     AuditTrace(Box<Expr>), // $
+    /// `smooth X`, `blend A (B + C)` — a call to a function the program
+    /// defined above. Exists only between parsing and expansion: every call
+    /// is replaced by the function's body, with the arguments bound, before
+    /// anything else looks at the program.
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
+}
+
+/// A function of the program's own: a named block with parameters, expanded
+/// at each call. `smooth:{ X ((▷X + X + ▽X) / 3.0) }` has an expression body;
+/// a body of flows ends in `→ =`, which names its result. A body sees its
+/// parameters, `𝜏` and constants, nothing of the caller's. Definitions come
+/// before their use, which is what rules recursion out: a function is not
+/// defined while its own body is being read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Function {
+    pub name: String,
+    pub params: Vec<String>,
+    pub body: FunctionBody,
+    /// Source line of the definition's header.
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FunctionBody {
+    /// A single expression, with its source line: the result.
+    Expression(Expr, usize),
+    /// Flows ending in `→ =`, each with its source line.
+    Flows(Vec<(Statement, usize)>),
+}
+
+/// Where an expanded statement came from, so a diagnostic can point at the
+/// function's body as well as at the call that expanded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    pub function: String,
+    pub body_line: usize,
 }
 
 /// Space Matrix Initialization & Boundary Declaration ([Name]:◯ □ [Dim1] [Dim2]...)
@@ -329,9 +368,39 @@ pub struct ToposBlock {
     /// Source line of each statement, parallel to `statements`, so a diagnostic
     /// can point at the line the reader actually wrote.
     pub lines: Vec<usize>,
+    /// For a statement that a function call expanded into, which function
+    /// and which line of its body; parallel to `statements`.
+    pub origins: Vec<Option<Origin>>,
 }
 
 impl ToposBlock {
+    /// Point a diagnostic at the function it arose in as well as at the call:
+    /// an error on a line where a call was expanded names the body line too.
+    pub fn attribute(&self, error: crate::error::HarmonyDisruption) -> crate::error::HarmonyDisruption {
+        use crate::error::HarmonyDisruption;
+        if matches!(error, HarmonyDisruption::InFunction { .. }) {
+            return error;
+        }
+        let Some(line) = error.line() else {
+            return error;
+        };
+        let origin = self
+            .lines
+            .iter()
+            .zip(&self.origins)
+            .find(|(l, o)| **l == line && o.is_some())
+            .and_then(|(_, o)| o.clone());
+        match origin {
+            Some(origin) => HarmonyDisruption::InFunction {
+                function: origin.function,
+                defined: origin.body_line,
+                line,
+                inner: Box::new(error),
+            },
+            None => error,
+        }
+    }
+
     /// Source line of statement `index`, or 0 when it is not known.
     pub fn line_of(&self, index: usize) -> usize {
         self.lines.get(index).copied().unwrap_or(0)
@@ -393,7 +462,8 @@ pub fn expr_shape(
                 (None, None) => None,
             }
         }
-        Expr::Number(_) => None,
+        // A call is expanded before shapes are asked for.
+        Expr::Number(_) | Expr::Call { .. } => None,
     }
 }
 

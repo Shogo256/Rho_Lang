@@ -109,7 +109,8 @@ fn run(args: &Args) -> anyhow::Result<()> {
     } else {
         rho_lang::numeric::Precision::F64
     };
-    let report = ConstraintSolver::verify_at(&block, args.tau, precision)?;
+    let report = ConstraintSolver::verify_at(&block, args.tau, precision)
+        .map_err(|e| block.attribute(e))?;
     println!("  └─ Backend: {} at {precision}", report.backend);
     let mut open_questions = 0;
     for finding in report
@@ -169,7 +170,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("--bind address '{addr}' is not a number: {e}"))?;
         codegen = codegen.bind(name.trim(), value);
     }
-    let llvm_ir = codegen.generate_llvm_ir(&block)?;
+    let llvm_ir = codegen.generate_llvm_ir(&block).map_err(|e| block.attribute(e))?;
 
     if args.dump_llvm {
         println!("-----------------------------------------------------");

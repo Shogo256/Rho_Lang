@@ -221,6 +221,9 @@ fn shape_of<S: Numeric>(expr: &Expr, env: &Env<S>, line: usize) -> Result<Option
                 None => None,
             }
         }
+        Expr::Call { name, .. } => {
+            return Err(err(line, format!("the call to `{name}` was not expanded")))
+        }
         Expr::Transpose { axes, operand } => match shape_of(operand, env, line)? {
             Some(inner) => Some(transposed_shape(&inner, axes.as_deref()).ok_or_else(|| {
                 err(line, format!("⍉ needs a permutation of the axes of {inner:?}"))
@@ -357,6 +360,8 @@ fn eval_cell<S: Numeric>(
             let cell = mapped - position * stride + target * stride;
             eval_at(operand, env, tau, line, &inner_shape, cell)
         }
+
+        Expr::Call { name, .. } => Err(err(line, format!("the call to `{name}` was not expanded"))),
 
         // The cell `count` in from the start or the end of the axis, or zero
         // where a take runs past the source.

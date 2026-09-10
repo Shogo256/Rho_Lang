@@ -59,6 +59,7 @@ jobs:
         cargo run --bin rhoc -- examples/min_plus.rho
         cargo run --bin rhoc -- examples/window.rho
         cargo run --bin rhoc -- examples/periodic.rho --tau 1e-9 --max-iter 20000
+        cargo run --bin rhoc -- examples/functions.rho
 
     - name: Check Codegen Determinism
       run: |

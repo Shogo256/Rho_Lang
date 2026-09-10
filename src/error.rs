@@ -46,6 +46,15 @@ pub enum HarmonyDisruption {
         line: usize,
     },
 
+    /// A disruption inside a function's body, reached through a call
+    #[error("{inner}\n  in `{function}`, whose body is at line {defined}; expanded at line {line}")]
+    InFunction {
+        function: String,
+        defined: usize,
+        line: usize,
+        inner: Box<HarmonyDisruption>,
+    },
+
     /// Lowering Disruption: construct cannot be mapped to hardware
     #[error("[Harmony Disruption: Lowering Failure] {detail} (Line {line})")]
     LoweringErr {
@@ -64,13 +73,39 @@ impl HarmonyDisruption {
             HarmonyDisruption::LogicErr { line, .. } => *line,
             HarmonyDisruption::LoweringErr { line, .. } => *line,
             HarmonyDisruption::IterateErr { line, .. } => *line,
+            HarmonyDisruption::InFunction { line, .. } => *line,
             HarmonyDisruption::FlowErr => 0,
         };
         (line > 0).then_some(line)
     }
 
-    /// The diagnostic with the offending source line under a caret.
+    /// The diagnostic with the offending source line under a caret. An error
+    /// inside a function shows the body line it arose on and the call that
+    /// expanded it, both with carets.
     pub fn render(&self, source: &str) -> String {
+        if let HarmonyDisruption::InFunction {
+            function,
+            defined,
+            line,
+            inner,
+        } = self
+        {
+            let show = |n: usize| {
+                let text = source.lines().nth(n.saturating_sub(1)).unwrap_or("");
+                let column = text.len() - text.trim_start().len() + 1;
+                let gutter = format!("{n}");
+                let pad = " ".repeat(gutter.len());
+                format!(
+                    "{pad} |\n{gutter} | {text}\n{pad} | {}^",
+                    " ".repeat(column.saturating_sub(1))
+                )
+            };
+            return format!(
+                "{inner}\n{}\n  expanded from the call to `{function}` at line {line}:\n{}",
+                show(*defined),
+                show(*line)
+            );
+        }
         let Some(line) = self.line() else {
             return self.to_string();
         };

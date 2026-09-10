@@ -2,12 +2,11 @@
     /* Relaxation of Laplace's equation on a grid whose boundary is held at
        zero: every sweep replaces a cell by the mean of its four neighbours.
 
-       The compiler proves the values stay within the range they started in,
-       so the contract holds at every sweep. It does *not* prove convergence:
-       the update's coefficients sum to exactly 1, and the ∞-norm argument the
-       checker makes stops there. The iteration does converge — by a spectral
-       argument this checker does not make — and the kernel reports whether it
-       stopped on the tolerance or on the cap.
+       A mean never leaves the range of what it averages, so the values stay
+       within the range they started in at every sweep. The iteration does
+       converge — the update's coefficients sum to exactly 1, so not by the
+       ∞-norm contraction Jacobi has, but by a spectral argument — and the
+       kernel reports whether it stopped on the tolerance or on the cap.
 
          rhoc examples/laplace.rho --tau 1e-6 --max-iter 2000
     */

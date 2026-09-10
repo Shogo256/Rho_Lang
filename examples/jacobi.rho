@@ -5,8 +5,9 @@
 
        Each sweep reads the whole previous X — a Jacobi step — and `⇒` repeats
        it until no cell moves by more than 𝜏 (--tau) or --max-iter sweeps have
-       run. The update's coefficients on X sum to 1/2, so the compiler proves
-       the iteration contracts in the ∞-norm: it converges from any start.
+       run. The update's coefficients on X sum to 1/2, so the step contracts
+       in the ∞-norm and converges from any start; the kernel reports whether
+       it stopped on the tolerance or on the cap (rho_kernel_converged()).
 
          rhoc examples/jacobi.rho --tau 1e-12 --max-iter 200
     */

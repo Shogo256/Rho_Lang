@@ -280,6 +280,15 @@ fn rounded(iv: Interval) -> Interval {
     }
 }
 
+/// Widen a range for a library function. `exp` and `log` are not correctly
+/// rounded — glibc's are within one unit of the true value — so their result
+/// can sit a unit either side of the real one, and then round again on the
+/// way out: two units, not one. difftest found this at f32, where `expf(-7)`
+/// landed one unit above the bound the analysis had taken from `exp(-7)`.
+fn library(iv: Interval) -> Interval {
+    rounded(rounded(iv))
+}
+
 /// `x * x` is never negative, but plain interval multiplication cannot see it:
 /// it treats the two operands as independent and returns [-inf, inf] for an
 /// unbounded x. Recognising a squared expression closes that gap.
@@ -415,15 +424,15 @@ pub fn eval_interval(sym: &Sym) -> Interval {
         Sym::Named { op, operand } => {
             let inner = eval_interval(operand);
             match op {
-                BuiltinOp::Exp => Interval {
+                BuiltinOp::Exp => library(Interval {
                     lo: if inner.lo.is_finite() { inner.lo.exp() } else { 0.0 },
                     hi: if inner.hi.is_finite() {
                         inner.hi.exp()
                     } else {
                         f64::INFINITY
                     },
-                },
-                BuiltinOp::Log => Interval {
+                }),
+                BuiltinOp::Log => library(Interval {
                     lo: if inner.lo > 0.0 {
                         inner.lo.ln()
                     } else {
@@ -434,15 +443,16 @@ pub fn eval_interval(sym: &Sym) -> Interval {
                     } else {
                         f64::INFINITY
                     },
-                },
-                BuiltinOp::Sqrt => Interval {
+                }),
+                // A square root is a basic operation and rounds once.
+                BuiltinOp::Sqrt => rounded(Interval {
                     lo: if inner.lo >= 0.0 { inner.lo.sqrt() } else { 0.0 },
                     hi: if inner.hi >= 0.0 && inner.hi.is_finite() {
                         inner.hi.sqrt()
                     } else {
                         f64::INFINITY
                     },
-                },
+                }),
                 // A sine or cosine is bounded however wild its argument.
                 BuiltinOp::Sin | BuiltinOp::Cos => Interval { lo: -1.0, hi: 1.0 },
                 BuiltinOp::Abs => Interval {

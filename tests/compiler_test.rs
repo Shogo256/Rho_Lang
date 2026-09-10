@@ -1980,6 +1980,22 @@ fn test_the_analysis_follows_the_width_it_was_made_at() {
         narrow.output_range.lo,
         wide.output_range.lo
     );
+
+    // A library function's result is not the real number: at f32 `expf(-7)`
+    // lands above `exp(-7)`, which difftest caught as a bound the kernel
+    // stepped over. The range of `exp` is widened at the width it is made at.
+    let source = r#"{
+        INPUT:◯ □ 4 1
+        ((exp -7.0) ⌊ INPUT) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let narrow = ConstraintSolver::analyze_at(&block, 0.0, Precision::F32);
+    let wide = ConstraintSolver::analyze_at(&block, 0.0, Precision::F64);
+    let at_f32 = f64::from((-7.0f32).exp());
+    assert!(narrow.output_range.hi >= at_f32, "{} < {at_f32}", narrow.output_range.hi);
+    assert!(wide.output_range.hi >= (-7.0f64).exp());
+    assert!(wide.output_range.hi < at_f32, "the f64 bound stays the tighter one");
 }
 
 // --------------------------------------------------------------------------

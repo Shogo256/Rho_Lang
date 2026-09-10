@@ -529,7 +529,13 @@ step:{ U
 }
 ```
 
-Not in this version: a `⇒` inside a body, and the rank operator `⍤`.
+Not in this version: a `⇒` inside a body.
+
+Not in the language, by decision: APL's rank operator `⍤`. The axis digit on
+`◇ ◈ ▷ ▽ ⍳` and the lift `□` already say along which axis a thing happens,
+and a function is written once for any shape; a second way to say it would
+change what a shift means inside a cell. Nor a spelling `f ⇒ U` for
+`(f U) ⇒ U`, which is short enough as it is.
 
 A note on `^`, which an index is often the exponent of: `x ^ 2.0` is `x × x`,
 and `x ^ Y` is a library power even where Y's cells happen to be whole. The

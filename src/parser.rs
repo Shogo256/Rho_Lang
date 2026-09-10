@@ -7,7 +7,7 @@ pub fn validate_symbols(input: &str) -> Result<()> {
     let code_only = remove_comments(input);
 
     let allowed_unicode: HashSet<char> = [
-        '◯', '□', '▷', '▽', '△', '◇', '◈', '⍳', '⌽', '+', '-', '×', '*', '/', '^', '⌈', '⌊', '|', '→', '⇒', '<', '>', '=', ':', '{', '}', '$', '&', '!',
+        '◯', '□', '▷', '▽', '△', '◇', '◈', '⍳', '⌽', '⍴', '+', '-', '×', '*', '/', '^', '⌈', '⌊', '|', '→', '⇒', '<', '>', '=', ':', '{', '}', '$', '&', '!',
         '(', ')', '[', ']', ';', ',', '.', ' ', '\t', '\r', '\n', '_', '𝜏', 'τ'
     ].iter().cloned().collect();
 
@@ -72,6 +72,7 @@ pub fn normalize_ascii_aliases(input: &str) -> String {
         .replace("<<", "▽")
         .replace("#", "⍳")
         .replace("%", "⌽")
+        .replace("\\", "⍴")
         .replace("@", "&")
 }
 
@@ -450,6 +451,36 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         });
     }
 
+    // Reshape: `2 3 ⍴ X`. The shape is a list of whole numbers written as
+    // literals, so the result's shape is known where every shape is: at
+    // compile time. Binds as tightly as the prefix glyphs.
+    if let Some(pos) = find_binary_op_position(expr_str, "⍴") {
+        let written = expr_str[..pos].trim();
+        let dims: Option<Vec<usize>> = written
+            .split_whitespace()
+            .map(|t| t.parse::<usize>().ok().filter(|d| *d >= 1))
+            .collect();
+        let Some(shape) = dims.filter(|d| !d.is_empty()) else {
+            return Err(HarmonyDisruption::LoweringErr {
+                detail: format!(
+                    "`⍴` reshapes to a list of whole numbers written as literals, not to `{written}`"
+                ),
+                line: 0,
+            });
+        };
+        let operand_str = expr_str[pos + '⍴'.len_utf8()..].trim();
+        if operand_str.is_empty() {
+            return Err(HarmonyDisruption::LoweringErr {
+                detail: "`⍴` needs a space to reshape".to_string(),
+                line: 0,
+            });
+        }
+        return Ok(Expr::Reshape {
+            shape,
+            operand: Box::new(parse_expr(operand_str)?),
+        });
+    }
+
     // Reverse: ⌽X reads the cell at the other end of the axis; ⌽0X names it.
     if expr_str.starts_with('⌽') && expr_str.chars().count() > 1 {
         let rest = &expr_str['⌽'.len_utf8()..];
@@ -557,7 +588,7 @@ fn is_sign_position(before: &str) -> bool {
         Some(c) => matches!(
             c,
             '+' | '-' | '×' | '*' | '/' | '^' | '⌈' | '⌊' | '|' | '>' | '<' | '=' | '('
-                | ':' | '→' | '◇' | '◈' | '▷' | '▽' | '□' | '⍳' | '⌽' | '!' | '$'
+                | ':' | '→' | '◇' | '◈' | '▷' | '▽' | '□' | '⍳' | '⌽' | '⍴' | '!' | '$'
         ),
     }
 }
@@ -680,6 +711,7 @@ fn check_expr_spaces(expr: &Expr, declared: &HashSet<String>, line: usize) -> Re
         | Expr::Index { operand: inner, .. }
         | Expr::Rotate { operand: inner, .. }
         | Expr::Reverse { operand: inner, .. }
+        | Expr::Reshape { operand: inner, .. }
         | Expr::AuditTrace(inner) => {
             check_expr_spaces(inner, declared, line)?;
         }
@@ -763,6 +795,7 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
             | Expr::Index { operand: inner, .. }
             | Expr::Rotate { operand: inner, .. }
             | Expr::Reverse { operand: inner, .. }
+            | Expr::Reshape { operand: inner, .. }
             | Expr::AuditTrace(inner) => check_broadcast(inner, shapes, line)?,
             Expr::Var(_) | Expr::Number(_) => {}
         }

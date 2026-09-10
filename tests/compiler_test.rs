@@ -3079,3 +3079,98 @@ fn test_diffusion_on_a_ring_relaxes_to_the_mean() {
     // A ring has no edge to lose heat through: everything ends at the mean.
     assert!(out.iter().all(|v| (v - mean).abs() < 1e-6), "{out:?}");
 }
+
+// --------------------------------------------------------------------------
+// ⍴: APL's reshape. The cells in row-major order, read into a shape written
+// down; a reinterpretation when the counts agree, and read round when not.
+// --------------------------------------------------------------------------
+
+#[test]
+fn test_reshape_parses_a_literal_shape_and_binds_tightly() {
+    let block = parse_rho_program(
+        "{\n    INPUT:◯ □ 3 4\n    (4 3 ⍴ INPUT) → A\n    (2 2 3 \\ INPUT) → B\n    (A + 12 1 ⍴ INPUT) → =\n}",
+    )
+    .unwrap();
+    let flows: Vec<&Expr> = block
+        .statements
+        .iter()
+        .filter_map(|s| match s {
+            rho_lang::ast::Statement::Flow { src, .. } => Some(src),
+            _ => None,
+        })
+        .collect();
+    assert!(matches!(flows[0], Expr::Reshape { shape, .. } if shape == &[4, 3]));
+    assert!(matches!(flows[1], Expr::Reshape { shape, .. } if shape == &[2, 2, 3]));
+    let Expr::BinaryOp { op: BinaryOpKind::Add, rhs, .. } = flows[2] else { panic!() };
+    assert!(matches!(&**rhs, Expr::Reshape { shape, .. } if shape == &[12, 1]));
+
+    for bad in ["(INPUT ⍴ INPUT) → =", "(0 3 ⍴ INPUT) → =", "(2.5 ⍴ INPUT) → ="] {
+        let err = parse_rho_program(&format!("{{\n    INPUT:◯ □ 3 4\n    {bad}\n}}")).unwrap_err();
+        assert!(matches!(err, HarmonyDisruption::LoweringErr { line: 3, .. }), "{bad}: {err}");
+    }
+}
+
+#[test]
+fn test_reshape_reinterprets_or_reads_round_in_kernel_and_interpreter() {
+    let grid: Vec<f64> = (0..12).map(|i| i as f64).collect();
+    // The same twelve cells as a column: nothing moves.
+    let out = run_kernel("reshape_flat", "{\n    INPUT:◯ □ 3 4\n    (12 1 ⍴ INPUT) → =\n}", &grid);
+    assert_eq!(&out[..12], &grid[..]);
+    // As 4x3, the new shape shows in what a shift along the last axis reads:
+    // it stops every three cells, not every four.
+    let block = parse_rho_program("{\n    INPUT:◯ □ 3 4\n    (4 3 ⍴ INPUT) → V\n    (▷V) → =\n}").unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![3, 4], grid.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    assert_eq!(meant, vec![0.0, 0.0, 1.0, 0.0, 3.0, 4.0, 0.0, 6.0, 7.0, 0.0, 9.0, 10.0]);
+    let out = run_kernel("reshape_shift", "{\n    INPUT:◯ □ 3 4\n    (4 3 ⍴ INPUT) → V\n    (▷V) → =\n}", &grid);
+    assert_eq!(&out[..12], &meant[..]);
+
+    // Reading round: two cells tiled six times; and a longer source cut short.
+    let pair = vec![7.0, 9.0];
+    let source = r#"{
+        P:◯ □ 2
+        (3 4 ⍴ P) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let out = run_spaces("reshape_round", source, &[("P", pair), ("OUTPUT", vec![0.0; 12])]);
+    assert_eq!(out["OUTPUT"], vec![7.0, 9.0, 7.0, 9.0, 7.0, 9.0, 7.0, 9.0, 7.0, 9.0, 7.0, 9.0]);
+    let source = r#"{
+        G:◯ □ 3 4
+        (5 ⍴ G) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let out = run_spaces("reshape_cut", source, &[("G", grid.clone()), ("OUTPUT", vec![0.0; 5])]);
+    assert_eq!(out["OUTPUT"], vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+
+    // Sixteen cells reinterpreted: the vector path applies and agrees.
+    let long: Vec<f64> = (0..16).map(|i| (i as f64 * 0.3).sin()).collect();
+    let source = "{\n    INPUT:◯ □ 16 1\n    ((4 4 ⍴ INPUT) × 2.0) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![16, 1], long.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    let out = run_kernel("reshape_vector", source, &long);
+    assert_eq!(bits(&out[..16]), bits(&meant));
+    let ir = LlvmCodeGen::new("reshape_plan").generate_llvm_ir(&block).unwrap();
+    assert!(ir.contains("sweep 16 cells (scalar 0..0, 4-wide vector"), "a same-count reshape keeps the vector path:\n{ir}");
+}
+
+#[test]
+fn test_reshape_makes_a_matrix_of_a_vector_and_keeps_the_range() {
+    // A vector of twelve becomes the 3x4 matrix a fold can work on.
+    let source = r#"{
+        V:◯ □ 12
+        (3 4 ⍴ V) → M
+        (◇+1 M) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let v: Vec<f64> = (1..=12).map(|i| i as f64).collect();
+    let out = run_spaces("reshape_rows", source, &[("V", v), ("OUTPUT", vec![0.0; 3])]);
+    assert_eq!(out["OUTPUT"], vec![10.0, 26.0, 42.0]);
+
+    // Whatever cell a reshape reads is a cell of the same space.
+    let report = analyze("{\n    INPUT:◯ □ 4 1\n    (ind (INPUT > 0.0)) → M\n    (2 2 ⍴ M) → OUTPUT\n    ! (OUTPUT <= 1.0)\n    OUTPUT → =\n}");
+    assert_eq!(report.constraints[0].verdict, rho_lang::solver::Verdict::Proved);
+    assert_eq!((report.output_range.lo, report.output_range.hi), (0.0, 1.0));
+}

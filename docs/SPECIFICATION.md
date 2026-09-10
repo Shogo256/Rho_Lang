@@ -45,6 +45,7 @@ principle.
 | `□` | Lift | Hojin (方陣) | In an expression, inserts a length-1 axis, see §3.6 | ✅ |
 | `⍳` / `#` | Index | — | The coordinate of each cell along an axis, from zero, see §3.7 | ✅ |
 | `⌽` / `%` | Rotate, Reverse | — | `k ⌽ X` reads `k` cells along, wrapping; `⌽X` reads from the other end, see §3.2.2 | ✅ |
+| `⍴` / `\` | Reshape | — | `2 3 ⍴ X` reads X's cells, in order, into that shape, see §3.8 | ✅ |
 | `+` | Addition | Superposition | Element-wise addition | ✅ |
 | `-` | Subtraction | Difference | Element-wise subtraction | ✅ |
 | `×` / `*` | Multiplication | Scaling | Element-wise product | ✅ |
@@ -65,7 +66,7 @@ principle.
 | `!` | Constraint | Invariant Check | Statically verified, see §4 | ✅ |
 | `→ =` | Convergence | — | Writes the caller's output buffer | ✅ |
 
-ASCII aliases: `->` for `→`, `=>` for `⇒`, `>>` for `▷`, `<<` for `▽`, `>.` for `⌈`, `<.` for `⌊`, `#` for `⍳`, `%` for `⌽`, `@` for `&`,
+ASCII aliases: `->` for `→`, `=>` for `⇒`, `>>` for `▷`, `<<` for `▽`, `>.` for `⌈`, `<.` for `⌊`, `#` for `⍳`, `%` for `⌽`, `\` for `⍴`, `@` for `&`,
 `<>` for `◇`, `<.>` for `◈`, `[]` for `□`.
 
 ### The greater, the lesser and the residue
@@ -378,6 +379,26 @@ had no way to write it before:
 
 To the `!` check a coordinate is a value between 0 and the axis's extent less
 one, so `! (⍳X >= 0)` and `! (⍳X <= 3.0)` on `◯ □ 3 4` are both settled.
+
+### 3.8 Reshape (`⍴`) ✅
+
+`2 3 ⍴ X` is APL's reshape: X's cells in row-major order, read into the shape
+written on the left, which is a list of whole numbers and so known at compile
+time like every other shape. With the same number of cells nothing moves — a
+vector of twelve becomes the `3 4` matrix a fold can work on, and the vector
+path stands. With fewer cells the source is read round again, `result[i] =
+X[i mod n]`, as APL does, so `3 4 ⍴ P` tiles a pair across a grid; with more,
+the tail is dropped. A reshape that reads round is not contiguous and keeps
+its sweep scalar. `\` spells it in ASCII.
+
+```rho
+(3 4 ⍴ V) → M            /* twelve cells as three rows of four */
+(◇+1 M) → ROWSUMS
+```
+
+Like a shift, it reads a declared space, not a computed value, and it binds
+as tightly as the prefix glyphs. It is not a transpose: `4 3 ⍴ X` re-cuts the
+same run of cells into rows of three. Transposition is `⍉`, see §3.9.
 
 A note on `^`, which an index is often the exponent of: `x ^ 2.0` is `x × x`,
 and `x ^ Y` is a library power even where Y's cells happen to be whole. The

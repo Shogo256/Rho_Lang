@@ -534,20 +534,30 @@ impl LlvmCodeGen {
         sym
     }
 
-    /// Whether the expression rotates or reverses anything. Such a read wraps
-    /// at the end of the axis, so its lanes are not contiguous and the sweep
-    /// stays scalar. 📋 A gathered vector path would lift this.
-    fn turns(expr: &Expr) -> bool {
+    /// Whether the expression reads anything out of order: a rotation or a
+    /// reversal wraps at the end of the axis, and a reshape to more cells
+    /// reads its operand round again. Such lanes are not contiguous, so the
+    /// sweep stays scalar. 📋 A gathered vector path would lift this.
+    fn turns(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Rotate { .. } | Expr::Reverse { .. } => true,
+            // Same count: a reinterpretation, contiguous as the operand is.
+            Expr::Reshape { shape, operand } => {
+                match Self::expr_shape(operand, &self.space_shapes) {
+                    Some(source) => {
+                        source.iter().product::<usize>() != shape.iter().product::<usize>()
+                    }
+                    None => true,
+                }
+            }
             Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => false,
             Expr::AuditTrace(inner)
             | Expr::Shift { operand: inner, .. }
             | Expr::Builtin { operand: inner, .. }
             | Expr::Lift { operand: inner, .. }
             | Expr::Scan { operand: inner, .. }
-            | Expr::Reduce { operand: inner, .. } => Self::turns(inner),
-            Expr::BinaryOp { lhs, rhs, .. } => Self::turns(lhs) || Self::turns(rhs),
+            | Expr::Reduce { operand: inner, .. } => self.turns(inner),
+            Expr::BinaryOp { lhs, rhs, .. } => self.turns(lhs) || self.turns(rhs),
         }
     }
 
@@ -789,7 +799,7 @@ impl LlvmCodeGen {
         let result_shape = self.sweep_shape(src, target);
         // A stretched read is not contiguous, so it cannot be vector loaded;
         // neither is a read that wraps at the end of an axis.
-        let plan = if self.needs_broadcast(src, &result_shape, &[]) || Self::turns(src) {
+        let plan = if self.needs_broadcast(src, &result_shape, &[]) || self.turns(src) {
             Sweep::AllScalar
         } else {
             self.plan_sweep(src, &sweep)?
@@ -1018,6 +1028,7 @@ impl LlvmCodeGen {
             | Expr::Shift { operand: inner, .. }
             | Expr::Rotate { operand: inner, .. }
             | Expr::Reverse { operand: inner, .. }
+            | Expr::Reshape { operand: inner, .. }
             | Expr::Builtin { operand: inner, .. }
             | Expr::Lift { operand: inner, .. } => {
                 self.reserve_fold_buffers(inner, ir, bufs, counter)?;
@@ -1087,6 +1098,7 @@ impl LlvmCodeGen {
             | Expr::Shift { operand: inner, .. }
             | Expr::Rotate { operand: inner, .. }
             | Expr::Reverse { operand: inner, .. }
+            | Expr::Reshape { operand: inner, .. }
             | Expr::Builtin { operand: inner, .. }
             | Expr::Lift { operand: inner, .. } => {
                 block = self.emit_fold_prepass(inner, ir, bufs, &block, counter)?;
@@ -1468,7 +1480,8 @@ impl LlvmCodeGen {
             | Expr::Scan { .. }
             | Expr::Index { .. }
             | Expr::Rotate { .. }
-            | Expr::Reverse { .. } => 0,
+            | Expr::Reverse { .. }
+            | Expr::Reshape { .. } => 0,
             Expr::Lift { operand, .. } | Expr::Builtin { operand, .. } => {
                 self.max_shift_stride(operand)?
             }
@@ -1674,11 +1687,13 @@ impl LlvmCodeGen {
             Expr::Reduce { .. } | Expr::Scan { .. } => {
                 Self::lifted_shape(&self.precomputed_shape(expr), lifts) != result_shape
             }
-            // An index is laid out like the operand it measures.
+            // An index is laid out like the operand it measures; a reshape
+            // like the shape it was given.
             Expr::Index { operand, .. } => match Self::expr_shape(operand, &self.space_shapes) {
                 Some(shape) => Self::lifted_shape(&shape, lifts) != result_shape,
                 None => false,
             },
+            Expr::Reshape { shape, .. } => Self::lifted_shape(shape, lifts) != result_shape,
             Expr::BinaryOp { lhs, rhs, .. } => {
                 self.needs_broadcast(lhs, result_shape, lifts)
                     || self.needs_broadcast(rhs, result_shape, lifts)
@@ -1831,6 +1846,47 @@ impl LlvmCodeGen {
                 ir.push_str(&format!(
                     "  {gep} = getelementptr inbounds {}, ptr {ptr}, i64 {read_at}\n",
             self.precision.llvm_type()
+                ));
+                ir.push_str(&format!(
+                    "  {val} = load {ty}, ptr {gep}, align {}\n",
+                    self.precision.bytes()
+                ));
+                Ok(val)
+            }
+
+            // The operand's cells in row-major order, read into a new shape.
+            // With the same count it is the operand's buffer read straight
+            // through — contiguous, so the vector path stands; with a
+            // different count the read goes round, and the sweep is scalar.
+            Expr::Reshape { shape, operand } => {
+                let name = Self::place_name(operand).ok_or_else(|| {
+                    HarmonyDisruption::LoweringErr {
+                        line: self.current_line.get(),
+                        detail: "⍴ reshapes a declared space, so it cannot be applied to a computed value. Flow the sub-expression into its own space first.".to_string(),
+                    }
+                })?;
+                let ptr = self.lookup(bufs, &name)?;
+                let count = self.shape_for(&name).iter().product::<usize>().max(1);
+                let view = Self::lifted_shape(shape, lifts);
+                let read_at = self.emit_index_map(ir, idx, &view, result_shape, counter)?;
+                let cell = if shape.iter().product::<usize>().max(1) == count {
+                    read_at
+                } else {
+                    if matches!(mode, Mode::Vector(..)) {
+                        return Err(HarmonyDisruption::LoweringErr {
+                            line: self.current_line.get(),
+                            detail: "internal: a cycling reshape reached the vector path".to_string(),
+                        });
+                    }
+                    let wrapped = Self::fresh(counter);
+                    ir.push_str(&format!("  {wrapped} = urem i64 {read_at}, {count}\n"));
+                    wrapped
+                };
+                let gep = Self::fresh(counter);
+                let val = Self::fresh(counter);
+                ir.push_str(&format!(
+                    "  {gep} = getelementptr inbounds {}, ptr {ptr}, i64 {cell}\n",
+                    self.precision.llvm_type()
                 ));
                 ir.push_str(&format!(
                     "  {val} = load {ty}, ptr {gep}, align {}\n",

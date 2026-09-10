@@ -206,6 +206,15 @@ pub enum Expr {
         axis: Option<usize>,
         operand: Box<Expr>,
     },
+    /// `2 3 ⍴ X` — APL's reshape: X's cells in row-major order, read into a
+    /// new shape written as a list of literals. With the same number of
+    /// cells nothing moves: it is a reinterpretation. With fewer, X is read
+    /// round again, `result[i] = X[i mod n]`, as APL does; with more, the
+    /// tail is dropped.
+    Reshape {
+        shape: Vec<usize>,
+        operand: Box<Expr>,
+    },
     /// `⍳X` — the coordinate of each cell of X's shape along one axis,
     /// counted from zero; `⍳0X` names the axis, a bare `⍳X` takes the
     /// innermost axis with more than one cell, as `▷` and `◇` do. X is read
@@ -334,6 +343,7 @@ pub fn expr_shape(
         | Expr::Index { operand, .. }
         | Expr::Rotate { operand, .. }
         | Expr::Reverse { operand, .. } => expr_shape(operand, shapes),
+        Expr::Reshape { shape, operand } => expr_shape(operand, shapes).map(|_| shape.clone()),
         Expr::Reduce { axis, operand, .. } => {
             let inner = expr_shape(operand, shapes)?;
             let a = axis.unwrap_or_else(|| default_axis(&inner));

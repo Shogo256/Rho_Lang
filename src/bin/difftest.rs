@@ -228,6 +228,11 @@ fn expression(
             if let Some(folded) = fold_down_to(rng, spaces, want) {
                 return folded;
             }
+            // Any space reshapes to the wanted shape, reading round if short.
+            if !spaces.is_empty() && rng.below(2) == 0 {
+                let (name, _) = &spaces[rng.below(spaces.len())];
+                return format!("({} ⍴ {name})", dims_of(want));
+            }
             return format!("{:.1}", rng.value().trunc());
         }
         if rng.below(6) == 0 {
@@ -246,10 +251,13 @@ fn expression(
             } else {
                 String::new()
             };
-            match rng.below(6) {
+            match rng.below(7) {
                 0 => format!("(⍳{axis}{name})"),
                 1 => format!("({} ⌽{axis} {name})", [-3i64, -2, -1, 1, 2, 3, 5][rng.below(7)]),
                 2 => format!("(⌽{axis}{name})"),
+                // Any space at all reshapes to the wanted shape, reading
+                // round when it is short and cut short when it is long.
+                3 => format!("({} ⍴ {})", dims_of(want), spaces[rng.below(spaces.len())].0),
                 _ => format!("({}{axis}{name})", ["▷", "▽"][rng.below(2)]),
             }
         }

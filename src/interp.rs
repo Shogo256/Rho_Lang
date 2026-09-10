@@ -211,6 +211,7 @@ fn shape_of<S: Numeric>(expr: &Expr, env: &Env<S>, line: usize) -> Result<Option
         | Expr::Index { operand, .. }
         | Expr::Rotate { operand, .. }
         | Expr::Reverse { operand, .. } => shape_of(operand, env, line)?,
+        Expr::Reshape { shape, operand } => shape_of(operand, env, line)?.map(|_| shape.clone()),
         Expr::Lift { axis, operand } => match shape_of(operand, env, line)? {
             Some(inner) => Some(shape_with_unit_axis(&inner, *axis).ok_or_else(|| {
                 err(line, format!("axis {axis} is past the end of {inner:?}"))
@@ -340,6 +341,17 @@ fn eval_cell<S: Numeric>(
             };
             let cell = mapped - position * stride + target * stride;
             eval_at(operand, env, tau, line, &inner_shape, cell)
+        }
+
+        // The operand's cells in row-major order, read into the new shape;
+        // round again when the new shape has more cells.
+        Expr::Reshape { shape, operand } => {
+            let inner_shape = shape_of(operand, env, line)?
+                .ok_or_else(|| err(line, "⍴ needs an operand with a shape"))?;
+            let count = inner_shape.iter().product::<usize>().max(1);
+            let view = lifted(shape, lifts);
+            let mapped = map_index(&view, at_shape, index);
+            eval_at(operand, env, tau, line, &inner_shape, mapped % count)
         }
 
         // The coordinate of this cell along one axis of the operand's shape,

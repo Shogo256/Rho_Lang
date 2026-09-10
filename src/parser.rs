@@ -1416,6 +1416,22 @@ fn is_sign_position(before: &str) -> bool {
         }
     }
 
+    // A function's name is not an operand, so a `-` right after one is a
+    // sign on its argument: `exp -3.0`, `A mix -1.0`. Without this the name
+    // was left standing alone as a space nobody declared.
+    let word_start = trimmed
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
+        .last()
+        .map(|(i, _)| i);
+    if let Some(start) = word_start {
+        let word = &trimmed[start..];
+        if BuiltinOp::ALL.contains(&word) || function_named(word).is_some() {
+            return true;
+        }
+    }
+
     match trimmed.chars().next_back() {
         None => true,
         Some(c) => matches!(

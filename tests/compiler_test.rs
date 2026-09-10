@@ -3702,6 +3702,17 @@ fn test_a_function_of_two_can_be_written_between_its_arguments() {
         bits(&run("infix_operands", "▷INPUT mix 2.0")),
         bits(&run("infix_operands_explicit", "(▷INPUT) mix 2.0"))
     );
+    // A `-` right after a function's name is a sign on its argument, since
+    // the name is not an operand: `INPUT mix -1.0` is not `(INPUT mix) - 1.0`,
+    // and `exp -1.0` is not `exp - 1.0`.
+    let signed = run("infix_signed", "INPUT mix -1.0");
+    for i in 0..8 {
+        assert_eq!(signed[i], input[i] * 0.25 - 0.75);
+    }
+    let scaled = run("builtin_signed", "INPUT × exp -1.0");
+    for i in 0..8 {
+        assert_eq!(scaled[i], input[i] * (-1.0f64).exp());
+    }
 
     // Only a function of two goes between its arguments.
     let source = "\nsmooth:{ X ((▷X + X + ▽X) / 3.0) }\n{\n    INPUT:◯ □ 8 1\n    (INPUT smooth INPUT) → =\n}";

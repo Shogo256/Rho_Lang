@@ -663,13 +663,16 @@ widths, runs it through both C entrypoints, and reports any cell where the
 kernel and the interpreter disagree on the bits.
 
 That is a stronger check than a test suite, because neither implementation was
-written to match the other. It has already found five defects:
+written to match the other. It has already found six defects:
 
 - the interpreter treated a fold's surviving index as the start of the line that
   cell summarises, so every row after the first folded the wrong values;
 - the parser split `A × -3.0` at the minus and left `A ×` behind as a name,
   because it never asked whether a sign was a sign;
 - the same, one step further, for an axis index: `◈×0 -3.0`;
+- and once more after a function's name: `exp -3.0` split at the minus and
+  left `exp` standing as a space, though a name is never an operand — the
+  generator's skipped programs, not a mismatch, pointed at it;
 - `^` had no pinned meaning, so the compiler and the interpreter rounded a
   square differently;
 - and `ind` of NaN was 0 from the kernel and 1 from the interpreter, because

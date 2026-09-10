@@ -540,7 +540,7 @@ impl LlvmCodeGen {
     /// sweep stays scalar. 📋 A gathered vector path would lift this.
     fn turns(&self, expr: &Expr) -> bool {
         match expr {
-            Expr::Rotate { .. } | Expr::Reverse { .. } => true,
+            Expr::Rotate { .. } | Expr::Reverse { .. } | Expr::Transpose { .. } => true,
             // Same count: a reinterpretation, contiguous as the operand is.
             Expr::Reshape { shape, operand } => {
                 match Self::expr_shape(operand, &self.space_shapes) {
@@ -1029,6 +1029,7 @@ impl LlvmCodeGen {
             | Expr::Rotate { operand: inner, .. }
             | Expr::Reverse { operand: inner, .. }
             | Expr::Reshape { operand: inner, .. }
+            | Expr::Transpose { operand: inner, .. }
             | Expr::Builtin { operand: inner, .. }
             | Expr::Lift { operand: inner, .. } => {
                 self.reserve_fold_buffers(inner, ir, bufs, counter)?;
@@ -1099,6 +1100,7 @@ impl LlvmCodeGen {
             | Expr::Rotate { operand: inner, .. }
             | Expr::Reverse { operand: inner, .. }
             | Expr::Reshape { operand: inner, .. }
+            | Expr::Transpose { operand: inner, .. }
             | Expr::Builtin { operand: inner, .. }
             | Expr::Lift { operand: inner, .. } => {
                 block = self.emit_fold_prepass(inner, ir, bufs, &block, counter)?;
@@ -1481,7 +1483,8 @@ impl LlvmCodeGen {
             | Expr::Index { .. }
             | Expr::Rotate { .. }
             | Expr::Reverse { .. }
-            | Expr::Reshape { .. } => 0,
+            | Expr::Reshape { .. }
+            | Expr::Transpose { .. } => 0,
             Expr::Lift { operand, .. } | Expr::Builtin { operand, .. } => {
                 self.max_shift_stride(operand)?
             }
@@ -1694,6 +1697,10 @@ impl LlvmCodeGen {
                 None => false,
             },
             Expr::Reshape { shape, .. } => Self::lifted_shape(shape, lifts) != result_shape,
+            Expr::Transpose { .. } => match Self::expr_shape(expr, &self.space_shapes) {
+                Some(shape) => Self::lifted_shape(&shape, lifts) != result_shape,
+                None => false,
+            },
             Expr::BinaryOp { lhs, rhs, .. } => {
                 self.needs_broadcast(lhs, result_shape, lifts)
                     || self.needs_broadcast(rhs, result_shape, lifts)
@@ -1846,6 +1853,83 @@ impl LlvmCodeGen {
                 ir.push_str(&format!(
                     "  {gep} = getelementptr inbounds {}, ptr {ptr}, i64 {read_at}\n",
             self.precision.llvm_type()
+                ));
+                ir.push_str(&format!(
+                    "  {val} = load {ty}, ptr {gep}, align {}\n",
+                    self.precision.bytes()
+                ));
+                Ok(val)
+            }
+
+            // The cell whose coordinates are this cell's, permuted. The
+            // sweep is scalar (see `turns`): each coordinate is taken apart
+            // with the result's strides and put back with the source's.
+            Expr::Transpose { axes, operand } => {
+                let name = Self::place_name(operand).ok_or_else(|| {
+                    HarmonyDisruption::LoweringErr {
+                        line: self.current_line.get(),
+                        detail: "⍉ transposes a declared space, so it cannot be applied to a computed value. Flow the sub-expression into its own space first.".to_string(),
+                    }
+                })?;
+                if matches!(mode, Mode::Vector(..)) {
+                    return Err(HarmonyDisruption::LoweringErr {
+                        line: self.current_line.get(),
+                        detail: "internal: a transpose reached the vector path".to_string(),
+                    });
+                }
+                let ptr = self.lookup(bufs, &name)?;
+                let source_shape = self.shape_for(&name);
+                let perm = crate::ast::transpose_axes(source_shape.len(), axes.as_deref())
+                    .ok_or_else(|| HarmonyDisruption::LoweringErr {
+                        line: self.current_line.get(),
+                        detail: format!("⍉ needs a permutation of the axes of {source_shape:?}"),
+                    })?;
+                let transposed = crate::ast::transposed_shape(&source_shape, Some(&perm))
+                    .unwrap_or_else(|| source_shape.clone());
+                let view = Self::lifted_shape(&transposed, lifts);
+                let read_at = self.emit_index_map(ir, idx, &view, result_shape, counter)?;
+                let result_strides = crate::ast::strides_of(&transposed);
+                let source_strides = crate::ast::strides_of(&source_shape);
+                let mut acc: Option<String> = None;
+                for k in 0..source_shape.len() {
+                    let a = perm[k];
+                    if transposed[a] <= 1 {
+                        continue;
+                    }
+                    let coord = Self::fresh(counter);
+                    if result_strides[a] == 1 {
+                        ir.push_str(&format!(
+                            "  {coord} = urem i64 {read_at}, {}\n",
+                            transposed[a]
+                        ));
+                    } else {
+                        let div = Self::fresh(counter);
+                        ir.push_str(&format!(
+                            "  {div} = udiv i64 {read_at}, {}\n",
+                            result_strides[a]
+                        ));
+                        ir.push_str(&format!("  {coord} = urem i64 {div}, {}\n", transposed[a]));
+                    }
+                    let scaled = Self::fresh(counter);
+                    ir.push_str(&format!(
+                        "  {scaled} = mul i64 {coord}, {}\n",
+                        source_strides[k]
+                    ));
+                    acc = Some(match acc {
+                        None => scaled,
+                        Some(previous) => {
+                            let next = Self::fresh(counter);
+                            ir.push_str(&format!("  {next} = add i64 {previous}, {scaled}\n"));
+                            next
+                        }
+                    });
+                }
+                let cell = acc.unwrap_or_else(|| "0".to_string());
+                let gep = Self::fresh(counter);
+                let val = Self::fresh(counter);
+                ir.push_str(&format!(
+                    "  {gep} = getelementptr inbounds {}, ptr {ptr}, i64 {cell}\n",
+                    self.precision.llvm_type()
                 ));
                 ir.push_str(&format!(
                     "  {val} = load {ty}, ptr {gep}, align {}\n",

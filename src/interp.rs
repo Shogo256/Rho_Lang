@@ -212,6 +212,12 @@ fn shape_of<S: Numeric>(expr: &Expr, env: &Env<S>, line: usize) -> Result<Option
         | Expr::Rotate { operand, .. }
         | Expr::Reverse { operand, .. } => shape_of(operand, env, line)?,
         Expr::Reshape { shape, operand } => shape_of(operand, env, line)?.map(|_| shape.clone()),
+        Expr::Transpose { axes, operand } => match shape_of(operand, env, line)? {
+            Some(inner) => Some(transposed_shape(&inner, axes.as_deref()).ok_or_else(|| {
+                err(line, format!("⍉ needs a permutation of the axes of {inner:?}"))
+            })?),
+            None => None,
+        },
         Expr::Lift { axis, operand } => match shape_of(operand, env, line)? {
             Some(inner) => Some(shape_with_unit_axis(&inner, *axis).ok_or_else(|| {
                 err(line, format!("axis {axis} is past the end of {inner:?}"))
@@ -341,6 +347,20 @@ fn eval_cell<S: Numeric>(
             };
             let cell = mapped - position * stride + target * stride;
             eval_at(operand, env, tau, line, &inner_shape, cell)
+        }
+
+        // The cell whose coordinates are this cell's, permuted.
+        Expr::Transpose { axes, operand } => {
+            let inner_shape = shape_of(operand, env, line)?
+                .ok_or_else(|| err(line, "⍉ needs an operand with a shape"))?;
+            let perm = transpose_axes(inner_shape.len(), axes.as_deref())
+                .ok_or_else(|| err(line, format!("⍉ needs a permutation of the axes of {inner_shape:?}")))?;
+            let result_shape = transposed_shape(&inner_shape, Some(&perm))
+                .ok_or_else(|| err(line, "⍉ could not shape its result"))?;
+            let view = lifted(&result_shape, lifts);
+            let mapped = map_index(&view, at_shape, index);
+            let source = transposed_source(&inner_shape, &perm, mapped);
+            eval_at(operand, env, tau, line, &inner_shape, source)
         }
 
         // The operand's cells in row-major order, read into the new shape;

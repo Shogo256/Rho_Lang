@@ -215,6 +215,14 @@ pub enum Expr {
         shape: Vec<usize>,
         operand: Box<Expr>,
     },
+    /// `⍉X` and `1 0 ⍉ X` — APL's transpose. Alone, the axes in reverse
+    /// order; with a permutation written on the left, source axis `k`
+    /// becomes result axis `axes[k]`, so `0 2 1 ⍉ X` swaps the last two axes
+    /// of a rank-3 X. `result[j] = X[i]` where `i[k] = j[axes[k]]`.
+    Transpose {
+        axes: Option<Vec<usize>>,
+        operand: Box<Expr>,
+    },
     /// `⍳X` — the coordinate of each cell of X's shape along one axis,
     /// counted from zero; `⍳0X` names the axis, a bare `⍳X` takes the
     /// innermost axis with more than one cell, as `▷` and `◇` do. X is read
@@ -344,6 +352,10 @@ pub fn expr_shape(
         | Expr::Rotate { operand, .. }
         | Expr::Reverse { operand, .. } => expr_shape(operand, shapes),
         Expr::Reshape { shape, operand } => expr_shape(operand, shapes).map(|_| shape.clone()),
+        Expr::Transpose { axes, operand } => {
+            let inner = expr_shape(operand, shapes)?;
+            transposed_shape(&inner, axes.as_deref())
+        }
         Expr::Reduce { axis, operand, .. } => {
             let inner = expr_shape(operand, shapes)?;
             let a = axis.unwrap_or_else(|| default_axis(&inner));
@@ -359,6 +371,59 @@ pub fn expr_shape(
         }
         Expr::Number(_) => None,
     }
+}
+
+/// The permutation a transpose applies: the one written, or the reversal of
+/// the axes when none was. None when what was written is not a permutation
+/// of the operand's axes.
+pub fn transpose_axes(rank: usize, axes: Option<&[usize]>) -> Option<Vec<usize>> {
+    let perm: Vec<usize> = match axes {
+        Some(written) => written.to_vec(),
+        None => (0..rank).rev().collect(),
+    };
+    if perm.len() != rank {
+        return None;
+    }
+    let mut seen = vec![false; rank];
+    for &axis in &perm {
+        if axis >= rank || seen[axis] {
+            return None;
+        }
+        seen[axis] = true;
+    }
+    Some(perm)
+}
+
+/// The shape a transpose produces: source axis `k` becomes result axis
+/// `perm[k]`.
+pub fn transposed_shape(shape: &[usize], axes: Option<&[usize]>) -> Option<Vec<usize>> {
+    let perm = transpose_axes(shape.len(), axes)?;
+    let mut out = vec![0usize; shape.len()];
+    for (k, &extent) in shape.iter().enumerate() {
+        out[perm[k]] = extent;
+    }
+    Some(out)
+}
+
+/// The flat source index a transposed cell reads: `result[j] = X[i]` with
+/// `i[k] = j[perm[k]]`.
+pub fn transposed_source(shape: &[usize], perm: &[usize], flat_result: usize) -> usize {
+    let result_shape = {
+        let mut out = vec![0usize; shape.len()];
+        for (k, &extent) in shape.iter().enumerate() {
+            out[perm[k]] = extent;
+        }
+        out
+    };
+    let result_strides = strides_of(&result_shape);
+    let source_strides = strides_of(shape);
+    (0..shape.len())
+        .map(|k| {
+            let a = perm[k];
+            let coord = (flat_result / result_strides[a]) % result_shape[a].max(1);
+            coord * source_strides[k]
+        })
+        .sum()
 }
 
 /// The exponent of `x ^ n` when `n` is written as a small whole number, in

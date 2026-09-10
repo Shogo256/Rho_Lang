@@ -251,6 +251,16 @@ fn expression(
             } else {
                 String::new()
             };
+            // A transpose fits where some space's reversed shape is the
+            // wanted one; a square or palindromic grid is its own.
+            let transposable: Vec<&String> = spaces
+                .iter()
+                .filter(|(_, shape)| shape.iter().rev().copied().collect::<Vec<_>>() == want)
+                .map(|(n, _)| n)
+                .collect();
+            if !transposable.is_empty() && rng.below(4) == 0 {
+                return format!("(⍉{})", transposable[rng.below(transposable.len())]);
+            }
             match rng.below(7) {
                 0 => format!("(⍳{axis}{name})"),
                 1 => format!("({} ⌽{axis} {name})", [-3i64, -2, -1, 1, 2, 3, 5][rng.below(7)]),

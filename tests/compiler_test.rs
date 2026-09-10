@@ -3174,3 +3174,137 @@ fn test_reshape_makes_a_matrix_of_a_vector_and_keeps_the_range() {
     assert_eq!(report.constraints[0].verdict, rho_lang::solver::Verdict::Proved);
     assert_eq!((report.output_range.lo, report.output_range.hi), (0.0, 1.0));
 }
+
+// --------------------------------------------------------------------------
+// ⍉: APL's transpose. Alone it reverses the axes; with a permutation written
+// on the left, source axis k becomes result axis P[k].
+// --------------------------------------------------------------------------
+
+#[test]
+fn test_transpose_parses_alone_or_with_a_permutation() {
+    let block = parse_rho_program(
+        "{\n    INPUT:◯ □ 3 4\n    (⍉INPUT) → A\n    (1 0 ⍉ INPUT) → B\n    (A + 'B) → =\n}",
+    )
+    .unwrap();
+    let flows: Vec<&Expr> = block
+        .statements
+        .iter()
+        .filter_map(|s| match s {
+            rho_lang::ast::Statement::Flow { src, .. } => Some(src),
+            _ => None,
+        })
+        .collect();
+    assert!(matches!(flows[0], Expr::Transpose { axes: None, .. }));
+    assert!(matches!(flows[1], Expr::Transpose { axes: Some(p), .. } if p == &[1, 0]));
+    let Expr::BinaryOp { op: BinaryOpKind::Add, rhs, .. } = flows[2] else { panic!() };
+    assert!(matches!(**rhs, Expr::Transpose { axes: None, .. }));
+
+    // Not a permutation of the operand's axes: an error with a line.
+    for bad in ["(0 0 ⍉ INPUT) → =", "(0 ⍉ INPUT) → =", "(2 0 ⍉ INPUT) → =", "(INPUT ⍉ INPUT) → ="] {
+        let err = parse_rho_program(&format!("{{\n    INPUT:◯ □ 3 4\n    {bad}\n}}")).unwrap_err();
+        assert!(matches!(err, HarmonyDisruption::LoweringErr { line: 3, .. }), "{bad}: {err}");
+    }
+}
+
+#[test]
+fn test_transpose_moves_the_cells_in_kernel_and_interpreter() {
+    let grid: Vec<f64> = (0..12).map(|i| i as f64).collect();
+    // 3x4 becomes 4x3: column j of the source is row j of the result.
+    let expected_t = vec![0.0, 4.0, 8.0, 1.0, 5.0, 9.0, 2.0, 6.0, 10.0, 3.0, 7.0, 11.0];
+    for (name, body) in [("transpose", "(⍉INPUT) → ="), ("transpose_perm", "(1 0 ⍉ INPUT) → =")] {
+        let source = format!("{{\n    INPUT:◯ □ 3 4\n    {body}\n}}");
+        let block = parse_rho_program(&source).unwrap();
+        let mut env: Env<f64> = Env::new();
+        env.insert("INPUT".to_string(), Grid::from(vec![3, 4], grid.clone()));
+        let meant = interpret(&block, &env, 0.0).unwrap();
+        assert_eq!(meant["OUTPUT"].shape, vec![4, 3]);
+        assert_eq!(meant["OUTPUT"].cells, expected_t, "{name}: interpreter");
+        let out = run_kernel(name, &source, &grid);
+        assert_eq!(&out[..12], &expected_t[..], "{name}: kernel");
+    }
+
+    // Rank 3: alone reverses every axis; `0 2 1` swaps the last two.
+    let cube: Vec<f64> = (0..24).map(|i| i as f64).collect();
+    let source = r#"{
+        C:◯ □ 2 3 4
+        (⍉C) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let out = run_spaces("transpose_cube", source, &[("C", cube.clone()), ("OUTPUT", vec![0.0; 24])]);
+    // result[k][j][i] = C[i][j][k]: result shape 4 3 2.
+    let mut expected = vec![0.0; 24];
+    for i in 0..2 {
+        for j in 0..3 {
+            for k in 0..4 {
+                expected[k * 6 + j * 2 + i] = cube[i * 12 + j * 4 + k];
+            }
+        }
+    }
+    assert_eq!(out["OUTPUT"], expected);
+    let source = r#"{
+        C:◯ □ 2 3 4
+        (0 2 1 ⍉ C) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let out = run_spaces("transpose_swap", source, &[("C", cube.clone()), ("OUTPUT", vec![0.0; 24])]);
+    // result[i][k][j] = C[i][j][k]: result shape 2 4 3.
+    let mut expected = vec![0.0; 24];
+    for i in 0..2 {
+        for j in 0..3 {
+            for k in 0..4 {
+                expected[i * 12 + k * 3 + j] = cube[i * 12 + j * 4 + k];
+            }
+        }
+    }
+    assert_eq!(out["OUTPUT"], expected);
+    let block = parse_rho_program(source).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("C".to_string(), Grid::from(vec![2, 3, 4], cube.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].clone();
+    assert_eq!(meant.shape, vec![2, 4, 3]);
+    assert_eq!(meant.cells, expected);
+
+    // Sixteen cells: the sweep would vectorise; a transpose keeps it scalar
+    // and the bits agree.
+    let long: Vec<f64> = (0..16).map(|i| (i as f64 * 0.7).cos()).collect();
+    let source = "{\n    INPUT:◯ □ 4 4\n    ((⍉INPUT) - INPUT) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![4, 4], long.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    let out = run_kernel("transpose_long", source, &long);
+    assert_eq!(bits(&out[..16]), bits(&meant));
+    // Antisymmetric, as A - Aᵀ is.
+    for i in 0..4 {
+        for j in 0..4 {
+            assert_eq!(out[i * 4 + j], -out[j * 4 + i]);
+        }
+    }
+}
+
+#[test]
+fn test_transpose_writes_a_product_with_a_transposed_factor() {
+    // A · Bᵀ for A of 2x3 and B of 4x3: the shared axis of A and ⍉B lined up
+    // by lifts, then folded away.
+    let source = r#"{
+        A:◯ □ 2 3
+        B:◯ □ 4 3
+        (◇+1 ((□2 A) × (□0 (⍉B)))) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b: Vec<f64> = (0..12).map(|i| (i % 5) as f64 - 2.0).collect();
+    let out = run_spaces("transpose_product", source, &[("A", a.clone()), ("B", b.clone()), ("OUTPUT", vec![0.0; 8])]);
+    let mut expected = vec![0.0; 8];
+    for i in 0..2 {
+        for j in 0..4 {
+            expected[i * 4 + j] = (0..3).map(|k| a[i * 3 + k] * b[j * 3 + k]).sum();
+        }
+    }
+    assert_eq!(out["OUTPUT"], expected);
+
+    // Whatever cell a transpose reads is a cell of the same space.
+    let report = analyze("{\n    INPUT:◯ □ 3 4\n    (ind (INPUT > 0.0)) → M\n    (⍉M) → OUTPUT\n    ! (OUTPUT <= 1.0)\n    OUTPUT → =\n}");
+    assert_eq!(report.constraints[0].verdict, rho_lang::solver::Verdict::Proved);
+    assert_eq!((report.output_range.lo, report.output_range.hi), (0.0, 1.0));
+}

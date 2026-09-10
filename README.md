@@ -39,6 +39,8 @@ Working prototype. What runs today:
   is a periodic boundary in one glyph
 - `⍴`, APL's reshape: `3 4 ⍴ V` reads a vector as a matrix without moving a
   cell, and `3 4 ⍴ P` tiles a pair across a grid
+- `⍉`, APL's transpose, alone or with a permutation of the axes, so `A · Bᵀ`
+  is a lift, a product and a fold
 - `--f32` for single precision, with the interpreter and the `!` check
   following the width
 - `□` lifting and broadcasting, so an outer product — and a matrix product — is

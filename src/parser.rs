@@ -7,7 +7,7 @@ pub fn validate_symbols(input: &str) -> Result<()> {
     let code_only = remove_comments(input);
 
     let allowed_unicode: HashSet<char> = [
-        '◯', '□', '▷', '▽', '△', '◇', '◈', '⍳', '⌽', '⍴', '+', '-', '×', '*', '/', '^', '⌈', '⌊', '|', '→', '⇒', '<', '>', '=', ':', '{', '}', '$', '&', '!',
+        '◯', '□', '▷', '▽', '△', '◇', '◈', '⍳', '⌽', '⍴', '⍉', '+', '-', '×', '*', '/', '^', '⌈', '⌊', '|', '→', '⇒', '<', '>', '=', ':', '{', '}', '$', '&', '!',
         '(', ')', '[', ']', ';', ',', '.', ' ', '\t', '\r', '\n', '_', '𝜏', 'τ'
     ].iter().cloned().collect();
 
@@ -73,6 +73,7 @@ pub fn normalize_ascii_aliases(input: &str) -> String {
         .replace("#", "⍳")
         .replace("%", "⌽")
         .replace("\\", "⍴")
+        .replace("'", "⍉")
         .replace("@", "&")
 }
 
@@ -481,6 +482,46 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         });
     }
 
+    // Transpose with a permutation: `1 0 ⍉ X`, source axis k to result axis
+    // P[k]. Checked against the operand's rank once shapes are known.
+    if let Some(pos) = find_binary_op_position(expr_str, "⍉") {
+        let written = expr_str[..pos].trim();
+        let axes: Option<Vec<usize>> = written
+            .split_whitespace()
+            .map(|t| t.parse::<usize>().ok())
+            .collect();
+        let Some(axes) = axes.filter(|a| !a.is_empty()) else {
+            return Err(HarmonyDisruption::LoweringErr {
+                detail: format!(
+                    "`⍉` takes a permutation of the axes written as literals, not `{written}`"
+                ),
+                line: 0,
+            });
+        };
+        let operand_str = expr_str[pos + '⍉'.len_utf8()..].trim();
+        if operand_str.is_empty() {
+            return Err(HarmonyDisruption::LoweringErr {
+                detail: "`⍉` needs a space to transpose".to_string(),
+                line: 0,
+            });
+        }
+        return Ok(Expr::Transpose {
+            axes: Some(axes),
+            operand: Box::new(parse_expr(operand_str)?),
+        });
+    }
+
+    // Transpose alone: ⍉X reverses the axes.
+    if expr_str.starts_with('⍉') && expr_str.chars().count() > 1 {
+        let operand_str = expr_str['⍉'.len_utf8()..].trim();
+        if !operand_str.is_empty() {
+            return Ok(Expr::Transpose {
+                axes: None,
+                operand: Box::new(parse_expr(operand_str)?),
+            });
+        }
+    }
+
     // Reverse: ⌽X reads the cell at the other end of the axis; ⌽0X names it.
     if expr_str.starts_with('⌽') && expr_str.chars().count() > 1 {
         let rest = &expr_str['⌽'.len_utf8()..];
@@ -549,7 +590,7 @@ fn find_binary_op_position(s: &str, op: &str) -> Option<usize> {
             // A + or - that follows another operator is a sign on the number to
             // its right, not a split point. Without this, `A × -3.0` breaks at
             // the minus and leaves `A ×` behind as if it were a name.
-            if matches!(op, "+" | "-" | "⌽") && is_sign_position(&s[..i]) {
+            if matches!(op, "+" | "-" | "⌽" | "⍉") && is_sign_position(&s[..i]) {
                 continue;
             }
             let lhs = s[..i].trim();
@@ -588,7 +629,7 @@ fn is_sign_position(before: &str) -> bool {
         Some(c) => matches!(
             c,
             '+' | '-' | '×' | '*' | '/' | '^' | '⌈' | '⌊' | '|' | '>' | '<' | '=' | '('
-                | ':' | '→' | '◇' | '◈' | '▷' | '▽' | '□' | '⍳' | '⌽' | '⍴' | '!' | '$'
+                | ':' | '→' | '◇' | '◈' | '▷' | '▽' | '□' | '⍳' | '⌽' | '⍴' | '⍉' | '!' | '$'
         ),
     }
 }
@@ -712,6 +753,7 @@ fn check_expr_spaces(expr: &Expr, declared: &HashSet<String>, line: usize) -> Re
         | Expr::Rotate { operand: inner, .. }
         | Expr::Reverse { operand: inner, .. }
         | Expr::Reshape { operand: inner, .. }
+        | Expr::Transpose { operand: inner, .. }
         | Expr::AuditTrace(inner) => {
             check_expr_spaces(inner, declared, line)?;
         }
@@ -797,6 +839,24 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
             | Expr::Reverse { operand: inner, .. }
             | Expr::Reshape { operand: inner, .. }
             | Expr::AuditTrace(inner) => check_broadcast(inner, shapes, line)?,
+            // A permutation that does not fit the operand is an error here,
+            // with a line, rather than an unknown shape later.
+            Expr::Transpose { axes, operand } => {
+                check_broadcast(operand, shapes, line)?;
+                if let Some(inner) = get_expr_shape(operand, shapes) {
+                    if transpose_axes(inner.len(), axes.as_deref()).is_none() {
+                        return Err(HarmonyDisruption::LoweringErr {
+                            detail: format!(
+                                "`⍉` needs a permutation of the {} axes of {:?}, not {:?}",
+                                inner.len(),
+                                inner,
+                                axes.clone().unwrap_or_default()
+                            ),
+                            line,
+                        });
+                    }
+                }
+            }
             Expr::Var(_) | Expr::Number(_) => {}
         }
         Ok(())

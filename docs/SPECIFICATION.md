@@ -46,6 +46,7 @@ principle.
 | `⍳` / `#` | Index | — | The coordinate of each cell along an axis, from zero, see §3.7 | ✅ |
 | `⌽` / `%` | Rotate, Reverse | — | `k ⌽ X` reads `k` cells along, wrapping; `⌽X` reads from the other end, see §3.2.2 | ✅ |
 | `⍴` / `\` | Reshape | — | `2 3 ⍴ X` reads X's cells, in order, into that shape, see §3.8 | ✅ |
+| `⍉` / `'` | Transpose | — | `⍉X` reverses the axes; `1 0 ⍉ X` permutes them, see §3.9 | ✅ |
 | `+` | Addition | Superposition | Element-wise addition | ✅ |
 | `-` | Subtraction | Difference | Element-wise subtraction | ✅ |
 | `×` / `*` | Multiplication | Scaling | Element-wise product | ✅ |
@@ -66,7 +67,7 @@ principle.
 | `!` | Constraint | Invariant Check | Statically verified, see §4 | ✅ |
 | `→ =` | Convergence | — | Writes the caller's output buffer | ✅ |
 
-ASCII aliases: `->` for `→`, `=>` for `⇒`, `>>` for `▷`, `<<` for `▽`, `>.` for `⌈`, `<.` for `⌊`, `#` for `⍳`, `%` for `⌽`, `\` for `⍴`, `@` for `&`,
+ASCII aliases: `->` for `→`, `=>` for `⇒`, `>>` for `▷`, `<<` for `▽`, `>.` for `⌈`, `<.` for `⌊`, `#` for `⍳`, `%` for `⌽`, `\` for `⍴`, `'` for `⍉`, `@` for `&`,
 `<>` for `◇`, `<.>` for `◈`, `[]` for `□`.
 
 ### The greater, the lesser and the residue
@@ -399,6 +400,25 @@ its sweep scalar. `\` spells it in ASCII.
 Like a shift, it reads a declared space, not a computed value, and it binds
 as tightly as the prefix glyphs. It is not a transpose: `4 3 ⍴ X` re-cuts the
 same run of cells into rows of three. Transposition is `⍉`, see §3.9.
+
+### 3.9 Transpose (`⍉`) ✅
+
+`⍉X` is APL's transpose: the axes in reverse order, so a `3 4` matrix becomes
+`4 3` with column `j` as row `j`, and a rank-3 `2 3 4` becomes `4 3 2`. With a
+permutation written on the left, `P ⍉ X`, source axis `k` becomes result axis
+`P[k]`: `1 0 ⍉ X` is the matrix transpose again and `0 2 1 ⍉ X` swaps the last
+two axes of a rank-3 X. `result[j] = X[i]` where `i[k] = j[P[k]]`. The
+permutation is checked against the operand's rank where shapes are checked,
+and a list that is not a permutation is an error with a line. `'` spells it in
+ASCII.
+
+```rho
+(◇+1 ((□2 A) × (□0 (⍉B)))) → C      /* A · Bᵀ, for A of m k and B of n k */
+```
+
+A transposed read is not contiguous, so a sweep containing one stays scalar
+(📋 a gathered vector path); like a shift, it reads a declared space rather
+than a computed value, and it binds as tightly as the prefix glyphs.
 
 A note on `^`, which an index is often the exponent of: `x ^ 2.0` is `x × x`,
 and `x ^ Y` is a library power even where Y's cells happen to be whole. The

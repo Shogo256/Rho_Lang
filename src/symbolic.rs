@@ -205,11 +205,13 @@ impl Builder<'_> {
                 Some(name) => self.build(&Expr::Var(name), before, offset),
                 None => Sym::Free(format!("reverse@{}", offset_tag(offset))),
             },
-            // A reshaped read is some cell of the same space too.
-            Expr::Reshape { operand, .. } => match place_name(operand) {
-                Some(name) => self.build(&Expr::Var(name), before, offset),
-                None => Sym::Free(format!("reshape@{}", offset_tag(offset))),
-            },
+            // A reshaped or transposed read is some cell of the same space too.
+            Expr::Reshape { operand, .. } | Expr::Transpose { operand, .. } => {
+                match place_name(operand) {
+                    Some(name) => self.build(&Expr::Var(name), before, offset),
+                    None => Sym::Free(format!("rearranged@{}", offset_tag(offset))),
+                }
+            }
             // A constraint speaks about any cell, so its coordinate is a free
             // value within the axis; the operand is only measured.
             Expr::Index { axis, operand } => {
@@ -450,6 +452,7 @@ fn collect_divisions(
         | Expr::Rotate { operand: inner, .. }
         | Expr::Reverse { operand: inner, .. }
         | Expr::Reshape { operand: inner, .. }
+        | Expr::Transpose { operand: inner, .. }
         | Expr::AuditTrace(inner) => {
             collect_divisions(inner, at, line, builder, out)
         }
@@ -499,6 +502,7 @@ fn collect_domains(
         | Expr::Rotate { operand: inner, .. }
         | Expr::Reverse { operand: inner, .. }
         | Expr::Reshape { operand: inner, .. }
+        | Expr::Transpose { operand: inner, .. }
         | Expr::AuditTrace(inner) => collect_domains(inner, at, line, builder, out),
         Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => {}
     }
@@ -542,6 +546,13 @@ impl fmt::Display for ExprGlyphs<'_> {
                 let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
                 write!(f, "({} ⍴ {})", dims.join(" "), ExprGlyphs(operand))
             }
+            Expr::Transpose { axes, operand } => match axes {
+                Some(perm) => {
+                    let dims: Vec<String> = perm.iter().map(|d| d.to_string()).collect();
+                    write!(f, "({} ⍉ {})", dims.join(" "), ExprGlyphs(operand))
+                }
+                None => write!(f, "⍉{}", ExprGlyphs(operand)),
+            },
             Expr::Shift { dir, axis, operand } => match axis {
                 Some(a) => write!(f, "{dir}{a}{}", ExprGlyphs(operand)),
                 None => write!(f, "{dir}{}", ExprGlyphs(operand)),

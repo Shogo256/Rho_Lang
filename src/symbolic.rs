@@ -212,6 +212,29 @@ impl Builder<'_> {
                     None => Sym::Free(format!("rearranged@{}", offset_tag(offset))),
                 }
             }
+            // A take or drop reads the same space `offset` cells along; a take
+            // longer than its axis may read past it and get zero, which is a
+            // boundary the flag names.
+            Expr::Take { count, axis, operand } | Expr::Drop { count, axis, operand } => {
+                let dropping = matches!(expr, Expr::Drop { .. });
+                let Some(name) = place_name(operand) else {
+                    return Sym::Free(format!("taken@{}", offset_tag(offset)));
+                };
+                let shape = self.shape_of(&name);
+                let Some((stride, extent)) = axis_geometry(&shape, *axis) else {
+                    return Sym::Const(0.0);
+                };
+                let along = taken_offset(extent, *count, dropping);
+                let interior = self.build(&Expr::Var(name), before, offset + along * stride as i64);
+                if !dropping && count.unsigned_abs() as usize > extent {
+                    Sym::Boundary {
+                        flag: format!("pad_o{}_s{stride}_e{extent}", offset_tag(offset)),
+                        interior: Box::new(interior),
+                    }
+                } else {
+                    interior
+                }
+            }
             // A constraint speaks about any cell, so its coordinate is a free
             // value within the axis; the operand is only measured.
             Expr::Index { axis, operand } => {
@@ -453,6 +476,8 @@ fn collect_divisions(
         | Expr::Reverse { operand: inner, .. }
         | Expr::Reshape { operand: inner, .. }
         | Expr::Transpose { operand: inner, .. }
+        | Expr::Take { operand: inner, .. }
+        | Expr::Drop { operand: inner, .. }
         | Expr::AuditTrace(inner) => {
             collect_divisions(inner, at, line, builder, out)
         }
@@ -503,6 +528,8 @@ fn collect_domains(
         | Expr::Reverse { operand: inner, .. }
         | Expr::Reshape { operand: inner, .. }
         | Expr::Transpose { operand: inner, .. }
+        | Expr::Take { operand: inner, .. }
+        | Expr::Drop { operand: inner, .. }
         | Expr::AuditTrace(inner) => collect_domains(inner, at, line, builder, out),
         Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => {}
     }
@@ -553,6 +580,13 @@ impl fmt::Display for ExprGlyphs<'_> {
                 }
                 None => write!(f, "⍉{}", ExprGlyphs(operand)),
             },
+            Expr::Take { count, axis, operand } | Expr::Drop { count, axis, operand } => {
+                let glyph = if matches!(self.0, Expr::Drop { .. }) { "↓" } else { "↑" };
+                match axis {
+                    Some(a) => write!(f, "({count} {glyph}{a} {})", ExprGlyphs(operand)),
+                    None => write!(f, "({count} {glyph} {})", ExprGlyphs(operand)),
+                }
+            }
             Expr::Shift { dir, axis, operand } => match axis {
                 Some(a) => write!(f, "{dir}{a}{}", ExprGlyphs(operand)),
                 None => write!(f, "{dir}{}", ExprGlyphs(operand)),

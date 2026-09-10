@@ -47,6 +47,8 @@ principle.
 | `⌽` / `%` | Rotate, Reverse | — | `k ⌽ X` reads `k` cells along, wrapping; `⌽X` reads from the other end, see §3.2.2 | ✅ |
 | `⍴` / `\` | Reshape | — | `2 3 ⍴ X` reads X's cells, in order, into that shape, see §3.8 | ✅ |
 | `⍉` / `'` | Transpose | — | `⍉X` reverses the axes; `1 0 ⍉ X` permutes them, see §3.9 | ✅ |
+| `↑` / `^.` | Take | — | `k ↑ X` keeps the first `k` cells along an axis, the last for negative `k`, see §3.10 | ✅ |
+| `↓` / `_.` | Drop | — | `k ↓ X` removes them instead, see §3.10 | ✅ |
 | `+` | Addition | Superposition | Element-wise addition | ✅ |
 | `-` | Subtraction | Difference | Element-wise subtraction | ✅ |
 | `×` / `*` | Multiplication | Scaling | Element-wise product | ✅ |
@@ -67,7 +69,7 @@ principle.
 | `!` | Constraint | Invariant Check | Statically verified, see §4 | ✅ |
 | `→ =` | Convergence | — | Writes the caller's output buffer | ✅ |
 
-ASCII aliases: `->` for `→`, `=>` for `⇒`, `>>` for `▷`, `<<` for `▽`, `>.` for `⌈`, `<.` for `⌊`, `#` for `⍳`, `%` for `⌽`, `\` for `⍴`, `'` for `⍉`, `@` for `&`,
+ASCII aliases: `->` for `→`, `=>` for `⇒`, `>>` for `▷`, `<<` for `▽`, `>.` for `⌈`, `<.` for `⌊`, `#` for `⍳`, `%` for `⌽`, `\` for `⍴`, `'` for `⍉`, `^.` for `↑`, `_.` for `↓`, `@` for `&`,
 `<>` for `◇`, `<.>` for `◈`, `[]` for `□`.
 
 ### The greater, the lesser and the residue
@@ -154,7 +156,9 @@ is written the same way: `◇+1X`. Its ASCII alias is `<>`.
 A space maps to a contiguous run of doubles. Every space in a block shares one
 flat index range, whose length is the product of the primary space's dimensions
 (`INPUT` if declared, otherwise the first space). `rho_kernel_element_count()`
-reports it.
+reports the larger of that and the output's cell count, since a take past the
+end, a reshape that reads round or an outer product writes more cells than it
+reads, and the two-pointer entrypoint's buffers have to hold both.
 
 Dimensions drive indexing. For a row-major shape `[d0, .., dk]`, axis `a` has
 extent `d_a` and stride `product(d_{a+1..k})`, so `◯ □ 1024 1024` and
@@ -419,6 +423,33 @@ ASCII.
 A transposed read is not contiguous, so a sweep containing one stays scalar
 (📋 a gathered vector path); like a shift, it reads a declared space rather
 than a computed value, and it binds as tightly as the prefix glyphs.
+
+### 3.10 Take and drop (`↑`, `↓`) ✅
+
+`k ↑ X` is APL's take: the first `k` cells along the axis, or the last `|k|`
+for a negative `k`. `k ↓ X` is drop: the same cells removed. The count is a
+whole number written as a literal, so the shape that results — `3 4` taken by
+two is `3 2`, dropped by one is `3 3` — is known at compile time, as every
+shape is; a take or drop that leaves nothing, or names an axis the operand has
+not got, is an error with a line. A digit after the glyph names the axis, and
+a bare glyph takes the innermost axis with more than one cell. `^.` and `_.`
+spell them in ASCII, which is why a literal needs a digit before its point.
+
+A take longer than its axis pads with zero, at the far end for a positive
+count and at the near end for a negative one, as a shift pads at the edge:
+`6 ↑ X` of a row of four is the row and two zeros. A drop longer than its axis
+would leave nothing and is refused.
+
+```rho
+((1 ↓ X) - (-1 ↓ X)) → D      /* the forward difference, n - 1 cells, no boundary zero */
+(-3 ↑ X) → TAIL                /* the last three */
+```
+
+Like a shift, a take or drop reads a declared space rather than a computed
+value, and it binds as tightly as the prefix glyphs. Its reads keep their
+order but the result's rows are not the source's, so the sweep stays scalar
+(📋 along the outermost axis it is a plain offset and could keep the vector
+path).
 
 A note on `^`, which an index is often the exponent of: `x ^ 2.0` is `x × x`,
 and `x ^ Y` is a library power even where Y's cells happen to be whole. The

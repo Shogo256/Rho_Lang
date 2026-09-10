@@ -251,6 +251,39 @@ fn expression(
             } else {
                 String::new()
             };
+            // A take or a drop fits where some space differs from the wanted
+            // shape along exactly one axis: shorter is taken or dropped down
+            // to, longer is over-taken and padded with zero.
+            let trimmable: Vec<(&String, usize, usize)> = spaces
+                .iter()
+                .filter(|(_, shape)| shape.len() == want.len())
+                .filter_map(|(n, shape)| {
+                    let differing: Vec<usize> =
+                        (0..want.len()).filter(|&b| shape[b] != want[b]).collect();
+                    match differing.as_slice() {
+                        [b] => Some((n, *b, shape[*b])),
+                        _ => None,
+                    }
+                })
+                .collect();
+            if !trimmable.is_empty() && rng.below(3) == 0 {
+                let (n, b, have) = trimmable[rng.below(trimmable.len())];
+                let need = want[b] as i64;
+                let have = have as i64;
+                let (glyph, count) = if have > need {
+                    match rng.below(4) {
+                        0 => ("↑", need),
+                        1 => ("↑", -need),
+                        2 => ("↓", have - need),
+                        _ => ("↓", -(have - need)),
+                    }
+                } else if rng.below(2) == 0 {
+                    ("↑", need)
+                } else {
+                    ("↑", -need)
+                };
+                return format!("({count} {glyph}{b} {n})");
+            }
             // A transpose fits where some space's reversed shape is the
             // wanted one; a square or palindromic grid is its own.
             let transposable: Vec<&String> = spaces

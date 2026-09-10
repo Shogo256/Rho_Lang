@@ -41,6 +41,8 @@ Working prototype. What runs today:
   cell, and `3 4 ⍴ P` tiles a pair across a grid
 - `⍉`, APL's transpose, alone or with a permutation of the axes, so `A · Bᵀ`
   is a lift, a product and a fold
+- `↑` and `↓`, APL's take and drop, so a window, a tail or a difference
+  without its boundary zero has the shape it should
 - `--f32` for single precision, with the interpreter and the `!` check
   following the width
 - `□` lifting and broadcasting, so an outer product — and a matrix product — is
@@ -221,7 +223,7 @@ engine.execute_spaces({"A": a, "B": b, "OUTPUT": c})
 
 | Symbol | Signature | Purpose |
 |---|---|---|
-| `rho_kernel_element_count` | `int64_t (void)` | Cells the kernel sweeps; the minimum buffer length |
+| `rho_kernel_element_count` | `int64_t (void)` | The larger of the input's and the output's cell counts; the minimum buffer length for the two-pointer entrypoints |
 | `rho_kernel_exec_with_args` | `void (const double *in, double *out)` | Run the kernel. Buffers **must** hold `element_count()` doubles |
 | `rho_kernel_exec_bounded` | `void (const double *in, double *out, int64_t n)` | Same, but clamps the sweep to `n` cells |
 | `rho_kernel_exec_spaces` | `void (void **spaces)` | One pointer per space, in the order `rho_kernel_metadata()` lists them. The way to call a kernel with several inputs |

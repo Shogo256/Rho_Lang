@@ -499,11 +499,21 @@ impl LlvmCodeGen {
             .or_else(|| shapes.values().next().cloned())
     }
 
+    /// The cells a caller of the two-pointer entrypoint has to provide: the
+    /// larger of the input's and the output's. A take past the end, a reshape
+    /// that reads round or an outer product writes more cells than it reads,
+    /// and a buffer sized to the input alone would be overrun.
     fn resolve_element_count(&self) -> usize {
-        Self::primary_shape(&self.space_shapes)
+        let primary = Self::primary_shape(&self.space_shapes)
             .map(|s| s.iter().product::<usize>())
             .filter(|n| *n > 0)
-            .unwrap_or(4)
+            .unwrap_or(4);
+        let output = self
+            .space_shapes
+            .get("OUTPUT")
+            .map(|s| s.iter().product::<usize>())
+            .unwrap_or(0);
+        primary.max(output)
     }
 
     // --------------------------------------------------------------- buffers
@@ -540,7 +550,11 @@ impl LlvmCodeGen {
     /// sweep stays scalar. 📋 A gathered vector path would lift this.
     fn turns(&self, expr: &Expr) -> bool {
         match expr {
-            Expr::Rotate { .. } | Expr::Reverse { .. } | Expr::Transpose { .. } => true,
+            Expr::Rotate { .. }
+            | Expr::Reverse { .. }
+            | Expr::Transpose { .. }
+            | Expr::Take { .. }
+            | Expr::Drop { .. } => true,
             // Same count: a reinterpretation, contiguous as the operand is.
             Expr::Reshape { shape, operand } => {
                 match Self::expr_shape(operand, &self.space_shapes) {
@@ -1030,6 +1044,8 @@ impl LlvmCodeGen {
             | Expr::Reverse { operand: inner, .. }
             | Expr::Reshape { operand: inner, .. }
             | Expr::Transpose { operand: inner, .. }
+            | Expr::Take { operand: inner, .. }
+            | Expr::Drop { operand: inner, .. }
             | Expr::Builtin { operand: inner, .. }
             | Expr::Lift { operand: inner, .. } => {
                 self.reserve_fold_buffers(inner, ir, bufs, counter)?;
@@ -1101,6 +1117,8 @@ impl LlvmCodeGen {
             | Expr::Reverse { operand: inner, .. }
             | Expr::Reshape { operand: inner, .. }
             | Expr::Transpose { operand: inner, .. }
+            | Expr::Take { operand: inner, .. }
+            | Expr::Drop { operand: inner, .. }
             | Expr::Builtin { operand: inner, .. }
             | Expr::Lift { operand: inner, .. } => {
                 block = self.emit_fold_prepass(inner, ir, bufs, &block, counter)?;
@@ -1484,7 +1502,9 @@ impl LlvmCodeGen {
             | Expr::Rotate { .. }
             | Expr::Reverse { .. }
             | Expr::Reshape { .. }
-            | Expr::Transpose { .. } => 0,
+            | Expr::Transpose { .. }
+            | Expr::Take { .. }
+            | Expr::Drop { .. } => 0,
             Expr::Lift { operand, .. } | Expr::Builtin { operand, .. } => {
                 self.max_shift_stride(operand)?
             }
@@ -1697,10 +1717,12 @@ impl LlvmCodeGen {
                 None => false,
             },
             Expr::Reshape { shape, .. } => Self::lifted_shape(shape, lifts) != result_shape,
-            Expr::Transpose { .. } => match Self::expr_shape(expr, &self.space_shapes) {
-                Some(shape) => Self::lifted_shape(&shape, lifts) != result_shape,
-                None => false,
-            },
+            Expr::Transpose { .. } | Expr::Take { .. } | Expr::Drop { .. } => {
+                match Self::expr_shape(expr, &self.space_shapes) {
+                    Some(shape) => Self::lifted_shape(&shape, lifts) != result_shape,
+                    None => false,
+                }
+            }
             Expr::BinaryOp { lhs, rhs, .. } => {
                 self.needs_broadcast(lhs, result_shape, lifts)
                     || self.needs_broadcast(rhs, result_shape, lifts)
@@ -1859,6 +1881,118 @@ impl LlvmCodeGen {
                     self.precision.bytes()
                 ));
                 Ok(val)
+            }
+
+            // The cell `count` in from the start or the end of the axis, or
+            // zero where a take runs past the source. Scalar (see `turns`):
+            // the result's row length differs from the source's, so lanes
+            // would straddle rows. 📋 A take or drop along the outermost axis
+            // is a plain offset and could keep the vector path.
+            Expr::Take { count, axis, operand } | Expr::Drop { count, axis, operand } => {
+                let dropping = matches!(expr, Expr::Drop { .. });
+                let glyph = if dropping { "↓" } else { "↑" };
+                let name = Self::place_name(operand).ok_or_else(|| {
+                    HarmonyDisruption::LoweringErr {
+                        line: self.current_line.get(),
+                        detail: format!("{glyph} takes from a declared space, so it cannot be applied to a computed value. Flow the sub-expression into its own space first."),
+                    }
+                })?;
+                if matches!(mode, Mode::Vector(..)) {
+                    return Err(HarmonyDisruption::LoweringErr {
+                        line: self.current_line.get(),
+                        detail: "internal: a take or drop reached the vector path".to_string(),
+                    });
+                }
+                let ptr = self.lookup(bufs, &name)?;
+                let source_shape = self.shape_for(&name);
+                let a = axis.unwrap_or_else(|| crate::ast::default_axis(&source_shape));
+                let taken = crate::ast::taken_shape(&source_shape, Some(a), *count, dropping)
+                    .ok_or_else(|| HarmonyDisruption::LoweringErr {
+                        line: self.current_line.get(),
+                        detail: format!("`{count} {glyph}` of {source_shape:?} leaves nothing"),
+                    })?;
+                let view = Self::lifted_shape(&taken, lifts);
+                let read_at = self.emit_index_map(ir, idx, &view, result_shape, counter)?;
+                let result_strides = crate::ast::strides_of(&taken);
+                let source_strides = crate::ast::strides_of(&source_shape);
+                let along = crate::ast::taken_offset(source_shape[a], *count, dropping);
+                let extent = source_shape[a] as i64;
+
+                // Coordinates of the result cell, the taken axis moved along.
+                let mut acc: Option<String> = None;
+                let mut padded: Option<String> = None;
+                for b in 0..source_shape.len() {
+                    if taken[b] <= 1 && b != a {
+                        continue;
+                    }
+                    let coord = Self::fresh(counter);
+                    if result_strides[b] == 1 {
+                        ir.push_str(&format!("  {coord} = urem i64 {read_at}, {}\n", taken[b]));
+                    } else {
+                        let div = Self::fresh(counter);
+                        ir.push_str(&format!("  {div} = udiv i64 {read_at}, {}\n", result_strides[b]));
+                        ir.push_str(&format!("  {coord} = urem i64 {div}, {}\n", taken[b]));
+                    }
+                    let position = if b == a {
+                        let moved = Self::fresh(counter);
+                        ir.push_str(&format!("  {moved} = add i64 {coord}, {along}\n"));
+                        // A take longer than the axis reads past it: zero there.
+                        if !dropping && count.unsigned_abs() as usize > source_shape[a] {
+                            let low = Self::fresh(counter);
+                            let high = Self::fresh(counter);
+                            let out = Self::fresh(counter);
+                            ir.push_str(&format!("  {low} = icmp slt i64 {moved}, 0\n"));
+                            ir.push_str(&format!("  {high} = icmp sge i64 {moved}, {extent}\n"));
+                            ir.push_str(&format!("  {out} = or i1 {low}, {high}\n"));
+                            padded = Some(out);
+                        }
+                        moved
+                    } else {
+                        coord
+                    };
+                    let scaled = Self::fresh(counter);
+                    ir.push_str(&format!("  {scaled} = mul i64 {position}, {}\n", source_strides[b]));
+                    acc = Some(match acc {
+                        None => scaled,
+                        Some(previous) => {
+                            let next = Self::fresh(counter);
+                            ir.push_str(&format!("  {next} = add i64 {previous}, {scaled}\n"));
+                            next
+                        }
+                    });
+                }
+                let cell = acc.unwrap_or_else(|| "0".to_string());
+                // Past the source, read cell 0 and discard it, so no address
+                // is ever formed outside the buffer.
+                let address = match &padded {
+                    Some(flag) => {
+                        let safe = Self::fresh(counter);
+                        ir.push_str(&format!("  {safe} = select i1 {flag}, i64 0, i64 {cell}\n"));
+                        safe
+                    }
+                    None => cell,
+                };
+                let gep = Self::fresh(counter);
+                let val = Self::fresh(counter);
+                ir.push_str(&format!(
+                    "  {gep} = getelementptr inbounds {}, ptr {ptr}, i64 {address}\n",
+                    self.precision.llvm_type()
+                ));
+                ir.push_str(&format!(
+                    "  {val} = load {ty}, ptr {gep}, align {}\n",
+                    self.precision.bytes()
+                ));
+                match padded {
+                    Some(flag) => {
+                        let out = Self::fresh(counter);
+                        ir.push_str(&format!(
+                            "  {out} = select i1 {flag}, {ty} {}, {ty} {val}\n",
+                            mode.zero()
+                        ));
+                        Ok(out)
+                    }
+                    None => Ok(val),
+                }
             }
 
             // The cell whose coordinates are this cell's, permuted. The

@@ -223,6 +223,22 @@ pub enum Expr {
         axes: Option<Vec<usize>>,
         operand: Box<Expr>,
     },
+    /// `k ↑ X` and `k ↓ X` — APL's take and drop along one axis. Take keeps
+    /// the first `k` cells along the axis, or the last `|k|` for a negative
+    /// `k`, padding with zero past the end as a shift does; drop removes the
+    /// first `k`, or the last `|k|`. `k` is a whole number written as a
+    /// literal, so the result's shape is known at compile time, and a digit
+    /// after the glyph names the axis.
+    Take {
+        count: i64,
+        axis: Option<usize>,
+        operand: Box<Expr>,
+    },
+    Drop {
+        count: i64,
+        axis: Option<usize>,
+        operand: Box<Expr>,
+    },
     /// `⍳X` — the coordinate of each cell of X's shape along one axis,
     /// counted from zero; `⍳0X` names the axis, a bare `⍳X` takes the
     /// innermost axis with more than one cell, as `▷` and `◇` do. X is read
@@ -356,6 +372,14 @@ pub fn expr_shape(
             let inner = expr_shape(operand, shapes)?;
             transposed_shape(&inner, axes.as_deref())
         }
+        Expr::Take { count, axis, operand } => {
+            let inner = expr_shape(operand, shapes)?;
+            taken_shape(&inner, *axis, *count, false)
+        }
+        Expr::Drop { count, axis, operand } => {
+            let inner = expr_shape(operand, shapes)?;
+            taken_shape(&inner, *axis, *count, true)
+        }
         Expr::Reduce { axis, operand, .. } => {
             let inner = expr_shape(operand, shapes)?;
             let a = axis.unwrap_or_else(|| default_axis(&inner));
@@ -424,6 +448,69 @@ pub fn transposed_source(shape: &[usize], perm: &[usize], flat_result: usize) ->
             coord * source_strides[k]
         })
         .sum()
+}
+
+/// The shape a take (or, `dropping`, a drop) of `count` along `axis` leaves.
+/// None when the axis is out of range or nothing would be left.
+pub fn taken_shape(shape: &[usize], axis: Option<usize>, count: i64, dropping: bool) -> Option<Vec<usize>> {
+    let a = axis.unwrap_or_else(|| default_axis(shape));
+    if a >= shape.len() {
+        return None;
+    }
+    let extent = shape[a] as i64;
+    let kept = if dropping {
+        extent - count.abs()
+    } else {
+        count.abs()
+    };
+    if kept <= 0 {
+        return None;
+    }
+    let mut out = shape.to_vec();
+    out[a] = kept as usize;
+    Some(out)
+}
+
+/// Where a take or drop reads along its axis: the offset added to a result
+/// position to reach the source position. A drop of the first k starts k in;
+/// a take of the last |k| starts |k| before the end, which is negative — and
+/// so padded — when the take is longer than the axis.
+pub fn taken_offset(extent: usize, count: i64, dropping: bool) -> i64 {
+    match (dropping, count >= 0) {
+        (true, true) => count,
+        (true, false) => 0,
+        (false, true) => 0,
+        (false, false) => extent as i64 - count.abs(),
+    }
+}
+
+/// The flat source cell a taken or dropped result cell reads, or None where
+/// the take runs past the source and reads zero.
+pub fn taken_source(
+    shape: &[usize],
+    axis: usize,
+    count: i64,
+    dropping: bool,
+    flat_result: usize,
+) -> Option<usize> {
+    let result_shape = taken_shape(shape, Some(axis), count, dropping)?;
+    let result_strides = strides_of(&result_shape);
+    let source_strides = strides_of(shape);
+    let offset = taken_offset(shape[axis], count, dropping);
+    let mut flat = 0usize;
+    for b in 0..shape.len() {
+        let coord = (flat_result / result_strides[b]) % result_shape[b].max(1);
+        if b == axis {
+            let source = coord as i64 + offset;
+            if source < 0 || source >= shape[axis] as i64 {
+                return None;
+            }
+            flat += source as usize * source_strides[b];
+        } else {
+            flat += coord * source_strides[b];
+        }
+    }
+    Some(flat)
 }
 
 /// The exponent of `x ^ n` when `n` is written as a small whole number, in

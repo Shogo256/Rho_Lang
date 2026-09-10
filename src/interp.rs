@@ -212,6 +212,15 @@ fn shape_of<S: Numeric>(expr: &Expr, env: &Env<S>, line: usize) -> Result<Option
         | Expr::Rotate { operand, .. }
         | Expr::Reverse { operand, .. } => shape_of(operand, env, line)?,
         Expr::Reshape { shape, operand } => shape_of(operand, env, line)?.map(|_| shape.clone()),
+        Expr::Take { count, axis, operand } | Expr::Drop { count, axis, operand } => {
+            match shape_of(operand, env, line)? {
+                Some(inner) => Some(
+                    taken_shape(&inner, *axis, *count, matches!(expr, Expr::Drop { .. }))
+                        .ok_or_else(|| err(line, format!("`{count}` of {inner:?} leaves nothing")))?,
+                ),
+                None => None,
+            }
+        }
         Expr::Transpose { axes, operand } => match shape_of(operand, env, line)? {
             Some(inner) => Some(transposed_shape(&inner, axes.as_deref()).ok_or_else(|| {
                 err(line, format!("⍉ needs a permutation of the axes of {inner:?}"))
@@ -347,6 +356,23 @@ fn eval_cell<S: Numeric>(
             };
             let cell = mapped - position * stride + target * stride;
             eval_at(operand, env, tau, line, &inner_shape, cell)
+        }
+
+        // The cell `count` in from the start or the end of the axis, or zero
+        // where a take runs past the source.
+        Expr::Take { count, axis, operand } | Expr::Drop { count, axis, operand } => {
+            let dropping = matches!(expr, Expr::Drop { .. });
+            let inner_shape = shape_of(operand, env, line)?
+                .ok_or_else(|| err(line, "↑ and ↓ need an operand with a shape"))?;
+            let a = axis.unwrap_or_else(|| default_axis(&inner_shape));
+            let result_shape = taken_shape(&inner_shape, Some(a), *count, dropping)
+                .ok_or_else(|| err(line, format!("`{count}` of {inner_shape:?} leaves nothing")))?;
+            let view = lifted(&result_shape, lifts);
+            let mapped = map_index(&view, at_shape, index);
+            match taken_source(&inner_shape, a, *count, dropping, mapped) {
+                Some(source) => eval_at(operand, env, tau, line, &inner_shape, source),
+                None => Ok(S::constant(0.0)),
+            }
         }
 
         // The cell whose coordinates are this cell's, permuted.

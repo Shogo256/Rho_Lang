@@ -7,7 +7,7 @@ pub fn validate_symbols(input: &str) -> Result<()> {
     let code_only = remove_comments(input);
 
     let allowed_unicode: HashSet<char> = [
-        '◯', '□', '▷', '▽', '△', '◇', '◈', '⍳', '⌽', '⍴', '⍉', '+', '-', '×', '*', '/', '^', '⌈', '⌊', '|', '→', '⇒', '<', '>', '=', ':', '{', '}', '$', '&', '!',
+        '◯', '□', '▷', '▽', '△', '◇', '◈', '⍳', '⌽', '⍴', '⍉', '↑', '↓', '+', '-', '×', '*', '/', '^', '⌈', '⌊', '|', '→', '⇒', '<', '>', '=', ':', '{', '}', '$', '&', '!',
         '(', ')', '[', ']', ';', ',', '.', ' ', '\t', '\r', '\n', '_', '𝜏', 'τ'
     ].iter().cloned().collect();
 
@@ -74,6 +74,10 @@ pub fn normalize_ascii_aliases(input: &str) -> String {
         .replace("%", "⌽")
         .replace("\\", "⍴")
         .replace("'", "⍉")
+        // Take and drop; a literal therefore needs a digit before its point,
+        // as `X ^ .5` would otherwise read as a take.
+        .replace("^.", "↑")
+        .replace("_.", "↓")
         .replace("@", "&")
 }
 
@@ -452,6 +456,48 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         });
     }
 
+    // Take and drop: `2 ↑ X`, `-1 ↓0 X`. The count is a whole number written
+    // as a literal, so the shape that results is known where every shape is.
+    for (glyph, dropping) in [('↑', false), ('↓', true)] {
+        let Some(pos) = find_binary_op_position(expr_str, &glyph.to_string()) else {
+            continue;
+        };
+        let written = expr_str[..pos].trim();
+        let count = match parse_expr(written)? {
+            Expr::Number(v) if v == v.trunc() && v != 0.0 && v.abs() <= 1e9 => v as i64,
+            _ => {
+                return Err(HarmonyDisruption::LoweringErr {
+                    detail: format!(
+                        "`{glyph}` takes a whole number of cells written as a literal, not `{written}`"
+                    ),
+                    line: 0,
+                })
+            }
+        };
+        let after = &expr_str[pos + glyph.len_utf8()..];
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        let operand_str = after[digits.len()..].trim();
+        if operand_str.is_empty() {
+            return Err(HarmonyDisruption::LoweringErr {
+                detail: format!("`{glyph}` needs a space on its right"),
+                line: 0,
+            });
+        }
+        let axis = if digits.is_empty() { None } else { digits.parse().ok() };
+        let operand = Box::new(parse_expr(operand_str)?);
+        return Ok(if dropping {
+            Expr::Drop { count, axis, operand }
+        } else {
+            Expr::Take { count, axis, operand }
+        });
+    }
+    if expr_str.starts_with('↑') || expr_str.starts_with('↓') {
+        return Err(HarmonyDisruption::LoweringErr {
+            detail: "`↑` and `↓` take a count on their left: `2 ↑ X`, `-1 ↓ X`".to_string(),
+            line: 0,
+        });
+    }
+
     // Reshape: `2 3 ⍴ X`. The shape is a list of whole numbers written as
     // literals, so the result's shape is known where every shape is: at
     // compile time. Binds as tightly as the prefix glyphs.
@@ -616,7 +662,7 @@ fn is_sign_position(before: &str) -> bool {
         let mut tail = stripped.chars();
         let last = tail.next_back();
         let before_last = tail.next_back();
-        if matches!(last, Some('▷' | '▽' | '□' | '⍳' | '⌽'))
+        if matches!(last, Some('▷' | '▽' | '□' | '⍳' | '⌽' | '↑' | '↓'))
             || (matches!(last, Some('+' | '-' | '×' | '*' | '>' | '<'))
                 && matches!(before_last, Some('◇' | '◈')))
         {
@@ -629,7 +675,8 @@ fn is_sign_position(before: &str) -> bool {
         Some(c) => matches!(
             c,
             '+' | '-' | '×' | '*' | '/' | '^' | '⌈' | '⌊' | '|' | '>' | '<' | '=' | '('
-                | ':' | '→' | '◇' | '◈' | '▷' | '▽' | '□' | '⍳' | '⌽' | '⍴' | '⍉' | '!' | '$'
+                | ':' | '→' | '◇' | '◈' | '▷' | '▽' | '□' | '⍳' | '⌽' | '⍴' | '⍉' | '↑' | '↓'
+                | '!' | '$'
         ),
     }
 }
@@ -754,6 +801,8 @@ fn check_expr_spaces(expr: &Expr, declared: &HashSet<String>, line: usize) -> Re
         | Expr::Reverse { operand: inner, .. }
         | Expr::Reshape { operand: inner, .. }
         | Expr::Transpose { operand: inner, .. }
+        | Expr::Take { operand: inner, .. }
+        | Expr::Drop { operand: inner, .. }
         | Expr::AuditTrace(inner) => {
             check_expr_spaces(inner, declared, line)?;
         }
@@ -839,6 +888,24 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
             | Expr::Reverse { operand: inner, .. }
             | Expr::Reshape { operand: inner, .. }
             | Expr::AuditTrace(inner) => check_broadcast(inner, shapes, line)?,
+            // A take or drop that leaves nothing, or names an axis the
+            // operand has not got, is an error here with a line.
+            Expr::Take { count, axis, operand } | Expr::Drop { count, axis, operand } => {
+                check_broadcast(operand, shapes, line)?;
+                let dropping = matches!(expr, Expr::Drop { .. });
+                if let Some(inner) = get_expr_shape(operand, shapes) {
+                    if taken_shape(&inner, *axis, *count, dropping).is_none() {
+                        return Err(HarmonyDisruption::LoweringErr {
+                            detail: format!(
+                                "`{} {}` of {inner:?} leaves nothing, or names an axis it has not got",
+                                count,
+                                if dropping { "↓" } else { "↑" }
+                            ),
+                            line,
+                        });
+                    }
+                }
+            }
             // A permutation that does not fit the operand is an error here,
             // with a line, rather than an unknown shape later.
             Expr::Transpose { axes, operand } => {

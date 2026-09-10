@@ -180,8 +180,15 @@ fn run_kernel(name: &str, source: &str, input: &[f64]) -> Vec<f64> {
     let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
     let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
         unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
-    let mut output = vec![0.0; input.len()];
-    unsafe { func(input.as_ptr(), output.as_mut_ptr()) };
+    // The buffers hold what the kernel says it needs, which covers an output
+    // larger than the input.
+    let count: libloading::Symbol<unsafe extern "C" fn() -> i64> =
+        unsafe { lib.get(b"rho_kernel_element_count").unwrap() };
+    let needed = (unsafe { count() } as usize).max(input.len());
+    let mut padded_input = input.to_vec();
+    padded_input.resize(needed, 0.0);
+    let mut output = vec![0.0; needed];
+    unsafe { func(padded_input.as_ptr(), output.as_mut_ptr()) };
     output
 }
 
@@ -536,8 +543,15 @@ fn run_variant(name: &str, source: &str, input: &[f64], simd: bool) -> Vec<f64> 
     let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
     let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
         unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
-    let mut output = vec![0.0; input.len()];
-    unsafe { func(input.as_ptr(), output.as_mut_ptr()) };
+    // The buffers hold what the kernel says it needs, which covers an output
+    // larger than the input.
+    let count: libloading::Symbol<unsafe extern "C" fn() -> i64> =
+        unsafe { lib.get(b"rho_kernel_element_count").unwrap() };
+    let needed = (unsafe { count() } as usize).max(input.len());
+    let mut padded_input = input.to_vec();
+    padded_input.resize(needed, 0.0);
+    let mut output = vec![0.0; needed];
+    unsafe { func(padded_input.as_ptr(), output.as_mut_ptr()) };
     output
 }
 
@@ -3307,4 +3321,124 @@ fn test_transpose_writes_a_product_with_a_transposed_factor() {
     let report = analyze("{\n    INPUT:◯ □ 3 4\n    (ind (INPUT > 0.0)) → M\n    (⍉M) → OUTPUT\n    ! (OUTPUT <= 1.0)\n    OUTPUT → =\n}");
     assert_eq!(report.constraints[0].verdict, rho_lang::solver::Verdict::Proved);
     assert_eq!((report.output_range.lo, report.output_range.hi), (0.0, 1.0));
+}
+
+// --------------------------------------------------------------------------
+// ↑ and ↓: APL's take and drop along an axis. The count is written down, so
+// the shape that results is known at compile time like every other shape.
+// --------------------------------------------------------------------------
+
+#[test]
+fn test_take_and_drop_parse_with_a_literal_count_and_an_axis() {
+    let block = parse_rho_program(
+        "{\n    INPUT:◯ □ 3 4\n    (2 ↑ INPUT) → A\n    (-1 ↓0 INPUT) → B\n    (1 ^. INPUT) → C\n    (1 _.0 INPUT) → D\n    (A + 3 ↑ INPUT) → =\n}",
+    )
+    .unwrap();
+    let flows: Vec<&Expr> = block
+        .statements
+        .iter()
+        .filter_map(|s| match s {
+            rho_lang::ast::Statement::Flow { src, .. } => Some(src),
+            _ => None,
+        })
+        .collect();
+    assert!(matches!(flows[0], Expr::Take { count: 2, axis: None, .. }));
+    assert!(matches!(flows[1], Expr::Drop { count: -1, axis: Some(0), .. }));
+    assert!(matches!(flows[2], Expr::Take { count: 1, axis: None, .. }));
+    assert!(matches!(flows[3], Expr::Drop { count: 1, axis: Some(0), .. }));
+    let Expr::BinaryOp { op: BinaryOpKind::Add, rhs, .. } = flows[4] else { panic!() };
+    assert!(matches!(**rhs, Expr::Take { count: 3, .. }));
+
+    // Nothing left, an axis it has not got, a count that is not a literal,
+    // or no count at all: errors with a line.
+    for bad in [
+        "(4 ↓ INPUT) → =",
+        "(-3 ↓0 INPUT) → =",
+        "(2 ↑2 INPUT) → =",
+        "(INPUT ↑ INPUT) → =",
+        "(0 ↑ INPUT) → =",
+        "(↑INPUT) → =",
+    ] {
+        let err = parse_rho_program(&format!("{{\n    INPUT:◯ □ 3 4\n    {bad}\n}}")).unwrap_err();
+        assert!(matches!(err, HarmonyDisruption::LoweringErr { line: 3, .. }), "{bad}: {err}");
+    }
+}
+
+#[test]
+fn test_take_and_drop_keep_the_right_cells_in_kernel_and_interpreter() {
+    let grid: Vec<f64> = (0..12).map(|i| i as f64).collect();
+    let cases: [(&str, &str, Vec<usize>, Vec<f64>); 7] = [
+        // Along the innermost axis: the first two, the last two of every row.
+        ("take_two", "(2 ↑ INPUT) → =", vec![3, 2], vec![0.0, 1.0, 4.0, 5.0, 8.0, 9.0]),
+        ("take_last", "(-2 ↑ INPUT) → =", vec![3, 2], vec![2.0, 3.0, 6.0, 7.0, 10.0, 11.0]),
+        ("drop_one", "(1 ↓ INPUT) → =", vec![3, 3], vec![1.0, 2.0, 3.0, 5.0, 6.0, 7.0, 9.0, 10.0, 11.0]),
+        ("drop_last", "(-1 ↓ INPUT) → =", vec![3, 3], vec![0.0, 1.0, 2.0, 4.0, 5.0, 6.0, 8.0, 9.0, 10.0]),
+        // Along the rows.
+        ("take_rows", "(2 ↑0 INPUT) → =", vec![2, 4], vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+        ("drop_rows", "(-2 ↓0 INPUT) → =", vec![1, 4], vec![0.0, 1.0, 2.0, 3.0]),
+        // A take longer than the axis pads with zero, at the far end for a
+        // positive count and at the near end for a negative one.
+        ("overtake", "(6 ↑ INPUT) → =", vec![3, 6], vec![0.0, 1.0, 2.0, 3.0, 0.0, 0.0, 4.0, 5.0, 6.0, 7.0, 0.0, 0.0, 8.0, 9.0, 10.0, 11.0, 0.0, 0.0]),
+    ];
+    for (name, body, shape, expected) in cases {
+        let source = format!("{{\n    INPUT:◯ □ 3 4\n    {body}\n}}");
+        let block = parse_rho_program(&source).unwrap();
+        let mut env: Env<f64> = Env::new();
+        env.insert("INPUT".to_string(), Grid::from(vec![3, 4], grid.clone()));
+        let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].clone();
+        assert_eq!(meant.shape, shape, "{name}: shape");
+        assert_eq!(meant.cells, expected, "{name}: interpreter");
+        let out = run_spaces(&format!("td_{name}"), &source, &[("INPUT", grid.clone()), ("OUTPUT", vec![9.0; expected.len()])]);
+        assert_eq!(out["OUTPUT"], expected, "{name}: kernel");
+    }
+    let out = run_kernel("td_undertake", "{\n    INPUT:◯ □ 4 1\n    (-6 ↑ INPUT) → =\n}", &[1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(&out[..6], &[0.0, 0.0, 1.0, 2.0, 3.0, 4.0]);
+
+    // A forward difference without the boundary zero: a row of n gives n-1.
+    let source = "{\n    INPUT:◯ □ 16 1\n    ((1 ↓ INPUT) - (-1 ↓ INPUT)) → =\n}";
+    let long: Vec<f64> = (0..16).map(|i| (i as f64 * 0.5).sin()).collect();
+    let block = parse_rho_program(source).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![16, 1], long.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].clone();
+    assert_eq!(meant.shape, vec![15, 1]);
+    let out = run_spaces("td_diff", source, &[("INPUT", long.clone()), ("OUTPUT", vec![0.0; 15])]);
+    assert_eq!(bits(&out["OUTPUT"]), bits(&meant.cells));
+    for i in 0..15 {
+        assert_eq!(out["OUTPUT"][i], long[i + 1] - long[i]);
+    }
+}
+
+#[test]
+fn test_element_count_covers_an_output_larger_than_the_input() {
+    // A take past the end, a reshape that reads round: the output has more
+    // cells than the input, and a buffer sized to the input would be overrun.
+    for (name, source, expected) in [
+        ("count_overtake", "{\n    INPUT:◯ □ 4 1\n    (-6 ↑ INPUT) → =\n}", 6),
+        ("count_reshape", "{\n    INPUT:◯ □ 2\n    (3 4 ⍴ INPUT) → =\n}", 12),
+        ("count_plain", "{\n    INPUT:◯ □ 4 1\n    (INPUT + 1.0) → =\n}", 4),
+        ("count_fold", "{\n    INPUT:◯ □ 3 4\n    (◇+1 INPUT) → =\n}", 12),
+    ] {
+        let block = parse_rho_program(source).unwrap();
+        let mut codegen = LlvmCodeGen::new(name);
+        let ir = codegen.generate_llvm_ir(&block).unwrap();
+        assert_eq!(codegen.element_count(), expected, "{name}");
+        assert!(ir.contains(&format!("ret i64 {expected}")), "{name}:\n{ir}");
+    }
+}
+
+#[test]
+fn test_take_keeps_a_range_and_an_overtake_admits_zero() {
+    // Cells taken from a [0,1] space stay in [0,1]; a take past the end can
+    // read a padding zero, which is inside that range anyway.
+    let report = analyze("{\n    INPUT:◯ □ 4 1\n    (ind (INPUT > 0.0)) → M\n    ((2 ↑ M) + 1.0) → OUTPUT\n    ! (OUTPUT > 0.5)\n    OUTPUT → =\n}");
+    assert_eq!(report.constraints[0].verdict, rho_lang::solver::Verdict::Proved);
+    // [1, 2], widened by the rounding of the sum.
+    assert!((report.output_range.lo - 1.0).abs() < 1e-12 && (report.output_range.hi - 2.0).abs() < 1e-12, "{:?}", report.output_range);
+
+    // A padded take of a space bounded away from zero cannot be: the range
+    // grows to include the zero.
+    let report = analyze("{\n    INPUT:◯ □ 4 1\n    ((ind (INPUT > 0.0)) + 1.0) → M\n    (6 ↑ M) → OUTPUT\n    ! (OUTPUT >= 1.0)\n    OUTPUT → =\n}");
+    assert_ne!(report.constraints[0].verdict, rho_lang::solver::Verdict::Proved);
+    assert_eq!(report.output_range.lo, 0.0);
 }

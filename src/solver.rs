@@ -414,6 +414,8 @@ pub fn eval_interval(sym: &Sym) -> Interval {
             };
             rounded(within)
         }
+        // Some other cell of the same space: the space's range.
+        Sym::Elsewhere { inner, .. } => eval_interval(inner),
         // A boundary cell contributes 0; an interior one contributes its value.
         Sym::Boundary { interior, .. } => {
             Interval::hull(Interval::point(0.0), eval_interval(interior))

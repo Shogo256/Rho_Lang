@@ -81,6 +81,15 @@ pub enum Sym {
         flag: String,
         interior: Box<Sym>,
     },
+    /// The same space read at some other cell — a reversal, a rotation, a
+    /// reshape, a transpose. Which cell is not known, and its range is the
+    /// space's; what it is not is this cell, so `⌽X × X` is not a square.
+    /// difftest found the analysis calling it one: `X > (⌽X × X)` was
+    /// claimed non-negative and produced -6.17.
+    Elsewhere {
+        what: String,
+        inner: Box<Sym>,
+    },
     /// A named function applied to a value.
     Named {
         op: BuiltinOp,
@@ -202,18 +211,41 @@ impl Builder<'_> {
                     let stride = axis_geometry(&self.shape_of(&name), *axis)
                         .map(|(stride, _)| stride as i64)
                         .unwrap_or(1);
-                    self.build(&Expr::Var(name), before, offset + by * stride)
+                    Sym::Elsewhere {
+                        what: format!("rotate{by}_{}", offset_tag(offset)),
+                        inner: Box::new(self.build(&Expr::Var(name), before, offset + by * stride)),
+                    }
                 }
                 None => Sym::Free(format!("rotate@{}", offset_tag(offset))),
             },
             Expr::Reverse { operand, .. } => match place_name(operand) {
-                Some(name) => self.build(&Expr::Var(name), before, offset),
+                Some(name) => Sym::Elsewhere {
+                    what: format!("reverse{}", offset_tag(offset)),
+                    inner: Box::new(self.build(&Expr::Var(name), before, offset)),
+                },
                 None => Sym::Free(format!("reverse@{}", offset_tag(offset))),
             },
+            // A read at a position the data decides: some cell of the space,
+            // or zero where the position is none of its cells — a boundary
+            // the flag names. The position's own expansion is built for what
+            // it obliges (a division in it, say) and then dropped.
+            Expr::Gather { index, operand } => {
+                let _ = self.build(index, before, offset);
+                match place_name(operand) {
+                    Some(name) => Sym::Boundary {
+                        flag: format!("gather{}", offset_tag(offset)),
+                        interior: Box::new(self.build(&Expr::Var(name), before, offset)),
+                    },
+                    None => Sym::Free(format!("gather@{}", offset_tag(offset))),
+                }
+            }
             // A reshaped or transposed read is some cell of the same space too.
             Expr::Reshape { operand, .. } | Expr::Transpose { operand, .. } => {
                 match place_name(operand) {
-                    Some(name) => self.build(&Expr::Var(name), before, offset),
+                    Some(name) => Sym::Elsewhere {
+                        what: format!("rearranged{}", offset_tag(offset)),
+                        inner: Box::new(self.build(&Expr::Var(name), before, offset)),
+                    },
                     None => Sym::Free(format!("rearranged@{}", offset_tag(offset))),
                 }
             }
@@ -493,6 +525,10 @@ fn collect_divisions(
             collect_divisions(lhs, at, line, builder, out);
             collect_divisions(rhs, at, line, builder, out);
         }
+        Expr::Gather { index, operand } => {
+            collect_divisions(index, at, line, builder, out);
+            collect_divisions(operand, at, line, builder, out);
+        }
         Expr::Shift { operand: inner, .. }
         | Expr::Reduce { operand: inner, .. }
         | Expr::Scan { operand: inner, .. }
@@ -547,7 +583,7 @@ fn collect_domains(
             }
             collect_domains(operand, at, line, builder, out);
         }
-        Expr::BinaryOp { lhs, rhs, .. } => {
+        Expr::BinaryOp { lhs, rhs, .. } | Expr::Gather { index: lhs, operand: rhs } => {
             collect_domains(lhs, at, line, builder, out);
             collect_domains(rhs, at, line, builder, out);
         }
@@ -605,6 +641,9 @@ impl fmt::Display for ExprGlyphs<'_> {
                 Some(a) => write!(f, "⌽{a}{}", ExprGlyphs(operand)),
                 None => write!(f, "⌽{}", ExprGlyphs(operand)),
             },
+            Expr::Gather { index, operand } => {
+                write!(f, "({} ⌷ {})", ExprGlyphs(index), ExprGlyphs(operand))
+            }
             Expr::Reshape { shape, operand } => {
                 let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
                 write!(f, "({} ⍴ {})", dims.join(" "), ExprGlyphs(operand))

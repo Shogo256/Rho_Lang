@@ -3676,6 +3676,55 @@ step:{ U
 }
 
 #[test]
+fn test_a_read_of_another_cell_is_not_the_other_factor_of_a_square() {
+    // difftest, seed 424242: `X > (⌽X × X)` was claimed non-negative, because
+    // the reversed read expanded to the very same symbol as X and the
+    // product was taken for a square. A reversal, a rotation, a reshape or
+    // a transpose is some other cell: its range is X's, its identity is not.
+    let not_a_square = analyze(
+        r#"{
+        INPUT:◯ □ 3 4
+        INPUT → T
+        (INPUT > ((⌽T) × T)) → OUTPUT
+        ! (OUTPUT >= 0)
+        OUTPUT → =
+    }"#,
+    );
+    assert!(!matches!(not_a_square.constraints[0].verdict, Verdict::Proved), "{:?}", not_a_square.constraints[0]);
+    let rotated = analyze(
+        r#"{
+        INPUT:◯ □ 12
+        INPUT → T
+        ((1 ⌽ T) × T) → OUTPUT
+        ! (OUTPUT >= 0)
+        OUTPUT → =
+    }"#,
+    );
+    assert!(!matches!(rotated.constraints[0].verdict, Verdict::Proved), "{:?}", rotated.constraints[0]);
+    // The same other cell twice is a square.
+    let square = analyze(
+        r#"{
+        INPUT:◯ □ 3 4
+        INPUT → T
+        ((⌽T) × (⌽T)) → OUTPUT
+        ! (OUTPUT >= 0)
+        OUTPUT → =
+    }"#,
+    );
+    assert_eq!(square.constraints[0].verdict, Verdict::Proved, "{:?}", square.constraints[0]);
+    // And the run agrees with the interpreter either way.
+    let source = r#"{
+        INPUT:◯ □ 3 4
+        INPUT → T
+        (INPUT > ((⌽T) × T)) → =
+    }"#;
+    let input: Vec<f64> = vec![1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 9.0, -1.5, 2.5, -3.5];
+    let (out, meant) = kernel_and_interpreter("not_square", source, &[("INPUT", vec![3, 4], input)]);
+    assert_eq!(bits(&out), bits(&meant));
+    assert!(out.iter().any(|v| *v < 0.0), "{out:?}");
+}
+
+#[test]
 fn test_a_sweep_split_across_threads_gives_the_same_bits() {
     // A grid large enough to be split (the grain is lowered so that even
     // the folds' few lines are), with a shift on each axis, a fold, a scan

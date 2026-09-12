@@ -344,7 +344,7 @@ fn expression(
 
         // Named functions keep their shape, so they compose anywhere.
         5 => {
-            let name = ["exp", "sqrt", "sin", "cos", "abs", "ind"][rng.below(6)];
+            let name = ["exp", "sqrt", "sin", "cos", "abs", "ind", "?", "⌊", "⌈"][rng.below(9)];
             format!("({name} {})", expression(rng, depth - 1, spaces, want))
         }
 

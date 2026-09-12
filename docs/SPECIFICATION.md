@@ -49,6 +49,8 @@ principle.
 | `⍉` / `'` | Transpose | — | `⍉X` reverses the axes; `1 0 ⍉ X` permutes them, see §3.9 | ✅ |
 | `↑` / `^.` | Take | — | `k ↑ X` keeps the first `k` cells along an axis, the last for negative `k`, see §3.10 | ✅ |
 | `⌷` / `~` | Index by value | — | `I ⌷ X` reads X at the position each cell of I names, zero past its cells, see §3.12 | ✅ |
+| `?` | Roll | — | `?X` is a number in [0, 1) hashed from X's bits: random, without state, see §3.13 | ✅ |
+| `⌊` `⌈` (monadic) / `<.` `>.` | Floor, ceiling | — | `⌊X` and `⌈X` with nothing on the left; with something they are the lesser and the greater | ✅ |
 | `↓` / `_.` | Drop | — | `k ↓ X` removes them instead, see §3.10 | ✅ |
 | `+` | Addition | Superposition | Element-wise addition | ✅ |
 | `-` | Subtraction | Difference | Element-wise subtraction | ✅ |
@@ -481,6 +483,25 @@ or zero — a claim that holds of X and of zero is proved, `! (I ⌷ SQ >= 0)`
 with `SQ` a square; one that zero breaks is not. There is no scatter — no
 write at a position the data names — since two threads' parts could name
 the same cell.
+
+### 3.13 Roll (`?`) ✅
+
+`?X` is APL's roll without its state: each cell is a number in [0, 1) that
+is a hash of the cell of X — splitmix64's finaliser over the value's bits,
+the top 53 of them scaled down. It is the same on every thread, on every
+run and in the interpreter, and different wherever X differs; a NaN hashes
+as one value, whatever its payload. The seed is whatever the program hashes:
+
+```rho
+(?(⍳0 X)) → NOISE                       /* a fixed field: the position, hashed */
+(?((⍳0 X) + (⍳1 X × 1000.0) + S)) → R   /* one that S, an input, moves from call to call */
+(⌊((?SEED) × 6.0)) → DIE                /* a whole number in 0..5 */
+```
+
+Distinct seeds a whole apart are unrelated, so a coordinate or a counter is
+a seed; two rolls of one seed are one roll, so a second stream takes a
+second seed (`?(SEED + 0.5)`). The analysis takes the range as [0, 1]. Not
+for cryptography.
 
 ### 3.11 Functions (`name:{ … }`) ✅
 

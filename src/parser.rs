@@ -31,7 +31,7 @@ pub fn validate_symbols(input: &str) -> Result<()> {
     let code_only = remove_comments(input);
 
     let allowed_unicode: HashSet<char> = [
-        '◯', '□', '▷', '▽', '△', '◇', '◈', '⍳', '⌽', '⍴', '⍉', '↑', '↓', '⌷', '~', '+', '-', '×', '*', '/', '^', '⌈', '⌊', '|', '→', '⇒', '<', '>', '=', ':', '{', '}', '$', '&', '!',
+        '◯', '□', '▷', '▽', '△', '◇', '◈', '⍳', '⌽', '⍴', '⍉', '↑', '↓', '⌷', '~', '?', '+', '-', '×', '*', '/', '^', '⌈', '⌊', '|', '→', '⇒', '<', '>', '=', ':', '{', '}', '$', '&', '!',
         '(', ')', '[', ']', ';', ',', '.', ' ', '\t', '\r', '\n', '_', '𝜏', 'τ'
     ].iter().cloned().collect();
 
@@ -1341,6 +1341,21 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         }
     }
 
+    // Roll, floor and ceiling as prefixes: `?X`, `⌊X`, `⌈X`. A `⌊` or `⌈`
+    // with nothing on its left is monadic, as in APL; with something it is
+    // the lesser or the greater, split off above.
+    for (glyph, op) in [('?', BuiltinOp::Roll), ('⌊', BuiltinOp::Floor), ('⌈', BuiltinOp::Ceil)] {
+        if let Some(rest) = expr_str.strip_prefix(glyph) {
+            let operand = rest.trim();
+            if !operand.is_empty() {
+                return Ok(Expr::Builtin {
+                    op,
+                    operand: Box::new(parse_expr(operand)?),
+                });
+            }
+        }
+    }
+
     // Reverse: ⌽X reads the cell at the other end of the axis; ⌽0X names it.
     if expr_str.starts_with('⌽') && expr_str.chars().count() > 1 {
         let rest = &expr_str['⌽'.len_utf8()..];
@@ -1409,7 +1424,7 @@ fn find_binary_op_position(s: &str, op: &str) -> Option<usize> {
             // A + or - that follows another operator is a sign on the number to
             // its right, not a split point. Without this, `A × -3.0` breaks at
             // the minus and leaves `A ×` behind as if it were a name.
-            if matches!(op, "+" | "-" | "⌽" | "⍉") && is_sign_position(&s[..i]) {
+            if matches!(op, "+" | "-" | "⌽" | "⍉" | "⌊" | "⌈") && is_sign_position(&s[..i]) {
                 continue;
             }
             let lhs = s[..i].trim();
@@ -1465,6 +1480,7 @@ fn is_sign_position(before: &str) -> bool {
             c,
             '+' | '-' | '×' | '*' | '/' | '^' | '⌈' | '⌊' | '|' | '>' | '<' | '=' | '('
                 | ':' | '→' | '◇' | '◈' | '▷' | '▽' | '□' | '⍳' | '⌽' | '⍴' | '⍉' | '↑' | '↓' | '⌷'
+                | '?'
                 | '!' | '$'
         ),
     }

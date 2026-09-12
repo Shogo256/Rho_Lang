@@ -356,7 +356,7 @@ impl LlvmCodeGen {
                 ));
             }
         }
-        for name in ["exp", "log", "sqrt", "sin", "cos", "fabs", "floor"] {
+        for name in ["exp", "log", "sqrt", "sin", "cos", "fabs", "floor", "ceil"] {
             ir.push_str(&format!(
                 "declare {elem} @llvm.{name}.{suffix}({elem})\n"
             ));
@@ -2382,6 +2382,17 @@ impl LlvmCodeGen {
                         "  {out} = call {ty} {}({ty} {value})\n",
                         mode.unary_intrinsic("fabs")
                     )),
+                    BuiltinOp::Floor => ir.push_str(&format!(
+                        "  {out} = call {ty} {}({ty} {value})\n",
+                        mode.unary_intrinsic("floor")
+                    )),
+                    BuiltinOp::Ceil => ir.push_str(&format!(
+                        "  {out} = call {ty} {}({ty} {value})\n",
+                        mode.unary_intrinsic("ceil")
+                    )),
+                    BuiltinOp::Roll => {
+                        self.emit_roll(ir, &value, &out, mode, counter);
+                    }
                     BuiltinOp::Indicator => unreachable!("handled above"),
                     _ => ir.push_str(&format!(
                         "  {out} = call {ty} {}({ty} {value})\n",
@@ -3158,6 +3169,97 @@ impl LlvmCodeGen {
         ));
 
         Ok(out)
+    }
+
+    /// `?X`: splitmix64's finaliser over the operand's bits, at double
+    /// width whatever the kernel's, the top 53 bits scaled into [0, 1).
+    /// Integer arithmetic throughout, so every lane and every thread gets
+    /// the number the interpreter gets. A NaN hashes as zero bits, since
+    /// its payload is the one thing the two need not agree on.
+    fn emit_roll(&self, ir: &mut String, value: &str, out: &str, mode: Mode, counter: &mut usize) {
+        let (dbl, int, mask) = match mode {
+            Mode::Scalar(_) => ("double".to_string(), "i64".to_string(), "i1".to_string()),
+            Mode::Vector(w, _) => (
+                format!("<{w} x double>"),
+                format!("<{w} x i64>"),
+                format!("<{w} x i1>"),
+            ),
+        };
+        // A constant operand: bare for a scalar, one per lane for a vector.
+        let splat = |elem: &str, v: String| match mode {
+            Mode::Scalar(_) => v,
+            Mode::Vector(w, _) => {
+                let lanes: Vec<String> = (0..w).map(|_| format!("{elem} {v}")).collect();
+                format!("<{}>", lanes.join(", "))
+            }
+        };
+        let ty = mode.ty();
+        let nan = Self::fresh(counter);
+        let canon = Self::fresh(counter);
+        ir.push_str(&format!("  {nan} = fcmp uno {ty} {value}, {value}\n"));
+        ir.push_str(&format!(
+            "  {canon} = select {mask} {nan}, {ty} {}, {ty} {value}\n",
+            mode.zero()
+        ));
+        let wide = if matches!(self.precision, Precision::F32) {
+            let w = Self::fresh(counter);
+            ir.push_str(&format!("  {w} = fpext {ty} {canon} to {dbl}\n"));
+            w
+        } else {
+            canon
+        };
+        let bits = Self::fresh(counter);
+        ir.push_str(&format!("  {bits} = bitcast {dbl} {wide} to {int}\n"));
+        let lit = |v: u64| splat("i64", (v as i64).to_string());
+        let mut z = Self::fresh(counter);
+        ir.push_str(&format!(
+            "  {z} = add {int} {bits}, {}\n",
+            lit(0x9E37_79B9_7F4A_7C15)
+        ));
+        for (shift, mul) in [
+            (30u32, Some(0xBF58_476D_1CE4_E5B9u64)),
+            (27, Some(0x94D0_49BB_1331_11EB)),
+            (31, None),
+        ] {
+            let shifted = Self::fresh(counter);
+            let mixed = Self::fresh(counter);
+            ir.push_str(&format!(
+                "  {shifted} = lshr {int} {z}, {}\n",
+                splat("i64", shift.to_string())
+            ));
+            ir.push_str(&format!("  {mixed} = xor {int} {z}, {shifted}\n"));
+            z = match mul {
+                Some(m) => {
+                    let product = Self::fresh(counter);
+                    ir.push_str(&format!("  {product} = mul {int} {mixed}, {}\n", lit(m)));
+                    product
+                }
+                None => mixed,
+            };
+        }
+        let top = Self::fresh(counter);
+        let real = Self::fresh(counter);
+        let scaled = Self::fresh(counter);
+        ir.push_str(&format!(
+            "  {top} = lshr {int} {z}, {}\n",
+            splat("i64", "11".to_string())
+        ));
+        ir.push_str(&format!("  {real} = uitofp {int} {top} to {dbl}\n"));
+        ir.push_str(&format!(
+            "  {scaled} = fmul {dbl} {real}, {}\n",
+            splat(
+                "double",
+                format!("0x{:016X}", (1.0f64 / 9_007_199_254_740_992.0).to_bits())
+            )
+        ));
+        if matches!(self.precision, Precision::F32) {
+            ir.push_str(&format!("  {out} = fptrunc {dbl} {scaled} to {ty}\n"));
+        } else {
+            ir.push_str(&format!(
+                "  {out} = fadd {dbl} {scaled}, {}\n",
+                splat("double", "0.0".to_string())
+            ));
+        }
     }
 
     fn place_name(expr: &Expr) -> Option<String> {

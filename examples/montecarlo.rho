@@ -1,0 +1,23 @@
+{
+    /* π by Monte Carlo, with `?`, the roll without state.
+
+       Every cell hashes its own seed — its coordinates plus INPUT, which the
+       caller fills with a number that changes from call to call — into two
+       coordinates in [0, 1), and asks whether the point falls inside the
+       quarter circle. `◇+1` counts the hits along each row; the caller sums
+       the 256 rows and multiplies by 4 / 65536.
+
+       A roll is the same on every thread and every run, so the estimate is
+       reproducible for a given INPUT, and a different INPUT is a different
+       sample.
+
+         rhoc examples/montecarlo.rho
+    */
+    INPUT:◯ □ 256 256
+
+    (((⍳0 INPUT) × 256.0) + (⍳1 INPUT) + INPUT) → SEED
+    (?SEED) → U
+    (?(SEED + 0.5)) → V
+    (ind (((U × U) + (V × V)) < 1.0)) → HIT
+    (◇+1 HIT) → =
+}

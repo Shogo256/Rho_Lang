@@ -46,6 +46,9 @@ Working prototype. What runs today:
 - `⌷`, index by value: `I ⌷ X` reads X at the positions the cells of I name,
   zero past its cells — a lookup table, a colour map, a resampling, a
   permutation, the one read whose place the data decides
+- `?`, roll without state: `?X` hashes each cell to a number in [0, 1),
+  the same on every thread and every run, so a coordinate or a counter is a
+  seed — Monte Carlo, noise, a stochastic automaton; `⌊X` and `⌈X` round
 - Functions: `smooth:{ X ((▷X + X + ▽X) / 3.0) }` defines one, `smooth INPUT`
   calls it, `A mix B` calls a function of two between its arguments, and the
   body is copied in at each call — nothing runs at call time, a function is

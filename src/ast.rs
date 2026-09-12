@@ -130,6 +130,16 @@ pub enum BuiltinOp {
     /// cannot do: a mask that passes a value which happens to be zero is
     /// indistinguishable from one that blocked it.
     Indicator,
+    /// `?X` — APL's roll, without state: a number in [0, 1) that is a hash
+    /// of the operand's bits, so it is the same on every thread and every
+    /// run, and different wherever the operand differs. The seed is whatever
+    /// the program hashes: `?(⍳0 X)` is a fixed noise, `?(⍳0 X + S)` one
+    /// that S, an input, moves.
+    Roll,
+    /// `⌊X` — the largest whole number not above X. Monadic `⌊`, as in APL.
+    Floor,
+    /// `⌈X` — the smallest whole number not below X.
+    Ceil,
 }
 
 impl BuiltinOp {
@@ -155,6 +165,9 @@ impl BuiltinOp {
             BuiltinOp::Cos => "cos",
             BuiltinOp::Abs => "abs",
             BuiltinOp::Indicator => "ind",
+            BuiltinOp::Roll => "?",
+            BuiltinOp::Floor => "⌊",
+            BuiltinOp::Ceil => "⌈",
         }
     }
 

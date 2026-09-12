@@ -3805,6 +3805,96 @@ fn test_index_by_value_reads_the_cell_the_data_names() {
 }
 
 #[test]
+fn test_roll_is_a_hash_of_the_cell_in_the_unit_interval() {
+    // `?X` is a number in [0, 1) from X's bits: the same on the kernel, the
+    // interpreter, the vector and the scalar path; different where X is.
+    let source = r#"{
+        INPUT:◯ □ 4096
+        (?INPUT) → =
+    }"#;
+    let seeds: Vec<f64> = (0..4096).map(|i| i as f64).collect();
+    let (out, meant) = kernel_and_interpreter("roll_basic", source, &[("INPUT", vec![4096], seeds.clone())]);
+    assert_eq!(bits(&out), bits(&meant));
+    assert!(out.iter().all(|v| (0.0..1.0).contains(v)), "not in [0, 1)");
+    let mean = out.iter().sum::<f64>() / 4096.0;
+    assert!((mean - 0.5).abs() < 0.03, "mean {mean}");
+    let mut sorted = out.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.dedup();
+    assert_eq!(sorted.len(), 4096, "the rolls of 4096 different seeds all differ");
+    // Seeds a whole apart are unrelated: no run of rising values.
+    let rising = out.windows(2).filter(|w| w[1] > w[0]).count();
+    assert!((1800..2300).contains(&rising), "{rising} rising pairs of 4095");
+    // Scalar and vector lowering agree bit for bit.
+    let scalar = run_variant("roll_scalar", source, &seeds, false);
+    let vector = run_variant("roll_simd", source, &seeds, true);
+    assert_eq!(bits(&scalar), bits(&vector));
+    assert_eq!(bits(&scalar), bits(&meant));
+
+    // A NaN hashes as one value however it was made; a seed an input moves
+    // gives a different field for every value of the input.
+    let source = r#"{
+        INPUT:◯ □ 8
+        ((INPUT / INPUT) + 0.0) → Q
+        ((?Q) + (?((⍳0 INPUT) + INPUT))) → =
+    }"#;
+    let input = vec![0.0, 0.0, 1.0, 2.0, 3.0, 0.0, 4.0, 5.0];
+    let (out, meant) = kernel_and_interpreter("roll_nan", source, &[("INPUT", vec![8], input)]);
+    assert_eq!(bits(&out), bits(&meant));
+
+    // The analysis knows the range: a roll is in [0, 1].
+    let report = analyze(
+        r#"{
+        INPUT:◯ □ 4
+        ((?INPUT) × 2.0) → OUTPUT
+        ! (OUTPUT >= 0)
+        ! (OUTPUT <= 2)
+        OUTPUT → =
+    }"#,
+    );
+    assert!(report.constraints.iter().all(|c| c.verdict == Verdict::Proved), "{:?}", report.constraints);
+}
+
+#[test]
+fn test_monadic_floor_and_ceiling() {
+    // `⌊X` and `⌈X` with nothing on the left, as in APL; with something on
+    // the left they are still the lesser and the greater.
+    let source = r#"{
+        INPUT:◯ □ 6
+        AUX:◯ □ 6
+        ((⌊INPUT) + (⌈INPUT) + (INPUT ⌊ ⌈AUX) + (⌊(INPUT + AUX))) → =
+    }"#;
+    let a = vec![1.5, -1.5, 2.0, -0.25, 1e10, 0.999];
+    let b = vec![0.2, 0.7, -3.1, 4.0, -1e10, 0.0];
+    let (out, meant) = kernel_and_interpreter(
+        "floor_ceil",
+        source,
+        &[("INPUT", vec![6], a.clone()), ("AUX", vec![6], b.clone())],
+    );
+    assert_eq!(bits(&out), bits(&meant));
+    for i in 0..6 {
+        let expect = a[i].floor() + a[i].ceil() + a[i].min(b[i].ceil()) + (a[i] + b[i]).floor();
+        assert_eq!(out[i], expect, "cell {i}");
+    }
+    // The ASCII spellings of the glyphs serve as prefixes too.
+    let ascii = "{\n    INPUT:◯ □ 6\n    ((<.INPUT) + (>.INPUT)) → =\n}";
+    let (out, meant) = kernel_and_interpreter("floor_ceil_ascii", ascii, &[("INPUT", vec![6], a.clone())]);
+    assert_eq!(bits(&out), bits(&meant));
+    assert_eq!(out[0], 1.0 + 2.0);
+    // Their intervals are exact.
+    let report = analyze(
+        r#"{
+        INPUT:◯ □ 4
+        ((INPUT × INPUT) + 0.5) → SQ
+        (⌊SQ) → OUTPUT
+        ! (OUTPUT >= 0)
+        OUTPUT → =
+    }"#,
+    );
+    assert_eq!(report.constraints[0].verdict, Verdict::Proved, "{:?}", report.constraints[0]);
+}
+
+#[test]
 fn test_a_sweep_split_across_threads_gives_the_same_bits() {
     // A grid large enough to be split (the grain is lowered so that even
     // the folds' few lines are), with a shift on each axis, a fold, a scan

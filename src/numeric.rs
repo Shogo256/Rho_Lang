@@ -55,6 +55,19 @@ pub trait Numeric: Clone + fmt::Debug {
     }
 }
 
+/// The roll: a number in [0, 1) from the bits of a value. splitmix64's
+/// finaliser over the value's bits, the top 53 of the result scaled down.
+/// Every NaN hashes as one value, since the kernel's NaN and the
+/// interpreter's need not share a payload. Not for cryptography.
+pub fn roll(value: f64) -> f64 {
+    let bits = if value.is_nan() { 0 } else { value.to_bits() };
+    let mut z = bits.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)
+}
+
 impl Numeric for f64 {
     type Bool = bool;
 
@@ -97,6 +110,9 @@ impl Numeric for f64 {
                     0.0
                 }
             }
+            BuiltinOp::Roll => roll(*self),
+            BuiltinOp::Floor => self.floor(),
+            BuiltinOp::Ceil => self.ceil(),
         }
     }
     fn compare(&self, other: &Self, how: Compare) -> bool {
@@ -222,6 +238,10 @@ impl Numeric for f32 {
                     0.0
                 }
             }
+            // Hashed at double width and rounded once, as the kernel does.
+            BuiltinOp::Roll => roll(f64::from(*self)) as f32,
+            BuiltinOp::Floor => self.floor(),
+            BuiltinOp::Ceil => self.ceil(),
         }
     }
     fn compare(&self, other: &Self, how: Compare) -> bool {

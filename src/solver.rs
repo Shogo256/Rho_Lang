@@ -466,6 +466,18 @@ pub fn eval_interval(sym: &Sym) -> Interval {
                     hi: inner.lo.abs().max(inner.hi.abs()),
                 },
                 BuiltinOp::Indicator => Interval { lo: 0.0, hi: 1.0 },
+                // A roll lies in [0, 1) whatever it hashes.
+                BuiltinOp::Roll => Interval { lo: 0.0, hi: 1.0 },
+                // Exact: a whole number is representable wherever its
+                // neighbour is.
+                BuiltinOp::Floor => Interval {
+                    lo: inner.lo.floor(),
+                    hi: inner.hi.floor(),
+                },
+                BuiltinOp::Ceil => Interval {
+                    lo: inner.lo.ceil(),
+                    hi: inner.hi.ceil(),
+                },
             }
         }
         // A fold is not expanded term by term: the number of terms is a

@@ -8,12 +8,14 @@ shared library.
 """
 
 import ctypes
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 import sysconfig
+import textwrap
 
 
 def _checkout_root():
@@ -86,7 +88,8 @@ class RhoEngine:
         self._lib = None
         self._bound = {}
 
-    def compile_rho_file(self, rho_file_path, bind=None, tau=None, max_iter=None, threads=None, portable=False):
+    def compile_rho_file(self, rho_file_path, bind=None, tau=None, max_iter=None, threads=None,
+                         portable=False, precision=None, load=True):
         """Compile a .rho script with the rhoc driver.
 
         `bind` maps space names to the buffers (or raw addresses) the kernel
@@ -100,6 +103,8 @@ class RhoEngine:
         `threads` is how many threads every sweep is split across (None or
         0: one per CPU; the kernel also honours RHO_THREADS when it runs).
         `portable=True` builds for any x86-64 instead of this machine.
+        `precision="f32"` computes in single precision. `load=False` leaves
+        the library on disk without loading it.
         """
         cmd = rhoc_command() + [rho_file_path, "-o", self.kernel_so_path]
         if tau is not None:
@@ -110,6 +115,10 @@ class RhoEngine:
             cmd += ["--threads", str(threads)]
         if portable:
             cmd += ["--portable"]
+        if precision == "f32":
+            cmd += ["--f32"]
+        elif precision not in (None, "f64"):
+            raise ValueError(f"precision is 'f64' or 'f32', not {precision!r}")
         self._bound = {}
         for name, target in (bind or {}).items():
             address = _buffer_address(target)
@@ -118,7 +127,8 @@ class RhoEngine:
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
             raise RuntimeError(f"ρ Compilation Error:\n{res.stderr}")
-        self._load_library()
+        if load:
+            self._load_library()
 
     def _load_library(self):
         if not os.path.exists(self.kernel_so_path):
@@ -363,3 +373,250 @@ def compile(func):
     wrapper.__name__ = func.__name__
     wrapper.__doc__ = func.__doc__
     return wrapper
+
+
+# --------------------------------------------------------------------------
+# A kernel at any shape: the flows are written once, the declarations come
+# from the arrays passed at call time, and each shape is compiled once and
+# kept on disk.
+# --------------------------------------------------------------------------
+
+
+def _default_cache_dir():
+    explicit = os.environ.get("RHO_CACHE_DIR")
+    if explicit:
+        return explicit
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "rho-lang")
+
+
+_COMPILER_STAMP = None
+
+
+def _compiler_stamp():
+    """Something that changes when the compiler does, so a kernel built by an
+    older rhoc is not served for a newer one. Taken once per process: in a
+    checkout the first compile is what builds rhoc, and a stamp read before
+    and after it would name two compilers for one program."""
+    global _COMPILER_STAMP
+    if _COMPILER_STAMP is not None:
+        return _COMPILER_STAMP
+    cmd = rhoc_command()
+    root = _checkout_root()
+    if cmd[0] == "cargo" and root is not None:
+        # Build first, so the binary stamped is the one that will run.
+        subprocess.run(
+            ["cargo", "build", "--quiet", "--manifest-path", os.path.join(root, "Cargo.toml"), "--bin", "rhoc"],
+            check=False, capture_output=True,
+        )
+    parts = [" ".join(cmd)]
+    candidates = [cmd[0]]
+    if root is not None:
+        candidates += [os.path.join(root, "target", profile, "rhoc") for profile in ("debug", "release")]
+    for path in candidates:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        parts.append(f"{path}:{st.st_size}:{int(st.st_mtime)}")
+    _COMPILER_STAMP = "|".join(parts)
+    return _COMPILER_STAMP
+
+
+def _numpy():
+    try:
+        import numpy
+    except ImportError:
+        return None
+    return numpy
+
+
+def _flatten(value, out):
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _flatten(item, out)
+    else:
+        out.append(float(value))
+    return out
+
+
+def _shape_of_nested(value):
+    shape = []
+    probe = value
+    while isinstance(probe, (list, tuple)):
+        shape.append(len(probe))
+        if not probe:
+            break
+        probe = probe[0]
+    return tuple(shape)
+
+
+def _as_space(value, ctype):
+    """(shape, buffer to pass, object to keep alive) for one argument.
+
+    Accepts a numpy array (made contiguous and of the kernel's width if it is
+    not), a ctypes array (one axis), a `(buffer, shape)` pair for anything
+    else, or nested lists, which are copied into a ctypes array.
+    """
+    np = _numpy()
+    if np is not None and isinstance(value, np.ndarray):
+        want = np.float32 if ctype is ctypes.c_float else np.float64
+        arr = value
+        if arr.dtype != want or not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr, dtype=want)
+        return tuple(int(d) for d in arr.shape), arr, arr
+    if isinstance(value, tuple) and len(value) == 2 and not isinstance(value[0], (int, float)):
+        buf, shape = value
+        return tuple(int(d) for d in shape), buf, buf
+    if isinstance(value, ctypes.Array):
+        return (len(value),), value, value
+    if isinstance(value, (list, tuple)):
+        shape = _shape_of_nested(value)
+        flat = _flatten(value, [])
+        cells = 1
+        for d in shape:
+            cells *= d
+        if cells != len(flat):
+            raise ValueError(f"a nested list of shape {shape} holds {cells} cells, not {len(flat)}")
+        buf = (ctype * len(flat))(*flat)
+        return shape, buf, buf
+    raise TypeError(
+        f"a space is a numpy array, a ctypes array, nested lists or a (buffer, shape) "
+        f"pair, not {type(value).__name__}"
+    )
+
+
+def _from_space(buf, shape, ctype):
+    """What a call returns for a space the kernel filled: a numpy array when
+    numpy is there, nested lists otherwise."""
+    np = _numpy()
+    if np is not None:
+        dtype = np.float32 if ctype is ctypes.c_float else np.float64
+        if isinstance(buf, np.ndarray):
+            return buf
+        return np.frombuffer(buf, dtype=dtype).reshape(shape).copy()
+    flat = list(buf)
+
+    def nest(values, dims):
+        if len(dims) <= 1:
+            return list(values)
+        step = len(values) // dims[0]
+        return [nest(values[i * step:(i + 1) * step], dims[1:]) for i in range(dims[0])]
+
+    return nest(flat, list(shape))
+
+
+class Kernel:
+    """A ρ kernel written without declarations, compiled for each shape it is
+    called with, and cached on disk.
+
+        blur = Kernel("((▷0INPUT + ▽0INPUT + ▷1INPUT + ▽1INPUT + INPUT) / 5.0) → =")
+        out = blur(INPUT=image)          # compiles for image's shape once
+        out = blur(INPUT=other_image)    # same shape: the cached kernel
+
+    The flows are the inside of the program's braces; `definitions` are the
+    functions written before them. Every named argument becomes a space
+    declared with the argument's shape, so the program is written once and
+    used at any shape. A space the kernel fills and the caller did not pass
+    (OUTPUT) is allocated and returned — one value, or a dict of them.
+
+    Kernels live in `cache_dir` (RHO_CACHE_DIR, else ~/.cache/rho-lang),
+    keyed by the program, the options and the compiler, so a second process
+    with the same program does not compile either.
+    """
+
+    def __init__(self, flows, definitions="", *, tau=None, max_iter=None, threads=None,
+                 precision="f64", portable=False, cache_dir=None):
+        self.flows = textwrap.dedent(flows).strip("\n")
+        self.definitions = textwrap.dedent(definitions).strip("\n")
+        self.tau = tau
+        self.max_iter = max_iter
+        self.threads = threads
+        if precision not in ("f64", "f32"):
+            raise ValueError(f"precision is 'f64' or 'f32', not {precision!r}")
+        self.precision = precision
+        self.portable = portable
+        self.cache_dir = os.path.abspath(cache_dir or _default_cache_dir())
+        self._engines = {}
+        self._last = None
+        self.compiled = 0
+
+    @property
+    def _ctype(self):
+        return ctypes.c_float if self.precision == "f32" else ctypes.c_double
+
+    def program(self, shapes):
+        """The full program for these shapes: definitions, declarations, flows."""
+        decls = "".join(
+            f"    {name}:◯ □ {' '.join(str(d) for d in shape)}\n" for name, shape in shapes.items()
+        )
+        body = "".join(f"    {line.strip()}\n" for line in self.flows.splitlines() if line.strip())
+        head = f"{self.definitions}\n\n" if self.definitions else ""
+        return f"{head}{{\n{decls}{body}}}\n"
+
+    def _key(self, program):
+        digest = hashlib.sha256()
+        digest.update(program.encode("utf-8"))
+        digest.update(repr((self.tau, self.max_iter, self.threads, self.precision, self.portable)).encode())
+        digest.update(_compiler_stamp().encode("utf-8"))
+        return digest.hexdigest()[:24]
+
+    def engine(self, **shapes):
+        """The compiled kernel for these shapes, compiling it if no cache has it."""
+        program = self.program({name: tuple(shape) for name, shape in shapes.items()})
+        key = self._key(program)
+        engine = self._engines.get(key)
+        if engine is not None:
+            return engine
+        os.makedirs(self.cache_dir, exist_ok=True)
+        so_path = os.path.join(self.cache_dir, f"{key}.so")
+        if not os.path.exists(so_path):
+            source = os.path.join(self.cache_dir, f"{key}.rho")
+            with open(source, "w", encoding="utf-8") as f:
+                f.write(program)
+            # Built under a private name and moved into place, so two
+            # processes racing for the same kernel never see half a file.
+            scratch = RhoEngine(os.path.join(self.cache_dir, f"{key}.{os.getpid()}.building.so"))
+            scratch.compile_rho_file(
+                source, tau=self.tau, max_iter=self.max_iter, threads=self.threads,
+                portable=self.portable, precision=self.precision, load=False,
+            )
+            os.replace(scratch.kernel_so_path, so_path)
+            self.compiled += 1
+        engine = RhoEngine(so_path)
+        engine._load_library()
+        self._engines[key] = engine
+        return engine
+
+    def __call__(self, **spaces):
+        ctype = self._ctype
+        shapes, buffers, alive = {}, {}, []
+        for name, value in spaces.items():
+            shape, buf, keep = _as_space(value, ctype)
+            shapes[name] = shape
+            buffers[name] = buf
+            alive.append(keep)
+        engine = self.engine(**shapes)
+        produced = {}
+        for name, shape, role in engine.spaces():
+            if role == "output" and name not in buffers:
+                cells = 1
+                for d in shape:
+                    cells *= d
+                buf = (ctype * max(cells, 1))()
+                buffers[name] = buf
+                produced[name] = (buf, tuple(shape))
+        engine.execute_spaces(buffers)
+        self._last = engine
+        results = {name: _from_space(buf, shape, ctype) for name, (buf, shape) in produced.items()}
+        if len(results) == 1:
+            return next(iter(results.values()))
+        return results
+
+    def sweeps(self):
+        """Sweeps the `⇒` loops of the most recent call took."""
+        return self._last.sweeps() if self._last is not None else 0
+
+    def converged(self):
+        """Whether every `⇒` of the most recent call stopped on the tolerance."""
+        return self._last.converged() if self._last is not None else True

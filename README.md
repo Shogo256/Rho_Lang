@@ -140,6 +140,22 @@ with what the `!` check could and could not settle.
 
 ### 3. Call it from Python
 
+The short way: write the flows once, without declarations, and let each
+shape you call it with be compiled once and kept in a cache
+(`~/.cache/rho-lang`, or `RHO_CACHE_DIR`). Nested lists or numpy arrays.
+
+```python
+from rho import Kernel
+
+blur = Kernel("((▷0INPUT + ▽0INPUT + ▷1INPUT + ▽1INPUT + INPUT) / 5.0) → =")
+out = blur(INPUT=image)            # compiles for image's shape, once
+out = blur(INPUT=another)          # a different shape: another kernel, once
+mix = Kernel("((A × W) + (B × (1.0 - W))) → =")
+out = mix(A=a, B=b, W=w)           # every named argument is a space
+```
+
+The long way, against a compiled `.so` by hand:
+
 ```python
 import ctypes
 

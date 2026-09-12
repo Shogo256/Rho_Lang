@@ -640,6 +640,30 @@ a dictionary and checks each buffer's length against its shape first.
 
 ---
 
+### 3.4.2 From Python, at any shape ✅
+
+The shapes in a program are fixed when it is compiled; what is not fixed is
+how many programs there are. `rho.Kernel` takes the flows without their
+declarations and, when called, declares each named argument with the
+argument's shape, compiles that program once, and keeps the kernel on disk
+(`~/.cache/rho-lang`, or `RHO_CACHE_DIR`) under a key made of the program,
+the options and the compiler. A second call with the same shape, in this
+process or another, loads what is there. Nested lists, ctypes arrays,
+`(buffer, shape)` pairs and numpy arrays are all spaces; a space the kernel
+fills and the caller did not pass is allocated and returned.
+
+```python
+blur = rho.Kernel("((▷0X + ▽0X + ▷1X + ▽1X + X) / 5.0) → =")
+out = blur(X=image)                       # any shape, compiled once each
+relax = rho.Kernel("INPUT → U\n((B / 4.0) - (step U)) ⇒ U\nU → =",
+                   definitions="step:{ V ((▷V + ▽V) / 4.0) }", tau=1e-12, max_iter=200)
+x = relax(INPUT=zeros, B=b); relax.converged()
+```
+
+This is what makes a program written once usable inside an ordinary data
+pipeline, where the arrays' sizes are the data's business; the language
+itself stays static, which is what its checks and its speed rest on.
+
 ## 4. Compile-Time Checking (`!`) ✅
 
 Enforced by the parser before code generation:

@@ -31,7 +31,7 @@ pub fn validate_symbols(input: &str) -> Result<()> {
     let code_only = remove_comments(input);
 
     let allowed_unicode: HashSet<char> = [
-        '◯', '□', '▷', '▽', '△', '◇', '◈', '⍳', '⌽', '⍴', '⍉', '↑', '↓', '+', '-', '×', '*', '/', '^', '⌈', '⌊', '|', '→', '⇒', '<', '>', '=', ':', '{', '}', '$', '&', '!',
+        '◯', '□', '▷', '▽', '△', '◇', '◈', '⍳', '⌽', '⍴', '⍉', '↑', '↓', '⌷', '~', '+', '-', '×', '*', '/', '^', '⌈', '⌊', '|', '→', '⇒', '<', '>', '=', ':', '{', '}', '$', '&', '!',
         '(', ')', '[', ']', ';', ',', '.', ' ', '\t', '\r', '\n', '_', '𝜏', 'τ'
     ].iter().cloned().collect();
 
@@ -96,6 +96,7 @@ pub fn normalize_ascii_aliases(input: &str) -> String {
         .replace("<<", "▽")
         .replace("#", "⍳")
         .replace("%", "⌽")
+        .replace("~", "⌷")
         .replace("\\", "⍴")
         .replace("'", "⍉")
         // Take and drop; a literal therefore needs a digit before its point,
@@ -615,6 +616,10 @@ impl Expander<'_> {
                 lhs: Box::new(self.expression(lhs, call_line, out)?),
                 rhs: Box::new(self.expression(rhs, call_line, out)?),
             },
+            Expr::Gather { index, operand } => Expr::Gather {
+                index: Box::new(self.expression(index, call_line, out)?),
+                operand: Box::new(self.expression(operand, call_line, out)?),
+            },
             Expr::Builtin { op, operand } => Expr::Builtin {
                 op: *op,
                 operand: Box::new(self.expression(operand, call_line, out)?),
@@ -704,6 +709,7 @@ fn substitute(expr: &Expr, binding: &BTreeMap<String, Expr>, locals: &BTreeMap<S
         Expr::Take { count, axis, operand } => Expr::Take { count: *count, axis: *axis, operand: sub(operand) },
         Expr::Drop { count, axis, operand } => Expr::Drop { count: *count, axis: *axis, operand: sub(operand) },
         Expr::Index { axis, operand } => Expr::Index { axis: *axis, operand: sub(operand) },
+        Expr::Gather { index, operand } => Expr::Gather { index: sub(index), operand: sub(operand) },
         Expr::AuditTrace(inner) => Expr::AuditTrace(sub(inner)),
     }
 }
@@ -1034,6 +1040,27 @@ pub fn parse_expr(expr_str: &str) -> Result<Expr> {
         if let Some(pos) = find_binary_op_position(expr_str, op_str) {
             return split_at(op_str, op_kind, pos);
         }
+    }
+
+    // Index by value: `I ⌷ X` reads X at the position each cell of I names.
+    // It binds as tightly as the other glyphs, so `A + I ⌷ X` is
+    // `A + (I ⌷ X)`, and the right side is a space's name: the position is
+    // a place in memory, and only a space has one.
+    if let Some(pos) = find_binary_op_position(expr_str, "⌷") {
+        let index = parse_expr(expr_str[..pos].trim())?;
+        let name = expr_str[pos + '⌷'.len_utf8()..].trim();
+        if !is_identifier(name) {
+            return Err(HarmonyDisruption::LoweringErr {
+                detail: format!(
+                    "`⌷` reads a declared space, so its right side is the space's name, not `{name}`"
+                ),
+                line: 0,
+            });
+        }
+        return Ok(Expr::Gather {
+            index: Box::new(index),
+            operand: Box::new(Expr::Var(name.to_string())),
+        });
     }
 
     // Rotate: `k ⌽ X`, `k ⌽0 X`. Binds tighter than every arithmetic operator,
@@ -1437,7 +1464,7 @@ fn is_sign_position(before: &str) -> bool {
         Some(c) => matches!(
             c,
             '+' | '-' | '×' | '*' | '/' | '^' | '⌈' | '⌊' | '|' | '>' | '<' | '=' | '('
-                | ':' | '→' | '◇' | '◈' | '▷' | '▽' | '□' | '⍳' | '⌽' | '⍴' | '⍉' | '↑' | '↓'
+                | ':' | '→' | '◇' | '◈' | '▷' | '▽' | '□' | '⍳' | '⌽' | '⍴' | '⍉' | '↑' | '↓' | '⌷'
                 | '!' | '$'
         ),
     }
@@ -1579,7 +1606,7 @@ fn check_expr_spaces(expr: &Expr, declared: &HashSet<String>, line: usize) -> Re
         | Expr::AuditTrace(inner) => {
             check_expr_spaces(inner, declared, line)?;
         }
-        Expr::BinaryOp { lhs, rhs, .. } => {
+        Expr::BinaryOp { lhs, rhs, .. } | Expr::Gather { index: lhs, operand: rhs } => {
             check_expr_spaces(lhs, declared, line)?;
             check_expr_spaces(rhs, declared, line)?;
         }
@@ -1666,6 +1693,9 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
             | Expr::Reverse { operand: inner, .. }
             | Expr::Reshape { operand: inner, .. }
             | Expr::AuditTrace(inner) => check_broadcast(inner, shapes, line)?,
+            // The positions are checked like any expression; the space read
+            // is addressed absolutely and need not match them in shape.
+            Expr::Gather { index, .. } => check_broadcast(index, shapes, line)?,
             Expr::Call { args, .. } => {
                 for arg in args {
                     check_broadcast(arg, shapes, line)?;

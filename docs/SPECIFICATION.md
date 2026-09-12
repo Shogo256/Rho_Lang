@@ -48,6 +48,7 @@ principle.
 | `⍴` / `\` | Reshape | — | `2 3 ⍴ X` reads X's cells, in order, into that shape, see §3.8 | ✅ |
 | `⍉` / `'` | Transpose | — | `⍉X` reverses the axes; `1 0 ⍉ X` permutes them, see §3.9 | ✅ |
 | `↑` / `^.` | Take | — | `k ↑ X` keeps the first `k` cells along an axis, the last for negative `k`, see §3.10 | ✅ |
+| `⌷` / `~` | Index by value | — | `I ⌷ X` reads X at the position each cell of I names, zero past its cells, see §3.12 | ✅ |
 | `↓` / `_.` | Drop | — | `k ↓ X` removes them instead, see §3.10 | ✅ |
 | `+` | Addition | Superposition | Element-wise addition | ✅ |
 | `-` | Subtraction | Difference | Element-wise subtraction | ✅ |
@@ -454,6 +455,32 @@ value, and it binds as tightly as the prefix glyphs. Its reads keep their
 order but the result's rows are not the source's, so the sweep stays scalar
 (📋 along the outermost axis it is a plain offset and could keep the vector
 path).
+
+### 3.12 Index by value (`⌷`) ✅
+
+`I ⌷ X` is APL's `⌷` with the cells of I as the positions: each cell of the
+result is the cell of X at the position the matching cell of I names, in X's
+row-major order, or zero where that names no cell of X — a negative number,
+one past the end, NaN or an infinity. A position is taken as a whole number
+by its floor, so `2.9 ⌷ X` is `X[2]`. The result has I's shape; X may be any
+shape, since a position is a place in its order. The ASCII spelling is `~`
+(`@` already spells the binding sigil `&`).
+
+```rho
+((INPUT × 256.0) ⌷ TABLE) → =                    /* a lookup table: gamma, a palette, a transfer curve */
+((((⍳1 X) × 3.0) + (⍳0 X)) ⌷ X) → T              /* cell (i, j) reads cell (j, i): a transpose, by hand */
+(((⍳0 P) × 0.5) ⌷ ROW) → HALF                    /* every other cell: a resampling */
+```
+
+This is the one read whose place the data decides, and it is what a lookup
+table, a colour map, a resampling or warp of an image, a permutation and a
+gather from an index array all are. It binds as tightly as the other glyphs
+(`A + I ⌷ X` is `A + (I ⌷ X)`), its right side is a declared space, and it
+keeps the sweep scalar. The `!` analysis takes the value as some cell of X
+or zero — a claim that holds of X and of zero is proved, `! (I ⌷ SQ >= 0)`
+with `SQ` a square; one that zero breaks is not. There is no scatter — no
+write at a position the data names — since two threads' parts could name
+the same cell.
 
 ### 3.11 Functions (`name:{ … }`) ✅
 

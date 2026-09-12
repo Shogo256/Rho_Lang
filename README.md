@@ -43,6 +43,9 @@ Working prototype. What runs today:
   is a lift, a product and a fold
 - `↑` and `↓`, APL's take and drop, so a window, a tail or a difference
   without its boundary zero has the shape it should
+- `⌷`, index by value: `I ⌷ X` reads X at the positions the cells of I name,
+  zero past its cells — a lookup table, a colour map, a resampling, a
+  permutation, the one read whose place the data decides
 - Functions: `smooth:{ X ((▷X + X + ▽X) / 3.0) }` defines one, `smooth INPUT`
   calls it, `A mix B` calls a function of two between its arguments, and the
   body is copied in at each call — nothing runs at call time, a function is

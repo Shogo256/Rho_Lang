@@ -223,6 +223,7 @@ fn shape_of<S: Numeric>(expr: &Expr, env: &Env<S>, line: usize) -> Result<Option
         | Expr::Index { operand, .. }
         | Expr::Rotate { operand, .. }
         | Expr::Reverse { operand, .. } => shape_of(operand, env, line)?,
+        Expr::Gather { index, .. } => shape_of(index, env, line)?,
         Expr::Reshape { shape, operand } => shape_of(operand, env, line)?.map(|_| shape.clone()),
         Expr::Take { count, axis, operand } | Expr::Drop { count, axis, operand } => {
             match shape_of(operand, env, line)? {
@@ -374,6 +375,25 @@ fn eval_cell<S: Numeric>(
         }
 
         Expr::Call { name, .. } => Err(err(line, format!("the call to `{name}` was not expanded"))),
+
+        // The cell of the operand at the position this cell of the index
+        // names, or zero where it names none. The result carries whatever
+        // the position carried, so a tainted position taints a zero too.
+        Expr::Gather { index: which, operand } => {
+            let inner_shape = shape_of(operand, env, line)?
+                .ok_or_else(|| err(line, "⌷ needs a space to read"))?;
+            let count = inner_shape.iter().product::<usize>().max(1);
+            let position = eval_cell(which, env, tau, line, at_shape, index, lifts)?.floor();
+            let at = position
+                .as_constant()
+                .ok_or_else(|| err(line, "⌷ needs a number for a position"))?;
+            let read = if at >= 0.0 && at < count as f64 {
+                eval_at(operand, env, tau, line, &inner_shape, at as usize)?
+            } else {
+                S::constant(0.0)
+            };
+            Ok(read.carrying(&position))
+        }
 
         // The cell `count` in from the start or the end of the axis, or zero
         // where a take runs past the source.

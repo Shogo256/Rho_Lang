@@ -132,6 +132,9 @@ impl<S: Numeric + Copy> Numeric for Traced<S> {
     fn truth(flag: &bool) -> bool {
         *flag
     }
+    fn carrying(&self, other: &Self) -> Self {
+        Traced::of(self.value, &[self.poisoned, other.poisoned])
+    }
 }
 
 /// Whether the interpreter, run on tainted values at width `S`, reaches the
@@ -294,10 +297,25 @@ fn expression(
             if !transposable.is_empty() && rng.below(4) == 0 {
                 return format!("(⍉{})", transposable[rng.below(transposable.len())]);
             }
-            match rng.below(7) {
+            match rng.below(9) {
                 0 => format!("(⍳{axis}{name})"),
                 1 => format!("({} ⌽{axis} {name})", [-3i64, -2, -1, 1, 2, 3, 5][rng.below(7)]),
                 2 => format!("(⌽{axis}{name})"),
+                // A read at a position the data names: the coordinate moved
+                // by a whole number, which runs past either end, or the
+                // cell's own value scaled, which is fractional, negative or
+                // far out as often as not; the space read is any at all,
+                // since the position is a place in its row-major order.
+                7 => format!(
+                    "((⍳{axis}{name}) + {}) ⌷ {}",
+                    [-2i64, -1, 0, 1, 2, 5][rng.below(6)],
+                    spaces[rng.below(spaces.len())].0
+                ),
+                8 => format!(
+                    "(({name} × {}) ⌷ {})",
+                    ["0.5", "1.0", "3.0", "-2.0"][rng.below(4)],
+                    spaces[rng.below(spaces.len())].0
+                ),
                 // Any space at all reshapes to the wanted shape, reading
                 // round when it is short and cut short when it is long.
                 3 => format!("({} ⍴ {})", dims_of(want), spaces[rng.below(spaces.len())].0),

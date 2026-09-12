@@ -1,0 +1,18 @@
+{
+    /* A lookup table. INPUT holds values in [0, 1); TABLE holds 256 entries
+       of any curve — a gamma, a palette channel, a transfer function. Each
+       cell of INPUT, scaled to a position, reads the entry there: `I ⌷ X`
+       is the cell of X at the position each cell of I names, in X's
+       row-major order, and zero where that is no cell of X (a negative
+       number, one past the end, NaN). The position is taken by its floor.
+
+       The same read with positions built from the coordinates (`⍳`) is a
+       permutation, a resampling or a transpose by hand.
+
+         rhoc examples/lookup.rho
+    */
+    INPUT:◯ □ 64 64
+    TABLE:◯ □ 256
+
+    ((INPUT × 256.0) ⌷ TABLE) → =
+}

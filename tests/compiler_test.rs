@@ -3725,6 +3725,86 @@ fn test_a_read_of_another_cell_is_not_the_other_factor_of_a_square() {
 }
 
 #[test]
+fn test_index_by_value_reads_the_cell_the_data_names() {
+    // `I ⌷ X`: the cell of X at the position each cell of I names, floored;
+    // zero for a position X has not got — negative, past the end, NaN, inf.
+    let source = r#"{
+        INPUT:◯ □ 8 1
+        TABLE:◯ □ 4
+        (INPUT ⌷ TABLE) → =
+    }"#;
+    let positions = vec![0.0, 1.5, 3.0, 4.0, -1.0, f64::NAN, 2.9999, 1e300];
+    let table = vec![10.0, 20.0, 30.0, 40.0];
+    let (out, meant) = kernel_and_interpreter(
+        "gather_basic",
+        source,
+        &[("INPUT", vec![8, 1], positions.clone()), ("TABLE", vec![4], table.clone())],
+    );
+    assert_eq!(bits(&out), bits(&meant));
+    assert_eq!(out, vec![10.0, 20.0, 40.0, 0.0, 0.0, 0.0, 30.0, 0.0]);
+
+    // A position built from the coordinates: the transpose of a 3x3, cell
+    // (i, j) reading cell (j, i), against `⍉`. The ASCII spelling is `~`.
+    let source = r#"{
+        INPUT:◯ □ 3 3
+        (((⍳1 INPUT) × 3.0) + (⍳0 INPUT)) → POS
+        (POS ~ INPUT) → BY_INDEX
+        (BY_INDEX - (⍉INPUT)) → =
+    }"#;
+    let grid: Vec<f64> = (0..9).map(|i| (i as f64 * 1.7).cos()).collect();
+    let (out, meant) = kernel_and_interpreter("gather_transpose", source, &[("INPUT", vec![3, 3], grid)]);
+    assert_eq!(bits(&out), bits(&meant));
+    assert!(out.iter().all(|v| *v == 0.0), "{out:?}");
+
+    // A lookup table applied to a grid: the positions come from the data,
+    // the table from a second input, and the result has the grid's shape.
+    let source = r#"{
+        INPUT:◯ □ 4 4
+        TABLE:◯ □ 16
+        ((INPUT × 16.0) ⌷ TABLE) → =
+    }"#;
+    let values: Vec<f64> = (0..16).map(|i| i as f64 / 16.0 + 0.01).collect();
+    let curve: Vec<f64> = (0..16).map(|i| (i as f64 / 15.0).powf(2.2)).collect();
+    let (out, meant) = kernel_and_interpreter(
+        "gather_lut",
+        source,
+        &[("INPUT", vec![4, 4], values.clone()), ("TABLE", vec![16], curve.clone())],
+    );
+    assert_eq!(bits(&out), bits(&meant));
+    for i in 0..16 {
+        assert_eq!(out[i], curve[i], "cell {i}");
+    }
+
+    // The right side is a space's name; a computed value has no place.
+    let err = parse_rho_program("{\n    INPUT:◯ □ 4\n    (INPUT ⌷ (INPUT + 1.0)) → =\n}").unwrap_err();
+    assert!(err.to_string().contains("space's name"), "{err}");
+
+    // The analysis: the value is some cell of the space or zero, so a claim
+    // that holds of the space and of zero is proved, and one zero breaks is
+    // not.
+    let report = analyze(
+        r#"{
+        INPUT:◯ □ 4
+        (INPUT × INPUT) → SQ
+        ((INPUT × 2.0) ⌷ SQ) → OUTPUT
+        ! (OUTPUT >= 0)
+        OUTPUT → =
+    }"#,
+    );
+    assert_eq!(report.constraints[0].verdict, Verdict::Proved, "{:?}", report.constraints[0]);
+    let report = analyze(
+        r#"{
+        INPUT:◯ □ 4
+        ((INPUT × INPUT) + 1.0) → SQ
+        ((INPUT × 2.0) ⌷ SQ) → OUTPUT
+        ! (OUTPUT >= 1)
+        OUTPUT → =
+    }"#,
+    );
+    assert!(!matches!(report.constraints[0].verdict, Verdict::Proved), "{:?}", report.constraints[0]);
+}
+
+#[test]
 fn test_a_sweep_split_across_threads_gives_the_same_bits() {
     // A grid large enough to be split (the grain is lowered so that even
     // the folds' few lines are), with a shift on each axis, a fold, a scan

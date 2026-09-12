@@ -206,6 +206,15 @@ pub enum Expr {
         axis: Option<usize>,
         operand: Box<Expr>,
     },
+    /// `I ⌷ X` — index by value: the cell of X whose row-major position is
+    /// this cell of I, taken as a whole number (its floor), or zero where
+    /// that is no position of X — negative, past the end, or not a number.
+    /// The result has I's shape. APL's `⌷` with the cells of I as the
+    /// positions: the one read whose place the data decides.
+    Gather {
+        index: Box<Expr>,
+        operand: Box<Expr>,
+    },
     /// `2 3 ⍴ X` — APL's reshape: X's cells in row-major order, read into a
     /// new shape written as a list of literals. With the same number of
     /// cells nothing moves: it is a reinterpretation. With fewer, X is read
@@ -440,6 +449,8 @@ pub fn expr_shape(
         | Expr::Index { operand, .. }
         | Expr::Rotate { operand, .. }
         | Expr::Reverse { operand, .. } => expr_shape(operand, shapes),
+        // The positions' shape is the result's; the space read has no say.
+        Expr::Gather { index, .. } => expr_shape(index, shapes),
         Expr::Reshape { shape, operand } => expr_shape(operand, shapes).map(|_| shape.clone()),
         Expr::Transpose { axes, operand } => {
             let inner = expr_shape(operand, shapes)?;

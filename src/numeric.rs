@@ -45,6 +45,14 @@ pub trait Numeric: Clone + fmt::Debug {
     /// The flag's value. The exit of a `⇒` loop is the one decision in the
     /// language that asks.
     fn truth(flag: &Self::Bool) -> bool;
+
+    /// This value, marked with whatever `other` carries besides its value:
+    /// a number is just itself, a tainted number takes the other's taint.
+    /// A read at a position the data names has the position's taint even
+    /// when it yields zero.
+    fn carrying(&self, _other: &Self) -> Self {
+        self.clone()
+    }
 }
 
 impl Numeric for f64 {

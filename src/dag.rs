@@ -161,7 +161,7 @@ fn extract_dependencies(expr: &Expr) -> Vec<String> {
         | Expr::AuditTrace(inner) => {
             deps.extend(extract_dependencies(inner));
         }
-        Expr::BinaryOp { lhs, rhs, .. } => {
+        Expr::BinaryOp { lhs, rhs, .. } | Expr::Gather { index: lhs, operand: rhs } => {
             deps.extend(extract_dependencies(lhs));
             deps.extend(extract_dependencies(rhs));
         }

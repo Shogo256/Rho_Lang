@@ -660,7 +660,8 @@ impl LlvmCodeGen {
             | Expr::Reverse { .. }
             | Expr::Transpose { .. }
             | Expr::Take { .. }
-            | Expr::Drop { .. } => true,
+            | Expr::Drop { .. }
+            | Expr::Gather { .. } => true,
             // Same count: a reinterpretation, contiguous as the operand is.
             Expr::Reshape { shape, operand } => {
                 match Self::expr_shape(operand, &self.space_shapes) {
@@ -1497,6 +1498,10 @@ impl LlvmCodeGen {
             | Expr::Lift { operand: inner, .. } => {
                 self.reserve_fold_buffers(inner, ir, bufs, counter)?;
             }
+            Expr::Gather { index, operand } => {
+                self.reserve_fold_buffers(index, ir, bufs, counter)?;
+                self.reserve_fold_buffers(operand, ir, bufs, counter)?;
+            }
             Expr::BinaryOp { lhs, rhs, .. } => {
                 self.reserve_fold_buffers(lhs, ir, bufs, counter)?;
                 self.reserve_fold_buffers(rhs, ir, bufs, counter)?;
@@ -1572,6 +1577,10 @@ impl LlvmCodeGen {
             | Expr::Builtin { operand: inner, .. }
             | Expr::Lift { operand: inner, .. } => {
                 block = self.emit_fold_prepass(inner, ir, bufs, &block, counter)?;
+            }
+            Expr::Gather { index, operand } => {
+                block = self.emit_fold_prepass(index, ir, bufs, &block, counter)?;
+                block = self.emit_fold_prepass(operand, ir, bufs, &block, counter)?;
             }
             Expr::BinaryOp { lhs, rhs, .. } => {
                 block = self.emit_fold_prepass(lhs, ir, bufs, &block, counter)?;
@@ -2032,6 +2041,9 @@ impl LlvmCodeGen {
             | Expr::Transpose { .. }
             | Expr::Take { .. }
             | Expr::Drop { .. } => 0,
+            // A gather keeps the sweep scalar too; its positions may hold
+            // shifts, whose reach is theirs.
+            Expr::Gather { index, .. } => self.max_shift_stride(index)?,
             Expr::Call { name, .. } => {
                 return Err(HarmonyDisruption::LoweringErr {
                     line: self.current_line.get(),
@@ -2233,6 +2245,9 @@ impl LlvmCodeGen {
             | Expr::Builtin { operand: inner, .. } => {
                 self.needs_broadcast(inner, result_shape, lifts)
             }
+            // The space is read at an absolute position, never stretched;
+            // the positions are read like anything else.
+            Expr::Gather { index, .. } => self.needs_broadcast(index, result_shape, lifts),
             Expr::Lift { axis, operand } => {
                 let mut nested = lifts.to_vec();
                 nested.push(*axis);
@@ -2715,6 +2730,69 @@ impl LlvmCodeGen {
                     self.precision.bytes()
                 ));
                 Ok(val)
+            }
+
+            // The cell of the space at the position this cell's index names,
+            // floored; zero when that is no cell of it. The position is
+            // clamped before the load and the value chosen after, so an
+            // index that is negative, past the end or NaN touches nothing.
+            Expr::Gather { index, operand } => {
+                let name = Self::place_name(operand).ok_or_else(|| {
+                    HarmonyDisruption::LoweringErr {
+                        line: self.current_line.get(),
+                        detail: "⌷ reads a declared space, so its right side is a space's name, not a computed value. Flow the sub-expression into its own space first.".to_string(),
+                    }
+                })?;
+                if matches!(mode, Mode::Vector(..)) {
+                    return Err(HarmonyDisruption::LoweringErr {
+                        line: self.current_line.get(),
+                        detail: "internal: a gather reached the vector path".to_string(),
+                    });
+                }
+                let ptr = self.lookup(bufs, &name)?;
+                let count = self.shape_for(&name).iter().product::<usize>().max(1);
+                let position =
+                    self.emit_expr(index, ir, bufs, idx, counter, mode, result_shape, lifts)?;
+                let elem = self.precision.llvm_type();
+                let suffix = self.precision.intrinsic_suffix();
+                let floored = Self::fresh(counter);
+                let not_before = Self::fresh(counter);
+                let not_past = Self::fresh(counter);
+                let inside = Self::fresh(counter);
+                let safe = Self::fresh(counter);
+                let at = Self::fresh(counter);
+                let gep = Self::fresh(counter);
+                let val = Self::fresh(counter);
+                let out = Self::fresh(counter);
+                ir.push_str(&format!(
+                    "  {floored} = call {elem} @llvm.floor.{suffix}({elem} {position})\n"
+                ));
+                ir.push_str(&format!(
+                    "  {not_before} = fcmp oge {elem} {floored}, {}\n",
+                    self.f64_literal(0.0)
+                ));
+                ir.push_str(&format!(
+                    "  {not_past} = fcmp olt {elem} {floored}, {}\n",
+                    self.f64_literal(count as f64)
+                ));
+                ir.push_str(&format!("  {inside} = and i1 {not_before}, {not_past}\n"));
+                ir.push_str(&format!(
+                    "  {safe} = select i1 {inside}, {elem} {floored}, {elem} {}\n",
+                    self.f64_literal(0.0)
+                ));
+                ir.push_str(&format!("  {at} = fptosi {elem} {safe} to i64\n"));
+                ir.push_str(&format!(
+                    "  {gep} = getelementptr inbounds {elem}, ptr {ptr}, i64 {at}\n"
+                ));
+                ir.push_str(&format!(
+                    "  {val} = load {elem}, ptr {gep}, align {}\n",
+                    self.precision.bytes()
+                ));
+                ir.push_str(&format!(
+                    "  {out} = select i1 {inside}, {elem} {val}, {elem} {}\n",
+                    self.f64_literal(0.0)
+                ));
+                Ok(out)
             }
 
             // The coordinate of the cell along one axis of the operand's

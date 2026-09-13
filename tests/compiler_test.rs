@@ -4129,9 +4129,71 @@ fn test_a_fixed_point_circuit_synthesises() {
 }
 
 #[test]
+fn test_a_broadcast_is_a_replay_out_of_memory() {
+    if !verilator_available() {
+        eprintln!("verilator not found: circuit test skipped");
+        return;
+    }
+    use rho_lang::codegen::sv::Numbers;
+    use rho_lang::numeric::Fixed;
+    type Q = Fixed<32, 16>;
+    // A matrix product: two inputs of different shapes stretched against
+    // [2, 3, 4], the fold's operand a replay with no streamed source at all,
+    // the two spaces read out of memory at the mapped place.
+    let matmul = "{\n    A:◯ □ 2 3 1\n    B:◯ □ 1 3 4\n    ◇+1 (A × B) → OUTPUT\n    OUTPUT → =\n}";
+    let a: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b: Vec<f64> = vec![1.0, 0.0, 2.0, 1.0, 0.0, 1.0, 1.0, 2.0, 3.0, 1.0, 0.0, 1.0];
+    // Each row's mean subtracted from it: the fold's sparse stream lifted
+    // back against the dense input, so both are captured and replayed.
+    let centre = "{\n    INPUT:◯ □ 4 16\n    (INPUT - (□1 ((◇+1 INPUT) / 16.0))) → =\n}";
+    // A declared space one wide along an axis, stretched.
+    let stretch = "{\n    INPUT:◯ □ 4 16\n    ROW:◯ □ 4 1\n    ((INPUT × ROW) + (▷1INPUT)) → =\n}";
+    let grid: Vec<f64> = (0..64).map(|i| ((i as f64) * 0.37).sin() * 2.0 + (i % 5) as f64 * 0.25).collect();
+    let row: Vec<f64> = vec![0.5, -1.0, 2.0, 0.25];
+    type Spaces = Vec<(&'static str, Vec<usize>, Vec<f64>)>;
+    let cases: [(&str, &str, Spaces); 3] = [
+        ("matmul", matmul, vec![("A", vec![2, 3, 1], a.clone()), ("B", vec![1, 3, 4], b.clone())]),
+        ("centre", centre, vec![("INPUT", vec![4, 16], grid.clone())]),
+        ("stretch", stretch, vec![("INPUT", vec![4, 16], grid.clone()), ("ROW", vec![4, 1], row.clone())]),
+    ];
+    for (name, source, inputs) in &cases {
+        let block = parse_rho_program(source).unwrap();
+        for numbers in [Numbers::Real, Numbers::Fixed { width: 32, frac: 16 }] {
+            let meant: Vec<f64> = match numbers {
+                Numbers::Real => {
+                    let mut env: Env<f64> = Env::new();
+                    for (n, shape, data) in inputs {
+                        env.insert(n.to_string(), Grid::from(shape.clone(), data.clone()));
+                    }
+                    interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone()
+                }
+                Numbers::Fixed { .. } => {
+                    let mut env: Env<Q> = Env::new();
+                    for (n, shape, data) in inputs {
+                        env.insert(n.to_string(), Grid::from(shape.clone(), data.iter().map(|v| Q::from_f64(*v)).collect()));
+                    }
+                    interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.iter().map(|c| c.to_f64()).collect()
+                }
+            };
+            let circuit = rho_lang::codegen::sv::emit(&block, 0.0, None, numbers).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(circuit.module.contains("replay for stage"), "{name}: {}", circuit.module);
+            let dir = format!("target/sv_bc_{name}_{}", if matches!(numbers, Numbers::Real) { "real" } else { "fixed" });
+            let feed: Vec<Vec<f64>> = circuit.inputs.iter().map(|(n, _)| inputs.iter().find(|(m, _, _)| m == n).unwrap().2.clone()).collect();
+            let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new(&dir), &feed).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(bits(&run.output), bits(&meant), "{name} {numbers:?}: circuit vs interpreter\n{}", circuit.module);
+        }
+    }
+    // By hand: the product's first row is A[0] · B = [10, 5, 4, 8].
+    let block = parse_rho_program(matmul).unwrap();
+    let circuit = rho_lang::codegen::sv::emit(&block, 0.0, None, Numbers::Real).unwrap();
+    let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new("target/sv_bc_matmul_real"), &[a, b]).unwrap();
+    assert_eq!(&run.output[..4], &[10.0, 5.0, 4.0, 8.0]);
+}
+
+#[test]
 fn test_what_is_not_yet_a_circuit_says_so() {
     for (source, what) in [
-        ("{\n    INPUT:◯ □ 4 4\n    (INPUT - (□1 (◇+1 INPUT))) → =\n}", "lift"),
+        ("{\n    INPUT:◯ □ 4 4\n    ROW:◯ □ 4 1\n    INPUT → X\n    ((X × 0.5) + ROW) ⇒ X\n    X → =\n}", "broadcast inside"),
         ("{\n    INPUT:◯ □ 4 4\n    INPUT → X\n    ((X × 0.5) + (□1 (◇+1 X))) ⇒ X\n    X → =\n}", "fold inside"),
         ("{\n    INPUT:◯ □ 4 4\n    ((1 ⌽ INPUT) + INPUT) → =\n}", "rotation"),
     ] {

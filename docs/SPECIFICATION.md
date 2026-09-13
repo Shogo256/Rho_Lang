@@ -890,6 +890,19 @@ is left on the critical path is the 32-bit adder chain of a stage and the
 accumulator of a fold; a division by a constant that is not a power of two
 is still a divider.
 
+A flow whose sources do not share one timing — a fold's sparse stream and
+the dense input it came from, say — or that stretches a smaller space
+against the result (`□`, a length-1 axis) is a replay. Every source is
+captured into a memory as its stream arrives; once all are there the
+result's cells are streamed out in order, the sources of the result's shape
+streamed back as lines the stage reads as ever, the broadcast ones read out
+of their memory at the mapped place — the cell's coordinates along the axes
+the source has, zero where it is one wide, nothing for an axis a lift put
+there. A matrix product, `◇+1 (A × B)` of a [2, 3, 1] and a [1, 3, 4], is
+a replay with no streamed source at all: 24 places read out of two
+memories into one accumulator. Subtracting each row's mean is the fold's
+stream captured next to the input and both replayed.
+
 A `⇒` is a loop around a stage. The spaces the update reads are captured
 into memories as their streams arrive — the target into one of two buffers
 — and once all are there, each round streams every source out of its memory
@@ -904,11 +917,11 @@ round costs the cells plus the pipeline's drain.
 
 In the subset: `→`, arithmetic, comparisons as masks, `⌈ ⌊ |`, the named
 functions, `?`, `⌊X` `⌈X`, `⍳`, shifts along any axis, folds and scans along
-any axis, chains of flows, several inputs, `⇒` with an expression body, and
-all of it in `real` or in fixed point. Not yet, and said so with a line:
-lifts and any broadcast, the turns, `⌷`, a fold or a body of flows inside
-`⇒`, a flow that reads two streams of different timing (a fold's or a
-loop's and a dense one), and in fixed point the transcendental functions.
+any axis, lifts and broadcasts, chains of flows, several inputs, `⇒` with
+an expression body, and all of it in `real` or in fixed point. Not yet, and
+said so with a line: the turns, `⌷`, a fold, a broadcast or a body of flows
+inside `⇒`, a shift of a lifted space, and in fixed point the transcendental
+functions.
 
 ## 8. Precision ✅
 

@@ -32,8 +32,12 @@
 //! reads are captured into memories, streamed out again every round through
 //! an update stage into a second buffer while the largest move is taken,
 //! until the move is within 𝜏 or the cap is reached, and the result is
-//! streamed out for what follows. Not yet: lifts, the turns, `⌷`, a fold
-//! inside `⇒`, and a flow that mixes a fold's or a loop's stream with another.
+//! streamed out for what follows. A flow whose sources do not share one
+//! timing, or that broadcasts a smaller space (`□`, a length-1 axis), is a
+//! replay: its sources are captured into memories and the result's cells
+//! are streamed out of them, the broadcast ones read at the mapped place —
+//! which is what makes a matrix product a circuit. Not yet: the turns,
+//! `⌷`, a fold or a broadcast inside `⇒`.
 
 use crate::ast::*;
 use crate::error::{HarmonyDisruption, Result};
@@ -163,6 +167,26 @@ struct Stage {
     kind: Kind,
     /// For the update stage of a `⇒`: the signal that starts a round afresh.
     round_reset: Option<String>,
+    /// For a stage with no streamed source: the valid that paces it.
+    timing: Option<String>,
+}
+
+/// A space read at a mapped place rather than streamed: its memory, its own
+/// shape, and which axes of the view a lift put there.
+#[derive(Clone, Debug)]
+struct BroadcastRead {
+    memory: String,
+    source_shape: Vec<usize>,
+    lifted: Vec<bool>,
+}
+
+/// A stage whose sources are captured and streamed back in the result's
+/// order: the main ones as streams, the broadcast ones read by place.
+struct Replay {
+    id: usize,
+    cells: usize,
+    main: Vec<(String, Stream)>,
+    broadcast: Vec<(String, Stream)>,
 }
 
 /// A `⇒`: which stage updates, what it reads, and where the result goes.
@@ -179,7 +203,7 @@ struct Loop {
 
 /// Where a stream's timing comes from: the dense inputs of one shape, or
 /// one fold's completions. Streams of one origin differ by whole clocks.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Origin(String);
 
 /// A stream: the signal, its valid, its latency, its origin, and the cells it carries.
@@ -247,7 +271,9 @@ fn sources(expr: &Expr, shapes: &BTreeMap<String, Vec<usize>>, line: usize) -> R
             // A fold or scan was made a stage of its own before this walk;
             // only its name is left in the expression.
             Expr::Reduce { .. } | Expr::Scan { .. } => return Err(unsupported("a fold inside a fold's own line", line)),
-            Expr::Lift { .. } => return Err(unsupported("a lift (`□`)", line)),
+            // A lift reads its space at a mapped place; the place is the
+            // stage's business (see `usage`), the space is a source.
+            Expr::Lift { operand, .. } => walk(operand, shapes, line, out, reach)?,
             Expr::Rotate { .. } | Expr::Reverse { .. } => return Err(unsupported("a rotation or reversal", line)),
             Expr::Reshape { .. } | Expr::Transpose { .. } => return Err(unsupported("a reshape or transpose", line)),
             Expr::Take { .. } | Expr::Drop { .. } => return Err(unsupported("a take or drop", line)),
@@ -264,6 +290,59 @@ fn is_tau(name: &str) -> bool {
     name == "𝜏" || name == "τ"
 }
 
+/// How each space is read: the lifts around it, which must be the same at
+/// every read; a shift or `⍳` cannot read a lifted space.
+fn usage(expr: &Expr, line: usize, lifts: &mut Vec<usize>, out: &mut BTreeMap<String, Vec<usize>>) -> Result<()> {
+    match expr {
+        Expr::Var(name) => {
+            if is_tau(name) {
+                return Ok(());
+            }
+            match out.get(name) {
+                Some(seen) if *seen != *lifts => {
+                    return Err(unsupported(&format!("`{name}` read with two different lifts"), line))
+                }
+                _ => {
+                    out.insert(name.clone(), lifts.clone());
+                }
+            }
+        }
+        Expr::Lift { axis, operand } => {
+            lifts.push(*axis);
+            usage(operand, line, lifts, out)?;
+            lifts.pop();
+        }
+        Expr::Shift { operand, .. } | Expr::Index { operand, .. } => {
+            if !lifts.is_empty() {
+                return Err(unsupported("a shift or `⍳` of a lifted space", line));
+            }
+            usage(operand, line, lifts, out)?;
+        }
+        Expr::AuditTrace(inner) | Expr::Builtin { operand: inner, .. } => usage(inner, line, lifts, out)?,
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            usage(lhs, line, lifts, out)?;
+            usage(rhs, line, lifts, out)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The shape a space is viewed at under `lifts`, and which of the view's
+/// axes the lifts put there.
+fn lifted_view(shape: &[usize], lifts: &[usize]) -> Option<(Vec<usize>, Vec<bool>)> {
+    let mut view = shape.to_vec();
+    let mut marks = vec![false; shape.len()];
+    for &axis in lifts.iter().rev() {
+        if axis > view.len() {
+            return None;
+        }
+        view.insert(axis, 1);
+        marks.insert(axis, true);
+    }
+    Some((view, marks))
+}
+
 /// One stage's expression over its chains, as SystemVerilog `real`.
 struct Lowering<'a> {
     shapes: &'a BTreeMap<String, Vec<usize>>,
@@ -275,18 +354,60 @@ struct Lowering<'a> {
     tau: f64,
     line: usize,
     numbers: Numbers,
+    /// Spaces read by place out of a memory rather than from a stream.
+    broadcast: &'a BTreeMap<String, BroadcastRead>,
 }
 
 impl Lowering<'_> {
     fn lower(&self, expr: &Expr) -> Result<String> {
+        self.lower_with(expr, &[])
+    }
+
+    /// The place in a broadcast source's memory that this cell reads: its
+    /// coordinates along the axes the source has, zero where the source is
+    /// one wide, nothing for an axis a lift put there.
+    fn place(&self, read: &BroadcastRead) -> String {
+        let mut terms: Vec<String> = Vec::new();
+        let mut j = 0usize;
+        for (a, lifted) in read.lifted.iter().enumerate() {
+            if *lifted {
+                continue;
+            }
+            let extent = read.source_shape.get(j).copied().unwrap_or(1);
+            let stride: usize = read.source_shape[j + 1..].iter().product::<usize>().max(1);
+            if extent > 1 && a < self.shape.len() {
+                terms.push(if stride == 1 {
+                    format!("pos[{a}]")
+                } else {
+                    format!("(pos[{a}] * {stride})")
+                });
+            }
+            j += 1;
+        }
+        if terms.is_empty() {
+            "0".to_string()
+        } else {
+            terms.join(" + ")
+        }
+    }
+
+    fn lower_with(&self, expr: &Expr, lifts: &[usize]) -> Result<String> {
         Ok(match expr {
             Expr::Number(v) => self.numbers.lit(*v),
             Expr::Var(name) if is_tau(name) => self.numbers.lit(self.tau),
-            Expr::Var(name) => {
-                let (_, _, _, _, centre) = &self.chains[name];
-                format!("c{}_{}[{centre}]", self.stage, ident(name))
+            Expr::Var(name) => match self.broadcast.get(name) {
+                Some(read) => format!("{}[{}]", read.memory, self.place(read)),
+                None => {
+                    let (_, _, _, _, centre) = &self.chains[name];
+                    format!("c{}_{}[{centre}]", self.stage, ident(name))
+                }
+            },
+            Expr::Lift { axis, operand } => {
+                let mut nested = lifts.to_vec();
+                nested.push(*axis);
+                self.lower_with(operand, &nested)?
             }
-            Expr::AuditTrace(inner) => self.lower(inner)?,
+            Expr::AuditTrace(inner) => self.lower_with(inner, lifts)?,
             Expr::Shift { dir, axis, operand } => {
                 let Expr::Var(name) = &**operand else {
                     return Err(unsupported("a shift of a computed value", self.line));
@@ -455,6 +576,7 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
         .collect();
     let mut stages: Vec<Stage> = Vec::new();
     let mut loops: Vec<Loop> = Vec::new();
+    let mut replays: Vec<Replay> = Vec::new();
     let mut written: BTreeSet<String> = BTreeSet::new();
     let mut folds_made = 0usize;
 
@@ -507,6 +629,11 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
                     captured.push((s.clone(), stream));
                 }
                 let renamed = rename(src, &|name: &str| format!("{name}⟳{id}"));
+                // Inside a loop every source is streamed by the round; a
+                // source of another shape would need capturing per round.
+                if srcs.iter().any(|s| shapes.get(s) != Some(&shape)) || has_lift(src) {
+                    return Err(unsupported("a broadcast inside `⇒`", line));
+                }
                 let mut stage = plan_stage(
                     &renamed,
                     &format!("{target}⟳{id}"),
@@ -515,9 +642,10 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
                     line,
                     tau,
                     numbers,
-                    &shapes,
-                    &streams,
+                    &mut shapes,
+                    &mut streams,
                     stages.len(),
+                    &mut replays,
                 )?;
                 stage.round_reset = Some(format!("rs{id}"));
                 let update = stage.index;
@@ -551,7 +679,7 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
                 };
                 // Every fold or scan in the expression becomes a stage first,
                 // innermost first, and its name stands in the expression.
-                let src = extract_folds(src, line, tau, numbers, &mut shapes, &mut streams, &mut stages, &mut folds_made)?;
+                let src = extract_folds(src, line, tau, numbers, &mut shapes, &mut streams, &mut stages, &mut folds_made, &mut replays)?;
                 let shape = expr_shape(&src, &shapes)
                     .or_else(|| shapes.get(&target).cloned())
                     .ok_or_else(|| unsupported("a flow with no shape", line))?;
@@ -563,9 +691,10 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
                     line,
                     tau,
                     numbers,
-                    &shapes,
-                    &streams,
+                    &mut shapes,
+                    &mut streams,
                     stages.len(),
+                    &mut replays,
                 )?;
                 let cells = shape.iter().product::<usize>().max(1);
                 let origin = stage_origin(&stage, &streams);
@@ -647,6 +776,9 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
         let _ = writeln!(sv, "  end");
     }
     for stage in &stages {
+        if let Some(r) = replays.iter().find(|r| r.id == stage.index) {
+            emit_replay(&mut sv, r, numbers);
+        }
         if let Some(l) = loops.iter().find(|l| l.update == stage.index) {
             emit_loop_declarations(&mut sv, l, numbers);
         }
@@ -750,14 +882,15 @@ fn extract_folds(
     streams: &mut BTreeMap<String, Stream>,
     stages: &mut Vec<Stage>,
     made: &mut usize,
+    replays: &mut Vec<Replay>,
 ) -> Result<Expr> {
-    let sub = |e: &Expr, shapes: &mut BTreeMap<String, Vec<usize>>, streams: &mut BTreeMap<String, Stream>, stages: &mut Vec<Stage>, made: &mut usize| -> Result<Box<Expr>> {
-        Ok(Box::new(extract_folds(e, line, tau, numbers, shapes, streams, stages, made)?))
+    let sub = |e: &Expr, shapes: &mut BTreeMap<String, Vec<usize>>, streams: &mut BTreeMap<String, Stream>, stages: &mut Vec<Stage>, made: &mut usize, replays: &mut Vec<Replay>| -> Result<Box<Expr>> {
+        Ok(Box::new(extract_folds(e, line, tau, numbers, shapes, streams, stages, made, replays)?))
     };
     Ok(match expr {
         Expr::Reduce { op, axis, operand } | Expr::Scan { op, axis, operand } => {
             let running = matches!(expr, Expr::Scan { .. });
-            let operand = extract_folds(operand, line, tau, numbers, shapes, streams, stages, made)?;
+            let operand = extract_folds(operand, line, tau, numbers, shapes, streams, stages, made, replays)?;
             let in_shape = expr_shape(&operand, shapes).ok_or_else(|| unsupported("a fold with no shape", line))?;
             let a = axis.unwrap_or_else(|| default_axis(&in_shape));
             if a >= in_shape.len() {
@@ -776,6 +909,7 @@ fn extract_folds(
                 shapes,
                 streams,
                 stages.len(),
+                replays,
             )?;
             let out_shape = if running { in_shape.clone() } else { shape_without_axis(&in_shape, a) };
             let cells = out_shape.iter().product::<usize>().max(1);
@@ -799,12 +933,13 @@ fn extract_folds(
             Expr::Var(name)
         }
         Expr::Number(_) | Expr::Var(_) => expr.clone(),
-        Expr::AuditTrace(inner) => Expr::AuditTrace(sub(inner, shapes, streams, stages, made)?),
-        Expr::Builtin { op, operand } => Expr::Builtin { op: *op, operand: sub(operand, shapes, streams, stages, made)? },
+        Expr::AuditTrace(inner) => Expr::AuditTrace(sub(inner, shapes, streams, stages, made, replays)?),
+        Expr::Builtin { op, operand } => Expr::Builtin { op: *op, operand: sub(operand, shapes, streams, stages, made, replays)? },
+        Expr::Lift { axis, operand } => Expr::Lift { axis: *axis, operand: sub(operand, shapes, streams, stages, made, replays)? },
         Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp {
             op: op.clone(),
-            lhs: sub(lhs, shapes, streams, stages, made)?,
-            rhs: sub(rhs, shapes, streams, stages, made)?,
+            lhs: sub(lhs, shapes, streams, stages, made, replays)?,
+            rhs: sub(rhs, shapes, streams, stages, made, replays)?,
         },
         // Anything else keeps its shape here and is judged by `sources`.
         other => other.clone(),
@@ -832,55 +967,114 @@ fn plan_stage(
     line: usize,
     tau: f64,
     numbers: Numbers,
-    shapes: &BTreeMap<String, Vec<usize>>,
-    streams: &BTreeMap<String, Stream>,
+    shapes: &mut BTreeMap<String, Vec<usize>>,
+    streams: &mut BTreeMap<String, Stream>,
     index: usize,
+    replays: &mut Vec<Replay>,
 ) -> Result<Stage> {
     let (srcs, reach) = sources(src, shapes, line)?;
-    let mut origin: Option<Origin> = None;
-    for s in &srcs {
-        if shapes.get(s) != Some(&shape) {
-            return Err(unsupported(
-                &format!("a broadcast (`{s}` is {:?}, the flow {:?})", shapes.get(s), shape),
-                line,
-            ));
-        }
-        let stream = streams.get(s).ok_or_else(|| HarmonyDisruption::SpaceErr {
-            space_name: s.clone(),
-            line,
-        })?;
-        match &origin {
-            None => origin = Some(stream.origin.clone()),
-            Some(o) if *o != stream.origin => {
-                return Err(unsupported(
-                    &format!("a flow reading two streams of different timing (`{s}` and another)"),
-                    line,
-                ))
-            }
-            _ => {}
-        }
-    }
     if srcs.is_empty() {
         return Err(unsupported("a flow with no space in it", line));
     }
-    let base = srcs.iter().map(|s| streams[s].latency).max().unwrap_or(1);
-    // A fold's stream is sparse: its cells are aligned by clocks only when
-    // they left at the same clock, so two latencies are refused.
-    let sparse = origin.as_ref().is_some_and(|o| o.0.starts_with("fold"));
-    if sparse && srcs.iter().any(|s| streams[s].latency != base) {
-        return Err(unsupported("a flow reading a fold's stream at two latencies", line));
+    let mut lifts_of: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    usage(src, line, &mut Vec::new(), &mut lifts_of)?;
+    // Main sources have the result's shape and stream; broadcast ones are
+    // read by place.
+    let mut main: Vec<String> = Vec::new();
+    let mut broadcast: BTreeMap<String, BroadcastRead> = BTreeMap::new();
+    for s in &srcs {
+        let source_shape = shapes.get(s).cloned().ok_or_else(|| HarmonyDisruption::SpaceErr {
+            space_name: s.clone(),
+            line,
+        })?;
+        if !streams.contains_key(s) {
+            return Err(HarmonyDisruption::SpaceErr {
+                space_name: s.clone(),
+                line,
+            });
+        }
+        let lifts = lifts_of.get(s).cloned().unwrap_or_default();
+        if lifts.is_empty() && source_shape == shape {
+            main.push(s.clone());
+            continue;
+        }
+        let (view, lifted) = lifted_view(&source_shape, &lifts)
+            .ok_or_else(|| unsupported(&format!("the lift of `{s}`"), line))?;
+        let stretches = view.len() == shape.len()
+            && view.iter().zip(&shape).all(|(v, r)| v == r || *v == 1);
+        if !stretches {
+            return Err(unsupported(
+                &format!("`{s}` viewed as {view:?} against a flow of {shape:?}"),
+                line,
+            ));
+        }
+        broadcast.insert(
+            s.clone(),
+            BroadcastRead {
+                memory: format!("m{index}_{}", ident(s)),
+                source_shape,
+                lifted,
+            },
+        );
     }
+    let origins: BTreeSet<Origin> = main.iter().map(|s| streams[s].origin.clone()).collect();
+    let base = main.iter().map(|s| streams[s].latency).max().unwrap_or(1);
+    let sparse = origins.iter().any(|o| o.0.starts_with("fold"));
+    let uneven = sparse && main.iter().any(|s| streams[s].latency != base);
+    let replay = !broadcast.is_empty() || origins.len() > 1 || uneven;
+
+    // A replay captures every source and streams the main ones back under
+    // aliases; the expression reads the aliases.
+    type Chains = BTreeMap<String, (String, String, usize, usize, usize)>;
+    let (src, chains, timing, base): (Expr, Chains, Option<String>, usize) = if replay {
+        let mut captured_main: Vec<(String, Stream)> = Vec::new();
+        let mut renamed: BTreeMap<String, String> = BTreeMap::new();
+        let cells = shape.iter().product::<usize>().max(1);
+        for s in &main {
+            let alias = format!("{s}⟳r{index}");
+            shapes.insert(alias.clone(), shapes[s].clone());
+            streams.insert(
+                alias.clone(),
+                Stream {
+                    value: format!("rr{index}_{}", ident(s)),
+                    valid: format!("rv{index}"),
+                    latency: 1,
+                    origin: Origin(format!("replay{index}")),
+                    cells,
+                },
+            );
+            captured_main.push((s.clone(), streams[s].clone()));
+            renamed.insert(s.clone(), alias);
+        }
+        let captured_broadcast: Vec<(String, Stream)> =
+            broadcast.keys().map(|s| (s.clone(), streams[s].clone())).collect();
+        replays.push(Replay {
+            id: index,
+            cells,
+            main: captured_main,
+            broadcast: captured_broadcast,
+        });
+        let src = rename(src, &|name: &str| renamed.get(name).cloned().unwrap_or_else(|| name.to_string()));
+        let chains: Chains = renamed
+            .values()
+            .map(|alias| {
+                let st = &streams[alias];
+                (alias.clone(), (st.value.clone(), st.valid.clone(), st.latency, 2 * reach + 1, reach))
+            })
+            .collect();
+        let timing = if renamed.is_empty() { Some(format!("rv{index}")) } else { None };
+        (src, chains, timing, 1)
+    } else {
+        let chains: Chains = main
+            .iter()
+            .map(|s| {
+                let st = &streams[s];
+                (s.clone(), (st.value.clone(), st.valid.clone(), st.latency, 2 * reach + 1, reach))
+            })
+            .collect();
+        (src.clone(), chains, None, base)
+    };
     let stage_latency = base + reach + 2;
-    let chains: BTreeMap<String, (String, String, usize, usize, usize)> = srcs
-        .iter()
-        .map(|s| {
-            let st = &streams[s];
-            (
-                s.clone(),
-                (st.value.clone(), st.valid.clone(), st.latency, 2 * reach + 1, reach),
-            )
-        })
-        .collect();
     let lowering = Lowering {
         shapes,
         chains: &chains,
@@ -889,9 +1083,9 @@ fn plan_stage(
         tau,
         line,
         numbers,
+        broadcast: &broadcast,
     };
-    let expr = lowering.lower(src)?;
-    let _ = lowering.shape;
+    let expr = lowering.lower(&src)?;
     Ok(Stage {
         index,
         target: target.to_string(),
@@ -902,7 +1096,59 @@ fn plan_stage(
         expr,
         kind,
         round_reset: None,
+        timing,
     })
+}
+
+/// A replay's memories, capture and read-out, ahead of its stage.
+fn emit_replay(sv: &mut String, r: &Replay, numbers: Numbers) {
+    let k = r.id;
+    let ty = numbers.ty();
+    let _ = writeln!(sv);
+    let _ = writeln!(sv, "  // ---- replay for stage {k}: {} cells streamed back out of memory", r.cells);
+    let all: Vec<&(String, Stream)> = r.main.iter().chain(r.broadcast.iter()).collect();
+    for (name, stream) in &all {
+        let sid = ident(name);
+        let _ = writeln!(sv, "  {ty} m{k}_{sid} [0:{}];  // {name}, captured", stream.cells - 1);
+        let _ = writeln!(sv, "  logic [{}:0] cap{k}_{sid};", bits(stream.cells) - 1);
+    }
+    for (name, _) in &r.main {
+        let _ = writeln!(sv, "  {ty} rr{k}_{};  // {name} streamed back", ident(name));
+    }
+    let _ = writeln!(sv, "  logic rv{k};");
+    let _ = writeln!(sv, "  logic [1:0] rst{k};  // 0 capture, 1 read, 2 done");
+    let _ = writeln!(sv, "  logic [{}:0] ri{k};", bits(r.cells) - 1);
+    let _ = writeln!(sv, "  always_ff @(posedge clk) begin : replay{k}");
+    let _ = writeln!(sv, "    logic all_captured;");
+    let _ = writeln!(sv, "    if (rst) begin");
+    let zero: Vec<String> = all.iter().map(|(n, _)| format!("cap{k}_{} <= 0", ident(n))).collect();
+    let _ = writeln!(sv, "      {}; rv{k} <= 1'b0; rst{k} <= 0; ri{k} <= 0;", zero.join("; "));
+    let _ = writeln!(sv, "    end else begin");
+    let _ = writeln!(sv, "      rv{k} <= 1'b0;");
+    for (name, stream) in &all {
+        let sid = ident(name);
+        let _ = writeln!(
+            sv,
+            "      if (rst{k} == 0 && {} && cap{k}_{sid} < {}) begin m{k}_{sid}[cap{k}_{sid}] <= {}; cap{k}_{sid} <= cap{k}_{sid} + 1; end",
+            stream.valid, stream.cells, stream.value
+        );
+    }
+    let done: Vec<String> = all.iter().map(|(n, st)| format!("(cap{k}_{} == {})", ident(n), st.cells)).collect();
+    let _ = writeln!(sv, "      all_captured = {};", done.join(" && "));
+    let _ = writeln!(sv, "      case (rst{k})");
+    let _ = writeln!(sv, "        0: if (all_captured) begin rst{k} <= 1; ri{k} <= 0; end");
+    let _ = writeln!(sv, "        1: begin");
+    for (name, _) in &r.main {
+        let sid = ident(name);
+        let _ = writeln!(sv, "          rr{k}_{sid} <= m{k}_{sid}[ri{k}];");
+    }
+    let _ = writeln!(sv, "          rv{k} <= 1'b1;");
+    let _ = writeln!(sv, "          if (ri{k} == {}) rst{k} <= 2; else ri{k} <= ri{k} + 1;", r.cells - 1);
+    let _ = writeln!(sv, "        end");
+    let _ = writeln!(sv, "        default: ;");
+    let _ = writeln!(sv, "      endcase");
+    let _ = writeln!(sv, "    end");
+    let _ = writeln!(sv, "  end");
 }
 
 /// Whether a fold or scan sits anywhere in the expression.
@@ -926,6 +1172,16 @@ fn has_fold(expr: &Expr) -> bool {
     }
 }
 
+/// Whether a lift sits anywhere in the expression.
+fn has_lift(expr: &Expr) -> bool {
+    match expr {
+        Expr::Lift { .. } => true,
+        Expr::AuditTrace(inner) | Expr::Builtin { operand: inner, .. } | Expr::Shift { operand: inner, .. } => has_lift(inner),
+        Expr::BinaryOp { lhs, rhs, .. } => has_lift(lhs) || has_lift(rhs),
+        _ => false,
+    }
+}
+
 /// The expression with every space name mapped through `f`.
 fn rename(expr: &Expr, f: &dyn Fn(&str) -> String) -> Expr {
     let sub = |e: &Expr| Box::new(rename(e, f));
@@ -936,6 +1192,7 @@ fn rename(expr: &Expr, f: &dyn Fn(&str) -> String) -> Expr {
         Expr::Builtin { op, operand } => Expr::Builtin { op: *op, operand: sub(operand) },
         Expr::Shift { dir, axis, operand } => Expr::Shift { dir: *dir, axis: *axis, operand: sub(operand) },
         Expr::Index { axis, operand } => Expr::Index { axis: *axis, operand: sub(operand) },
+        Expr::Lift { axis, operand } => Expr::Lift { axis: *axis, operand: sub(operand) },
         Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp { op: op.clone(), lhs: sub(lhs), rhs: sub(rhs) },
         other => other.clone(),
     }
@@ -1083,7 +1340,7 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
         stage.latency
     );
     // Sources aligned to the latest of them, value and valid together.
-    let first_src = stage.chains.keys().next().cloned().unwrap();
+    let first_src = stage.chains.keys().next().cloned();
     for (src, (value, valid, latency, _, _)) in &stage.chains {
         let sid = ident(src);
         let delay = base - latency;
@@ -1101,8 +1358,11 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
             let _ = writeln!(sv, "  logic av{k}_{sid}; assign av{k}_{sid} = adv{k}_{sid}[{}];", delay - 1);
         }
     }
-    let src_cells = streams[&first_src].cells;
-    let fsid = ident(&first_src);
+    // A stage with no streamed source is paced by its replay's valid.
+    let (src_cells, pace) = match &first_src {
+        Some(name) => (streams[name].cells, format!("av{k}_{}", ident(name))),
+        None => (cells, stage.timing.clone().unwrap_or_else(|| "1'b0".to_string())),
+    };
     // Counters as wide as what they count, and the cell's coordinates kept
     // as counters with a carry rather than divided out of an index: what
     // sets the clock rate once the arithmetic is narrow.
@@ -1110,7 +1370,7 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
     let _ = writeln!(sv, "  // cells entered, real cells entered, zeros pushed through after the last, cells computed");
     let _ = writeln!(sv, "  logic [{}:0] n{k}_in, n{k}_real, n{k}_flushed, nc{k};", cw - 1);
     let _ = writeln!(sv, "  logic v{k}_src, fl{k}, en{k};");
-    let _ = writeln!(sv, "  assign v{k}_src = av{k}_{fsid};");
+    let _ = writeln!(sv, "  assign v{k}_src = {pace};");
     let _ = writeln!(
         sv,
         "  assign fl{k} = (n{k}_real == {src_cells}) && (n{k}_flushed < {}) && !v{k}_src;",

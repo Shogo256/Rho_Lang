@@ -1659,6 +1659,8 @@ fn emit_loop_declarations(sv: &mut String, l: &Loop, numbers: Numbers) {
     let _ = writeln!(sv, "  logic [{}:0] round{k}, sw{k};", bits(l.cap + 1) - 1);
     let _ = writeln!(sv, "  logic cv{k};");
     let _ = writeln!(sv, "  {ty} d{k};  // the largest move this round");
+    let _ = writeln!(sv, "  {ty} wa{k}_a, wa{k}_b, wo{k}, wu{k}, wu{k}_2, wd{k};  // the writer's pipeline: the old cell read, then registered, the new one, their distance");
+    let _ = writeln!(sv, "  logic wp{k}_1, wp{k}_2, wp{k}_3;");
     let _ = writeln!(sv, "  logic [2:0] ls{k};  // 0 capture, 1 read, 2 drain, 3 emit, 4 done");
     let _ = writeln!(sv, "  {ty} px{k};  // {} after the loop, streamed out", l.target);
     let _ = writeln!(sv, "  logic pv{k};");
@@ -1668,12 +1670,11 @@ fn emit_loop_declarations(sv: &mut String, l: &Loop, numbers: Numbers) {
 fn emit_loop_logic(sv: &mut String, l: &Loop, update: &Stage, numbers: Numbers) {
     let k = l.id;
     let n = l.cells;
-    let ty = numbers.ty();
     let tid = ident(&l.target);
     let upd_value = format!("st{}_{}", update.index, ident(&update.target));
     let upd_valid = format!("v{}_out", update.index);
     let _ = writeln!(sv, "  always_ff @(posedge clk) begin : loop{k}");
-    let _ = writeln!(sv, "    {ty} old, diff;");
+
     let _ = writeln!(sv, "    logic all_captured, settled, capped;");
     let _ = writeln!(sv, "    if (rst) begin");
     for (name, _) in &l.sources {
@@ -1681,11 +1682,11 @@ fn emit_loop_logic(sv: &mut String, l: &Loop, update: &Stage, numbers: Numbers) 
     }
     let _ = writeln!(
         sv,
-        "      rv{k} <= 1'b0; rs{k} <= 1'b0; cur{k} <= 1'b0; i{k} <= 0; w{k} <= 0; round{k} <= 0; sw{k} <= 0; cv{k} <= 1'b1; d{k} <= {}; ls{k} <= 0; pv{k} <= 1'b0;",
+        "      rv{k} <= 1'b0; rs{k} <= 1'b0; cur{k} <= 1'b0; i{k} <= 0; w{k} <= 0; round{k} <= 0; sw{k} <= 0; cv{k} <= 1'b1; d{k} <= {}; ls{k} <= 0; pv{k} <= 1'b0; wp{k}_1 <= 1'b0; wp{k}_2 <= 1'b0; wp{k}_3 <= 1'b0;",
         numbers.lit(0.0)
     );
     let _ = writeln!(sv, "    end else begin");
-    let _ = writeln!(sv, "      rv{k} <= 1'b0; rs{k} <= 1'b0; pv{k} <= 1'b0;");
+    let _ = writeln!(sv, "      rv{k} <= 1'b0; rs{k} <= 1'b0; pv{k} <= 1'b0; wp{k}_1 <= 1'b0; wp{k}_2 <= 1'b0; wp{k}_3 <= 1'b0;");
     // Capture, always on: a source's cells land in its memory as they come.
     for (name, stream) in &l.sources {
         let sid = ident(name);
@@ -1709,8 +1710,9 @@ fn emit_loop_logic(sv: &mut String, l: &Loop, update: &Stage, numbers: Numbers) 
     let _ = writeln!(sv, "          rv{k} <= 1'b1;");
     let _ = writeln!(sv, "          if (i{k} == {}) ls{k} <= 2; else i{k} <= i{k} + 1;", n - 1);
     let _ = writeln!(sv, "        end");
-    // Drain: the update stage finishes; when every cell is written, decide.
-    let _ = writeln!(sv, "        2: if (w{k} == {n}) begin");
+    // Drain: the update stage finishes; when every cell is written and the
+    // writer's pipeline has measured the last, decide.
+    let _ = writeln!(sv, "        2: if (w{k} == {n} && !wp{k}_1 && !wp{k}_2 && !wp{k}_3) begin");
     let _ = writeln!(sv, "          settled = (d{k} <= {});", numbers.lit(l.tau));
     let _ = writeln!(sv, "          capped = (round{k} + 1 >= {});", l.cap);
     let _ = writeln!(sv, "          sw{k} <= sw{k} + 1;");
@@ -1729,21 +1731,29 @@ fn emit_loop_logic(sv: &mut String, l: &Loop, update: &Stage, numbers: Numbers) 
     let _ = writeln!(sv, "        end");
     let _ = writeln!(sv, "        default: ;");
     let _ = writeln!(sv, "      endcase");
-    // The writer: the update's cells into the other buffer, measuring the move.
+    // The writer: the update's cells into the other buffer, and the move
+    // measured in four steps so that no step is longer than one carry
+    // chain: the old cell read out of memory (a synchronous read), taken
+    // into a register (block RAM's own output register), its distance to
+    // the new one, the largest kept.
     let _ = writeln!(sv, "      if ((ls{k} == 1 || ls{k} == 2) && {upd_valid}) begin");
-    let _ = writeln!(sv, "        old = cur{k} ? m{k}_{tid}_b[w{k}] : m{k}_{tid}_a[w{k}];");
+    let _ = writeln!(sv, "        wa{k}_a <= m{k}_{tid}_a[w{k}]; wa{k}_b <= m{k}_{tid}_b[w{k}]; wu{k} <= {upd_value}; wp{k}_1 <= 1'b1;");
     let _ = writeln!(sv, "        if (cur{k}) m{k}_{tid}_a[w{k}] <= {upd_value}; else m{k}_{tid}_b[w{k}] <= {upd_value};");
-    match numbers {
-        Numbers::Real => {
-            let _ = writeln!(sv, "        diff = rho_abs({upd_value} - old);");
-        }
-        Numbers::Fixed { .. } => {
-            let _ = writeln!(sv, "        diff = rho_abs(fx_sub({upd_value}, old));");
-        }
-    }
-    let _ = writeln!(sv, "        if (diff > d{k}) d{k} <= diff;");
     let _ = writeln!(sv, "        w{k} <= w{k} + 1;");
     let _ = writeln!(sv, "      end");
+    let _ = writeln!(sv, "      if (wp{k}_1) begin wo{k} <= cur{k} ? wa{k}_b : wa{k}_a; wu{k}_2 <= wu{k}; wp{k}_2 <= 1'b1; end");
+    let _ = writeln!(sv, "      if (wp{k}_2) begin");
+    match numbers {
+        Numbers::Real => {
+            let _ = writeln!(sv, "        wd{k} <= rho_abs(wu{k}_2 - wo{k});");
+        }
+        Numbers::Fixed { .. } => {
+            let _ = writeln!(sv, "        wd{k} <= rho_abs(fx_sub(wu{k}_2, wo{k}));");
+        }
+    }
+    let _ = writeln!(sv, "        wp{k}_3 <= 1'b1;");
+    let _ = writeln!(sv, "      end");
+    let _ = writeln!(sv, "      if (wp{k}_3 && wd{k} > d{k}) d{k} <= wd{k};");
     let _ = writeln!(sv, "    end");
     let _ = writeln!(sv, "  end");
 }

@@ -885,9 +885,19 @@ for a quotient, so it still truncates toward zero as the reference does):
 | Jacobi `⇒` on 48 cells, two buffers and INPUT in memory | ECP5 85K | 1020 → 825 LUT4, 2078 → 177 carry, 1553 → 649 FF, 5 BRAM | 5.5 → 52.3 MHz |
 
 The flip-flops that remain are the line buffers (a 16-wide line, 32 bits a
-cell, twice over per source); the memories of the loop are block RAM. What
-is left on the critical path is the 32-bit adder chain of a stage and the
-accumulator of a fold.
+cell, twice over per source); the memories of the loop are block RAM.
+
+The loop's writer then set the clock: it read the old cell out of memory,
+took its distance to the new one and compared that with the round's
+largest, all between two edges, and the block RAM's output alone is 5.6 ns
+on the ECP5. The writer now takes four steps a cell — the synchronous read,
+its register (the block RAM's own output register), the distance, the
+largest — and the round's decision waits for the last cell to come through;
+one cell per clock as before, three clocks more per round. The same Jacobi
+loop: 642 LUT4, 195 carry, 783 FF, 3 block RAMs at 89.0 MHz, and through
+the `step` body of §3.11 668 LUT4, 231 carry, 1089 FF at 104.2 MHz (47.5
+before). What is left on the critical path is a 32-bit compare or adder
+chain between registers.
 
 A division by a constant that is not a power of two is a multiplier, not a
 divider: the constant's even part comes off the dividend as a shift, and

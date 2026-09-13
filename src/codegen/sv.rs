@@ -2198,6 +2198,10 @@ pub fn synthesize(dir: &Path, family: &str) -> std::io::Result<Synthesis> {
 /// multiply-add rounds twice here too.
 pub fn simulate(circuit: &Circuit, dir: &Path, inputs: &[Vec<f64>]) -> std::io::Result<Run> {
     write(circuit, dir)?;
+    // Absolute paths: Verilator's makefile runs inside --Mdir, and older
+    // Verilators (5.02x) keep the source paths as given, so a relative
+    // path to the harness is not found from there.
+    let dir = &std::fs::canonicalize(dir)?;
     let obj = dir.join("obj");
     let status = Command::new(verilator())
         .args([

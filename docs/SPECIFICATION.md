@@ -840,6 +840,18 @@ sources' plus its reach plus two, and the module's latency is OUTPUT's: a
 6 × 8 grid through a four-point stencil, a square and a third flow leaves at
 clock 14 and runs in 48 + 14 clocks.
 
+Every stream carries a valid bit. A stage's lines advance only on a valid
+cell, and once a source's cells have all arrived the stage pushes zeros
+through for as many cells as its reach, so the last cells come out. That is
+what lets a fold be a stage: `◇+1 X` keeps one accumulator, `◇×0 X` of a
+4 × 16 grid keeps sixteen — one per line across the folded axis — and a cell
+leaves whenever a line completes, so the fold's stream is sparse and what
+reads it follows its valids. A scan emits on every cell. A fold's operand may
+be any expression of the subset, shifts included, so the line buffer sits
+inside the fold; a fold of a fold is two stages; a fold's stream may be
+shifted like any other. Streams of one origin — the dense inputs of a shape,
+or one fold's completions — are aligned by whole clocks.
+
 The cells are `real` — IEEE double in simulation, calling the same libm the
 interpreter and the kernel call — so Verilator's run is held to the
 interpreter bit for bit, by the tests and by `DIFFTEST_SV=1 difftest`, which
@@ -849,10 +861,11 @@ one cell per clock, with the arithmetic units left to a later step — fixed
 point in the language, or floating-point cores.
 
 In the subset: `→`, arithmetic, comparisons as masks, `⌈ ⌊ |`, the named
-functions, `?`, `⌊X` `⌈X`, `⍳`, shifts along any axis, chains of flows,
-several inputs. Not yet, and said so with a line: folds and scans (an
-accumulator per line), `⇒` (an outer loop with a settled flag), lifts,
-the turns, `⌷`, and any broadcast.
+functions, `?`, `⌊X` `⌈X`, `⍳`, shifts along any axis, folds and scans along
+any axis, chains of flows, several inputs. Not yet, and said so with a line:
+`⇒` (an outer loop with a settled flag), lifts and any broadcast, the turns,
+`⌷`, and a flow that reads two streams of different timing (a fold's and a
+dense one).
 
 ## 8. Precision ✅
 

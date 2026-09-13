@@ -3964,9 +3964,46 @@ fn test_the_circuit_gives_the_interpreters_bits_one_cell_per_clock() {
 }
 
 #[test]
+fn test_folds_and_scans_are_stages_of_the_circuit() {
+    if !verilator_available() {
+        eprintln!("verilator not found: circuit test skipped");
+        return;
+    }
+    let grid: Vec<f64> = (0..64).map(|i| ((i as f64) * 0.37).sin() * 2.0 + (i % 5) as f64 * 0.25).collect();
+    let cases: [(&str, &str); 6] = [
+        // Row sums: one accumulator, a cell out every 16 in.
+        ("fold_rows", "{\n    INPUT:◯ □ 4 16\n    ((◇+1 INPUT) / 16.0) → =\n}"),
+        // Column products: 16 accumulators across the lines, out in the last row.
+        ("fold_cols", "{\n    INPUT:◯ □ 4 16\n    (◇×0 (INPUT × 0.5)) → =\n}"),
+        // The fold of a stencil, with the line buffer inside the fold.
+        ("fold_stencil", "{\n    INPUT:◯ □ 4 16\n    (◇>1 (▷0INPUT - ▽1INPUT)) → =\n}"),
+        // A scan: every cell out, the running sum along each row.
+        ("scan_rows", "{\n    INPUT:◯ □ 4 16\n    ((◈+1 INPUT) - INPUT) → =\n}"),
+        // A fold of a fold: a single cell.
+        ("fold_total", "{\n    INPUT:◯ □ 4 16\n    (◇<0 (◇+1 INPUT)) → =\n}"),
+        // A fold's stream shifted: its cells have neighbours of their own.
+        ("fold_shifted", "{\n    INPUT:◯ □ 4 16\n    (◇+1 INPUT) → ROW\n    ((▷ROW + ROW) × 0.5) → =\n}"),
+    ];
+    for (name, source) in cases {
+        let block = parse_rho_program(source).unwrap();
+        let mut env: Env<f64> = Env::new();
+        env.insert("INPUT".to_string(), Grid::from(vec![4, 16], grid.clone()));
+        let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+        let circuit = rho_lang::codegen::sv::emit(&block, 0.0).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(circuit.output_cells, meant.len(), "{name}");
+        let dir_name = format!("target/sv_{name}");
+        let (out, cycles) = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new(&dir_name), std::slice::from_ref(&grid))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(bits(&out), bits(&meant), "{name}: circuit vs interpreter\n{}", circuit.module);
+        // The input is 64 cells and the pipeline shallow: no cell waits long.
+        assert!(cycles <= 64 + 40, "{name}: {cycles} cycles");
+    }
+}
+
+#[test]
 fn test_what_is_not_yet_a_circuit_says_so() {
     for (source, what) in [
-        ("{\n    INPUT:◯ □ 4 4\n    (◇+1 INPUT) → =\n}", "fold"),
+        ("{\n    INPUT:◯ □ 4 4\n    (INPUT - (□1 (◇+1 INPUT))) → =\n}", "lift"),
         ("{\n    INPUT:◯ □ 4 4\n    INPUT → X\n    (X × 0.5) ⇒ X\n    X → =\n}", "fixed point"),
         ("{\n    INPUT:◯ □ 4 4\n    ((1 ⌽ INPUT) + INPUT) → =\n}", "rotation"),
     ] {

@@ -11,6 +11,15 @@
 //! accelerator, here because the language said so. Boundary cells read zero,
 //! decided by the cell's coordinates, which a counter carries along.
 //!
+//! Every stream carries a valid bit. A stage's lines advance only on a valid
+//! cell, and when a source's cells have all arrived the stage pushes zeros
+//! through for as many cells as its reach, so the last cells come out. A
+//! fold is a stage with one accumulator per line across the folded axis; it
+//! emits a cell whenever a line completes, so its stream is sparse, and what
+//! reads it follows its valids. A scan emits on every cell. Streams of one
+//! origin — the dense inputs, or one fold's output — are aligned by clocks;
+//! two origins in one flow are refused, as is a broadcast.
+//!
 //! The cells are SystemVerilog `real`: IEEE double in simulation, with the
 //! same libm the interpreter and the kernel call, so Verilator's run is held
 //! to the interpreter bit for bit. `real` does not synthesise; this is the
@@ -18,8 +27,9 @@
 //! arithmetic units left to a later step (fixed point, or floating-point
 //! cores). What is in the subset so far: `→`, arithmetic, comparisons as
 //! masks, the greater and the lesser, the residue, the named functions,
-//! `?`, `⌊` `⌈`, `⍳`, shifts along any axis, chains of flows. Not yet:
-//! folds, scans, lifts, the turns, `⌷`, `⇒`.
+//! `?`, `⌊` `⌈`, `⍳`, shifts along any axis, chains of flows, folds and
+//! scans along any axis, folds of folds. Not yet: lifts, the turns, `⌷`,
+//! `⇒`, and a flow that mixes a fold's stream with another.
 
 use crate::ast::*;
 use crate::error::{HarmonyDisruption, Result};
@@ -42,18 +52,47 @@ pub struct Circuit {
     pub latency: usize,
 }
 
+/// What a stage does with the cell it computes.
+enum Kind {
+    /// The cell is the target's cell.
+    Flow,
+    /// The cell joins an accumulator; a cell of the target leaves when a
+    /// line along the axis completes.
+    Fold { op: FoldOp, axis: usize, running: bool },
+}
+
 struct Stage {
     /// Position in the program: signal names carry it, since a space may be
     /// written by more than one flow (`T → OUTPUT` and then `OUTPUT → =`).
     index: usize,
-    /// Target space, its shape, and the latency its stream has.
+    /// Target space (a fold's is a name of its own) and the shape the stage
+    /// sweeps — the operand's, for a fold.
     target: String,
     shape: Vec<usize>,
+    /// Clocks from a source cell of the stage's origin to the stage's cell.
     latency: usize,
-    /// Source space -> (the signal its stream is on, chain length, centre tap index).
-    chains: BTreeMap<String, (String, usize, usize)>,
+    /// How far the furthest neighbour is, in cells.
+    reach: usize,
+    /// Source space -> (value signal, valid signal, its latency, chain length, centre tap).
+    chains: BTreeMap<String, (String, String, usize, usize, usize)>,
     /// The expression, as SystemVerilog over the chains.
     expr: String,
+    kind: Kind,
+}
+
+/// Where a stream's timing comes from: the dense inputs of one shape, or
+/// one fold's completions. Streams of one origin differ by whole clocks.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Origin(String);
+
+/// A stream: the signal, its valid, its latency, its origin, and the cells it carries.
+#[derive(Clone, Debug)]
+struct Stream {
+    value: String,
+    valid: String,
+    latency: usize,
+    origin: Origin,
+    cells: usize,
 }
 
 fn unsupported(what: &str, line: usize) -> HarmonyDisruption {
@@ -108,7 +147,9 @@ fn sources(expr: &Expr, shapes: &BTreeMap<String, Vec<usize>>, line: usize) -> R
                     return Err(unsupported("`⍳` of a computed value", line));
                 };
             }
-            Expr::Reduce { .. } | Expr::Scan { .. } => return Err(unsupported("a fold or scan", line)),
+            // A fold or scan was made a stage of its own before this walk;
+            // only its name is left in the expression.
+            Expr::Reduce { .. } | Expr::Scan { .. } => return Err(unsupported("a fold inside a fold's own line", line)),
             Expr::Lift { .. } => return Err(unsupported("a lift (`□`)", line)),
             Expr::Rotate { .. } | Expr::Reverse { .. } => return Err(unsupported("a rotation or reversal", line)),
             Expr::Reshape { .. } | Expr::Transpose { .. } => return Err(unsupported("a reshape or transpose", line)),
@@ -129,7 +170,7 @@ fn is_tau(name: &str) -> bool {
 /// One stage's expression over its chains, as SystemVerilog `real`.
 struct Lowering<'a> {
     shapes: &'a BTreeMap<String, Vec<usize>>,
-    chains: &'a BTreeMap<String, (String, usize, usize)>,
+    chains: &'a BTreeMap<String, (String, String, usize, usize, usize)>,
     /// The result shape, whose coordinates `pos` holds.
     shape: &'a [usize],
     /// The stage's number: its delay lines are `c<stage>_<source>`.
@@ -144,7 +185,7 @@ impl Lowering<'_> {
             Expr::Number(v) => real_literal(*v),
             Expr::Var(name) if is_tau(name) => real_literal(self.tau),
             Expr::Var(name) => {
-                let (_, _, centre) = &self.chains[name];
+                let (_, _, _, _, centre) = &self.chains[name];
                 format!("c{}_{}[{centre}]", self.stage, ident(name))
             }
             Expr::AuditTrace(inner) => self.lower(inner)?,
@@ -158,7 +199,7 @@ impl Lowering<'_> {
                     return Ok(real_literal(0.0));
                 }
                 let a = axis.unwrap_or_else(|| default_axis(shape));
-                let (_, _, centre) = &self.chains[name];
+                let (_, _, _, _, centre) = &self.chains[name];
                 let (tap, edge) = match dir {
                     ShiftDir::Positive => (centre + stride, 0),
                     ShiftDir::Negative => (centre - stride, extent - 1),
@@ -252,13 +293,26 @@ pub fn emit(block: &ToposBlock, tau: f64) -> Result<Circuit> {
             inputs.push(decl.name.clone());
         }
     }
-    // The stream each space is on right now: its signal and its latency.
-    let mut streams: BTreeMap<String, (String, usize)> = inputs
+    // The stream each space is on right now.
+    let mut streams: BTreeMap<String, Stream> = inputs
         .iter()
-        .map(|n| (n.clone(), (format!("s_in_{}", ident(n)), 1)))
+        .map(|n| {
+            let cells = shapes[n].iter().product::<usize>().max(1);
+            (
+                n.clone(),
+                Stream {
+                    value: format!("s_in_{}", ident(n)),
+                    valid: format!("v_in_{}", ident(n)),
+                    latency: 1,
+                    origin: Origin(format!("dense{:?}", shapes[n])),
+                    cells,
+                },
+            )
+        })
         .collect();
     let mut stages: Vec<Stage> = Vec::new();
     let mut written: BTreeSet<String> = BTreeSet::new();
+    let mut folds_made = 0usize;
 
     for (index, stmt) in block.statements.iter().enumerate() {
         let line = block.line_of(index);
@@ -271,68 +325,50 @@ pub fn emit(block: &ToposBlock, tau: f64) -> Result<Circuit> {
                     FlowTarget::Var(n) => n.clone(),
                     FlowTarget::Equilibrium => "OUTPUT".to_string(),
                 };
-                let (srcs, reach) = sources(src, &shapes, line)?;
-                let shape = expr_shape(src, &shapes)
+                // Every fold or scan in the expression becomes a stage first,
+                // innermost first, and its name stands in the expression.
+                let src = extract_folds(src, line, tau, &mut shapes, &mut streams, &mut stages, &mut folds_made)?;
+                let shape = expr_shape(&src, &shapes)
                     .or_else(|| shapes.get(&target).cloned())
                     .ok_or_else(|| unsupported("a flow with no shape", line))?;
-                for s in &srcs {
-                    if shapes.get(s) != Some(&shape) {
-                        return Err(unsupported(
-                            &format!("a broadcast (`{s}` is {:?}, the flow {:?})", shapes.get(s), shape),
-                            line,
-                        ));
-                    }
-                    if !streams.contains_key(s) {
-                        return Err(HarmonyDisruption::SpaceErr {
-                            space_name: s.clone(),
-                            line,
-                        });
-                    }
-                }
-                let stage_index = stages.len();
-                let base = srcs.iter().map(|s| streams[s].1).max().unwrap_or(1);
-                let stage_latency = base + reach + 2;
-                let chains: BTreeMap<String, (String, usize, usize)> = srcs
-                    .iter()
-                    .map(|s| {
-                        let (signal, d) = &streams[s];
-                        let centre = stage_latency - d - 2;
-                        (s.clone(), (signal.clone(), centre + reach + 1, centre))
-                    })
-                    .collect();
-                let lowering = Lowering {
-                    shapes: &shapes,
-                    chains: &chains,
-                    shape: &shape,
-                    stage: stage_index,
-                    tau,
+                let stage = plan_stage(
+                    &src,
+                    &target,
+                    shape.clone(),
+                    Kind::Flow,
                     line,
-                };
-                let expr = lowering.lower(src)?;
-                let _ = lowering.shape;
-                shapes.insert(target.clone(), shape.clone());
-                streams.insert(target.clone(), (format!("st{stage_index}_{}", ident(&target)), stage_latency));
+                    tau,
+                    &shapes,
+                    &streams,
+                    stages.len(),
+                )?;
+                let cells = shape.iter().product::<usize>().max(1);
+                let origin = stage_origin(&stage, &streams);
+                streams.insert(
+                    target.clone(),
+                    Stream {
+                        value: format!("st{}_{}", stage.index, ident(&target)),
+                        valid: format!("v{}_out", stage.index),
+                        latency: stage.latency,
+                        origin,
+                        cells,
+                    },
+                );
+                shapes.insert(target.clone(), shape);
                 written.insert(target.clone());
-                stages.push(Stage {
-                    index: stage_index,
-                    target: target.clone(),
-                    shape,
-                    latency: stage_latency,
-                    chains,
-                    expr,
-                });
+                stages.push(stage);
                 if matches!(stmt, Statement::Flow { target: FlowTarget::Equilibrium, .. }) {
                     break;
                 }
             }
         }
     }
-    let (out_signal, out_latency) = streams
+    let out_stream = streams
         .get("OUTPUT")
         .cloned()
         .ok_or_else(|| unsupported("a program with no `→ =`", 0))?;
-    let out_shape = shapes["OUTPUT"].clone();
-    let out_cells = out_shape.iter().product::<usize>().max(1);
+    let out_latency = out_stream.latency;
+    let out_cells = out_stream.cells;
     let inputs: Vec<(String, usize)> = inputs
         .into_iter()
         .filter(|n| !written.contains(n))
@@ -341,6 +377,10 @@ pub fn emit(block: &ToposBlock, tau: f64) -> Result<Circuit> {
             (n, cells)
         })
         .collect();
+    let budget: usize = inputs.iter().map(|(_, c)| *c).max().unwrap_or(0)
+        + out_cells
+        + stages.iter().map(|s| s.reach + 3).sum::<usize>()
+        + 16;
 
     // ------------------------------------------------------------ module
     let mut sv = String::new();
@@ -360,58 +400,27 @@ pub fn emit(block: &ToposBlock, tau: f64) -> Result<Circuit> {
     let _ = writeln!(sv, "  output real  out_OUTPUT");
     let _ = writeln!(sv, ");");
     sv.push_str(FUNCTIONS);
-    let _ = writeln!(sv, "  // Clocks since the first cell; cell k of a stream with latency d is on it at clock k + d.");
-    let _ = writeln!(sv, "  longint cyc;");
-    let _ = writeln!(sv, "  always_ff @(posedge clk) begin");
-    let _ = writeln!(sv, "    if (rst) cyc <= 0; else cyc <= cyc + 1;");
-    let _ = writeln!(sv, "  end");
-    for (name, _) in &inputs {
+    for (name, cells) in &inputs {
         let id = ident(name);
-        let _ = writeln!(sv, "  real s_in_{id};  // the stream of {name}, latency 1");
-        let _ = writeln!(sv, "  always_ff @(posedge clk) s_in_{id} <= in_valid ? in_{id} : {};", real_literal(0.0));
-    }
-    for stage in &stages {
-        let k = stage.index;
-        let tid = ident(&stage.target);
-        let _ = writeln!(sv);
-        let _ = writeln!(
-            sv,
-            "  // ---- stage {k}: -> {} (shape {:?}), latency {}",
-            stage.target, stage.shape, stage.latency
-        );
-        for (src, (signal, length, centre)) in &stage.chains {
-            let line = format!("c{k}_{}", ident(src));
-            let _ = writeln!(
-                sv,
-                "  real {line} [0:{}];  // {src} delayed for this stage; centre tap {centre}",
-                length - 1
-            );
-            let _ = writeln!(sv, "  always_ff @(posedge clk) begin");
-            let _ = writeln!(sv, "    {line}[0] <= {signal};");
-            let _ = writeln!(sv, "    for (int i = 1; i < {length}; i++) {line}[i] <= {line}[i - 1];");
-            let _ = writeln!(sv, "  end");
-        }
-        // Coordinates of the centre cell this stage computes at this clock.
-        let rank = stage.shape.len();
-        let _ = writeln!(sv, "  real st{k}_{tid};");
-        let _ = writeln!(sv, "  always_ff @(posedge clk) begin : stage{k}_{tid}");
-        let _ = writeln!(sv, "    longint here;  // the cell this clock computes");
-        let _ = writeln!(sv, "    longint pos [0:{}];", rank.max(1) - 1);
-        let _ = writeln!(sv, "    here = cyc - {};", stage.latency - 1);
-        for a in 0..rank {
-            let (stride, extent) = axis_geometry(&stage.shape, Some(a)).unwrap_or((1, 1));
-            let _ = writeln!(sv, "    pos[{a}] = (here < 0) ? 0 : ((here / {stride}) % {extent});");
-        }
-        let _ = writeln!(sv, "    st{k}_{tid} <= {};", stage.expr);
+        let _ = writeln!(sv, "  // the stream of {name}: {cells} cells, latency 1");
+        let _ = writeln!(sv, "  real  s_in_{id};");
+        let _ = writeln!(sv, "  logic v_in_{id};");
+        let _ = writeln!(sv, "  longint n_in_{id};");
+        let _ = writeln!(sv, "  always_ff @(posedge clk) begin");
+        let _ = writeln!(sv, "    if (rst) begin n_in_{id} <= 0; v_in_{id} <= 1'b0; s_in_{id} <= {}; end", real_literal(0.0));
+        let _ = writeln!(sv, "    else begin");
+        let _ = writeln!(sv, "      v_in_{id} <= in_valid && (n_in_{id} < {cells});");
+        let _ = writeln!(sv, "      s_in_{id} <= in_valid ? in_{id} : {};", real_literal(0.0));
+        let _ = writeln!(sv, "      if (in_valid) n_in_{id} <= n_in_{id} + 1;");
+        let _ = writeln!(sv, "    end");
         let _ = writeln!(sv, "  end");
     }
+    for stage in &stages {
+        emit_stage(&mut sv, stage, &streams, &shapes);
+    }
     let _ = writeln!(sv);
-    let _ = writeln!(sv, "  assign out_OUTPUT = {out_signal};");
-    let _ = writeln!(
-        sv,
-        "  assign out_valid = (cyc >= {out_latency}) && (cyc < {});",
-        out_latency + out_cells
-    );
+    let _ = writeln!(sv, "  assign out_OUTPUT = {};", out_stream.value);
+    let _ = writeln!(sv, "  assign out_valid = {};", out_stream.valid);
     let _ = writeln!(sv, "endmodule");
 
     // ------------------------------------------------------------ harness
@@ -434,8 +443,8 @@ pub fn emit(block: &ToposBlock, tau: f64) -> Result<Circuit> {
     let _ = writeln!(h, "  m.rst = 1; m.in_valid = 0; tick(); m.rst = 0;");
     let _ = writeln!(h, "  std::vector<double> out; out.reserve({out_cells});");
     let _ = writeln!(h, "  long cycles = 0;");
-    let feed_cells = inputs.first().map(|(_, c)| *c).unwrap_or(0);
-    let _ = writeln!(h, "  for (long t = 0; out.size() < {out_cells} && t < {}; t++) {{", feed_cells + out_latency + out_cells + 4);
+    let feed_cells = inputs.iter().map(|(_, c)| *c).max().unwrap_or(0);
+    let _ = writeln!(h, "  for (long t = 0; out.size() < {out_cells} && t < {budget}; t++) {{");
     let _ = writeln!(h, "    m.in_valid = t < {feed_cells};");
     let mut offset = 0usize;
     for (name, cells) in &inputs {
@@ -459,6 +468,289 @@ pub fn emit(block: &ToposBlock, tau: f64) -> Result<Circuit> {
         output_cells: out_cells,
         latency: out_latency,
     })
+}
+
+/// Replace every fold and scan in `expr` by a name, making a stage for each,
+/// innermost first.
+#[allow(clippy::too_many_arguments)]
+fn extract_folds(
+    expr: &Expr,
+    line: usize,
+    tau: f64,
+    shapes: &mut BTreeMap<String, Vec<usize>>,
+    streams: &mut BTreeMap<String, Stream>,
+    stages: &mut Vec<Stage>,
+    made: &mut usize,
+) -> Result<Expr> {
+    let sub = |e: &Expr, shapes: &mut BTreeMap<String, Vec<usize>>, streams: &mut BTreeMap<String, Stream>, stages: &mut Vec<Stage>, made: &mut usize| -> Result<Box<Expr>> {
+        Ok(Box::new(extract_folds(e, line, tau, shapes, streams, stages, made)?))
+    };
+    Ok(match expr {
+        Expr::Reduce { op, axis, operand } | Expr::Scan { op, axis, operand } => {
+            let running = matches!(expr, Expr::Scan { .. });
+            let operand = extract_folds(operand, line, tau, shapes, streams, stages, made)?;
+            let in_shape = expr_shape(&operand, shapes).ok_or_else(|| unsupported("a fold with no shape", line))?;
+            let a = axis.unwrap_or_else(|| default_axis(&in_shape));
+            if a >= in_shape.len() {
+                return Err(unsupported(&format!("axis {a} of {in_shape:?}"), line));
+            }
+            *made += 1;
+            let name = format!("{}{}{}", if running { "◈" } else { "◇" }, op, made);
+            let stage = plan_stage(
+                &operand,
+                &name,
+                in_shape.clone(),
+                Kind::Fold { op: *op, axis: a, running },
+                line,
+                tau,
+                shapes,
+                streams,
+                stages.len(),
+            )?;
+            let out_shape = if running { in_shape.clone() } else { shape_without_axis(&in_shape, a) };
+            let cells = out_shape.iter().product::<usize>().max(1);
+            let origin = if running {
+                stage_origin(&stage, streams)
+            } else {
+                Origin(format!("fold{}", stage.index))
+            };
+            streams.insert(
+                name.clone(),
+                Stream {
+                    value: format!("st{}_{}", stage.index, ident(&name)),
+                    valid: format!("v{}_out", stage.index),
+                    latency: stage.latency,
+                    origin,
+                    cells,
+                },
+            );
+            shapes.insert(name.clone(), out_shape);
+            stages.push(stage);
+            Expr::Var(name)
+        }
+        Expr::Number(_) | Expr::Var(_) => expr.clone(),
+        Expr::AuditTrace(inner) => Expr::AuditTrace(sub(inner, shapes, streams, stages, made)?),
+        Expr::Builtin { op, operand } => Expr::Builtin { op: *op, operand: sub(operand, shapes, streams, stages, made)? },
+        Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp {
+            op: op.clone(),
+            lhs: sub(lhs, shapes, streams, stages, made)?,
+            rhs: sub(rhs, shapes, streams, stages, made)?,
+        },
+        // Anything else keeps its shape here and is judged by `sources`.
+        other => other.clone(),
+    })
+}
+
+/// The origin a stage's cells have: its sources' (they share one).
+fn stage_origin(stage: &Stage, streams: &BTreeMap<String, Stream>) -> Origin {
+    stage
+        .chains
+        .keys()
+        .next()
+        .map(|s| streams[s].origin.clone())
+        .unwrap_or_else(|| Origin("constant".to_string()))
+}
+
+/// Lay out one stage: which streams it reads, how deep its lines are, what
+/// it computes.
+#[allow(clippy::too_many_arguments)]
+fn plan_stage(
+    src: &Expr,
+    target: &str,
+    shape: Vec<usize>,
+    kind: Kind,
+    line: usize,
+    tau: f64,
+    shapes: &BTreeMap<String, Vec<usize>>,
+    streams: &BTreeMap<String, Stream>,
+    index: usize,
+) -> Result<Stage> {
+    let (srcs, reach) = sources(src, shapes, line)?;
+    let mut origin: Option<Origin> = None;
+    for s in &srcs {
+        if shapes.get(s) != Some(&shape) {
+            return Err(unsupported(
+                &format!("a broadcast (`{s}` is {:?}, the flow {:?})", shapes.get(s), shape),
+                line,
+            ));
+        }
+        let stream = streams.get(s).ok_or_else(|| HarmonyDisruption::SpaceErr {
+            space_name: s.clone(),
+            line,
+        })?;
+        match &origin {
+            None => origin = Some(stream.origin.clone()),
+            Some(o) if *o != stream.origin => {
+                return Err(unsupported(
+                    &format!("a flow reading two streams of different timing (`{s}` and another)"),
+                    line,
+                ))
+            }
+            _ => {}
+        }
+    }
+    if srcs.is_empty() {
+        return Err(unsupported("a flow with no space in it", line));
+    }
+    let base = srcs.iter().map(|s| streams[s].latency).max().unwrap_or(1);
+    // A fold's stream is sparse: its cells are aligned by clocks only when
+    // they left at the same clock, so two latencies are refused.
+    let sparse = origin.as_ref().is_some_and(|o| o.0.starts_with("fold"));
+    if sparse && srcs.iter().any(|s| streams[s].latency != base) {
+        return Err(unsupported("a flow reading a fold's stream at two latencies", line));
+    }
+    let stage_latency = base + reach + 2;
+    let chains: BTreeMap<String, (String, String, usize, usize, usize)> = srcs
+        .iter()
+        .map(|s| {
+            let st = &streams[s];
+            (
+                s.clone(),
+                (st.value.clone(), st.valid.clone(), st.latency, 2 * reach + 1, reach),
+            )
+        })
+        .collect();
+    let lowering = Lowering {
+        shapes,
+        chains: &chains,
+        shape: &shape,
+        stage: index,
+        tau,
+        line,
+    };
+    let expr = lowering.lower(src)?;
+    let _ = lowering.shape;
+    Ok(Stage {
+        index,
+        target: target.to_string(),
+        shape,
+        latency: stage_latency,
+        reach,
+        chains,
+        expr,
+        kind,
+    })
+}
+
+/// The SystemVerilog of one stage: alignment, lines, counters, flush, the
+/// computation, and for a fold the accumulators.
+fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>, _shapes: &BTreeMap<String, Vec<usize>>) {
+    let k = stage.index;
+    let tid = ident(&stage.target);
+    let r = stage.reach;
+    let cells = stage.shape.iter().product::<usize>().max(1);
+    let base = stage.chains.values().map(|c| c.2).max().unwrap_or(1);
+    let _ = writeln!(sv);
+    let _ = writeln!(
+        sv,
+        "  // ---- stage {k}: {} (sweeps {:?}, reach {r}), latency {}",
+        match stage.kind {
+            Kind::Flow => format!("-> {}", stage.target),
+            Kind::Fold { running, .. } => format!("{} {}", if running { "scan" } else { "fold" }, stage.target),
+        },
+        stage.shape,
+        stage.latency
+    );
+    // Sources aligned to the latest of them, value and valid together.
+    let first_src = stage.chains.keys().next().cloned().unwrap();
+    for (src, (value, valid, latency, _, _)) in &stage.chains {
+        let sid = ident(src);
+        let delay = base - latency;
+        if delay == 0 {
+            let _ = writeln!(sv, "  real  a{k}_{sid};  always_comb a{k}_{sid} = {value};");
+            let _ = writeln!(sv, "  logic av{k}_{sid}; assign av{k}_{sid} = {valid};");
+        } else {
+            let _ = writeln!(sv, "  real  ad{k}_{sid} [0:{}];", delay - 1);
+            let _ = writeln!(sv, "  logic adv{k}_{sid} [0:{}];", delay - 1);
+            let _ = writeln!(sv, "  always_ff @(posedge clk) begin");
+            let _ = writeln!(sv, "    ad{k}_{sid}[0] <= {value}; adv{k}_{sid}[0] <= rst ? 1'b0 : {valid};");
+            let _ = writeln!(sv, "    for (int i = 1; i < {delay}; i++) begin ad{k}_{sid}[i] <= ad{k}_{sid}[i - 1]; adv{k}_{sid}[i] <= rst ? 1'b0 : adv{k}_{sid}[i - 1]; end");
+            let _ = writeln!(sv, "  end");
+            let _ = writeln!(sv, "  real  a{k}_{sid};  always_comb a{k}_{sid} = ad{k}_{sid}[{}];", delay - 1);
+            let _ = writeln!(sv, "  logic av{k}_{sid}; assign av{k}_{sid} = adv{k}_{sid}[{}];", delay - 1);
+        }
+    }
+    let src_cells = streams[&first_src].cells;
+    let fsid = ident(&first_src);
+    let _ = writeln!(sv, "  // cells entered, real cells entered, zeros pushed through after the last");
+    let _ = writeln!(sv, "  longint n{k}_in, n{k}_real, n{k}_flushed;");
+    let _ = writeln!(sv, "  logic v{k}_src, fl{k}, en{k};");
+    let _ = writeln!(sv, "  assign v{k}_src = av{k}_{fsid};");
+    let _ = writeln!(
+        sv,
+        "  assign fl{k} = (n{k}_real == {src_cells}) && (n{k}_flushed < {}) && !v{k}_src;",
+        r + 1
+    );
+    let _ = writeln!(sv, "  assign en{k} = v{k}_src || fl{k};");
+    for (src, (_, _, _, length, centre)) in &stage.chains {
+        let sid = ident(src);
+        let l = format!("c{k}_{sid}");
+        let _ = writeln!(sv, "  real {l} [0:{}];  // {src}; centre tap {centre}", length - 1);
+        let _ = writeln!(sv, "  always_ff @(posedge clk) if (en{k}) begin");
+        let _ = writeln!(sv, "    {l}[0] <= v{k}_src ? a{k}_{sid} : {};", real_literal(0.0));
+        let _ = writeln!(sv, "    for (int i = 1; i < {length}; i++) {l}[i] <= {l}[i - 1];");
+        let _ = writeln!(sv, "  end");
+    }
+    let rank = stage.shape.len();
+    let _ = writeln!(sv, "  real  st{k}_{tid};");
+    let _ = writeln!(sv, "  logic v{k}_out;");
+    if let Kind::Fold { axis, .. } = stage.kind {
+        let (stride, _) = axis_geometry(&stage.shape, Some(axis)).unwrap_or((1, 1));
+        let _ = writeln!(sv, "  real acc{k} [0:{}];  // one accumulator per line across axis {axis}", stride - 1);
+    }
+    let _ = writeln!(sv, "  always_ff @(posedge clk) begin : stage{k}");
+    let _ = writeln!(sv, "    longint here;");
+    let _ = writeln!(sv, "    longint pos [0:{}];", rank.max(1) - 1);
+    let _ = writeln!(sv, "    real x;");
+    let _ = writeln!(sv, "    if (rst) begin");
+    let _ = writeln!(sv, "      n{k}_in <= 0; n{k}_real <= 0; n{k}_flushed <= 0; v{k}_out <= 1'b0; st{k}_{tid} <= {};", real_literal(0.0));
+    let _ = writeln!(sv, "    end else begin");
+    let _ = writeln!(sv, "      v{k}_out <= 1'b0;");
+    let _ = writeln!(sv, "      if (v{k}_src) n{k}_real <= n{k}_real + 1;");
+    let _ = writeln!(sv, "      if (fl{k}) n{k}_flushed <= n{k}_flushed + 1;");
+    let _ = writeln!(sv, "      if (en{k}) begin");
+    let _ = writeln!(sv, "        n{k}_in <= n{k}_in + 1;");
+    let _ = writeln!(sv, "        here = n{k}_in - {};", r + 1);
+    for a in 0..rank {
+        let (stride, extent) = axis_geometry(&stage.shape, Some(a)).unwrap_or((1, 1));
+        let _ = writeln!(sv, "        pos[{a}] = (here < 0) ? 0 : ((here / {stride}) % {extent});");
+    }
+    let _ = writeln!(sv, "        if (here >= 0 && here < {cells}) begin");
+    let _ = writeln!(sv, "          x = {};", stage.expr);
+    match stage.kind {
+        Kind::Flow => {
+            let _ = writeln!(sv, "          st{k}_{tid} <= x;");
+            let _ = writeln!(sv, "          v{k}_out <= 1'b1;");
+        }
+        Kind::Fold { op, axis, running } => {
+            let (stride, extent) = axis_geometry(&stage.shape, Some(axis)).unwrap_or((1, 1));
+            let step = match op {
+                FoldOp::Sum => "(a + x)",
+                FoldOp::Product => "(a * x)",
+                FoldOp::Max => "((x > a) ? x : a)",
+                FoldOp::Min => "((x < a) ? x : a)",
+            };
+            let _ = writeln!(sv, "          begin : accumulate");
+            let _ = writeln!(sv, "            real a, next;");
+            let _ = writeln!(sv, "            longint t, m;");
+            let _ = writeln!(sv, "            t = here % {stride};");
+            let _ = writeln!(sv, "            m = (here / {stride}) % {extent};");
+            let _ = writeln!(sv, "            a = (m == 0) ? {} : acc{k}[t];", real_literal(op.identity()));
+            let _ = writeln!(sv, "            next = {step};");
+            let _ = writeln!(sv, "            acc{k}[t] <= next;");
+            if running {
+                let _ = writeln!(sv, "            st{k}_{tid} <= next;");
+                let _ = writeln!(sv, "            v{k}_out <= 1'b1;");
+            } else {
+                let _ = writeln!(sv, "            if (m == {}) begin st{k}_{tid} <= next; v{k}_out <= 1'b1; end", extent - 1);
+            }
+            let _ = writeln!(sv, "          end");
+        }
+    }
+    let _ = writeln!(sv, "        end");
+    let _ = writeln!(sv, "      end");
+    let _ = writeln!(sv, "    end");
+    let _ = writeln!(sv, "  end");
 }
 
 /// The helpers every module carries: the language's operations that are not

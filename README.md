@@ -1,322 +1,114 @@
-# ρ (RHO) Language Compiler
+# ρ (RHO)
 
 [![CI](https://github.com/Escoffier1156/Rho_Lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Escoffier1156/Rho_Lang/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![LLVM](https://img.shields.io/badge/LLVM-15%2B-dragon.svg)](https://llvm.org)
-[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 
 **An array language in the line of APL, compiled to native kernels.**
 
-ρ (RHO) writes computation over whole arrays — no indices, no loops. Each glyph
-is an array operation: a shift reads a neighbour, a fold collapses an axis, a
-scan runs along one, a lift stretches one array against another, and `⇒`
-repeats a flow to a fixed point. Shapes are declared, so every program compiles
-to a straight native kernel: the compiler emits LLVM IR and links a shared
-library callable from C or Python.
+ρ writes computation over whole arrays — no indices, no loops. A shift reads a
+neighbour, a fold collapses an axis, a scan runs along one, a lift stretches
+one array against another, and `⇒` repeats a flow to a fixed point. Shapes are
+declared, so a program becomes a straight native kernel — or a JAX module, or
+a circuit — and every one of them is held to a reference interpreter.
 
----
-
-## Current Status
-
-Working prototype. What runs today:
-
-- Parses the RHO symbol set, with ASCII aliases for every glyph
-- Static validation: undeclared spaces, shape mismatches, missing equilibrium point
-- `!` constraints checked at compile time by interval arithmetic, which models
-  binary64 rounding rather than ℝ
-- Lowers flows to LLVM IR — one full grid sweep per `→`
-- Multi-dimensional shifts `▷` / `▽`, per axis, zero-padded at each axis's boundary
-- Folds `◇+` `◇×` `◇>` `◇<` that collapse an axis, so sums, means, dot products
-  and norms are one line each
-- Scans `◈+` `◈×` `◈>` `◈<` for running totals, which keep the shape they walk
-- Named functions `exp` `log` `sqrt` `sin` `cos` `abs`, with their domains
-  checked, and `ind` so a program can count
-- APL's dyadic `⌈` `⌊` `|` — the greater, the lesser and the residue — so a
-  ReLU is `X ⌈ 0.0`, a clamp is `(X ⌊ 1.0) ⌈ -1.0`, and `3.0 | X` is X mod 3
-- `⍳`, the coordinate of each cell along an axis from zero, so a window, a
-  distance from the centre or a Vandermonde matrix is one line
-- `⌽`, APL's rotate and reverse: `1 ⌽ U` wraps where `▽U` pads with zero, which
-  is a periodic boundary in one glyph
-- `⍴`, APL's reshape: `3 4 ⍴ V` reads a vector as a matrix without moving a
-  cell, and `3 4 ⍴ P` tiles a pair across a grid
-- `⍉`, APL's transpose, alone or with a permutation of the axes, so `A · Bᵀ`
-  is a lift, a product and a fold
-- `↑` and `↓`, APL's take and drop, so a window, a tail or a difference
-  without its boundary zero has the shape it should
-- `⌷`, index by value: `I ⌷ X` reads X at the positions the cells of I name,
-  zero past its cells — a lookup table, a colour map, a resampling, a
-  permutation, the one read whose place the data decides
-- `?`, roll without state: `?X` hashes each cell to a number in [0, 1),
-  the same on every thread and every run, so a coordinate or a counter is a
-  seed — Monte Carlo, noise, a stochastic automaton; `⌊X` and `⌈X` round
-- `--emit-sv`: the same program as a SystemVerilog streaming pipeline, one
-  cell per clock with line buffers for the shifts, folds as accumulators
-  and `⇒` as a loop over block RAM; simulated with Verilator and held to
-  the interpreter bit for bit, and with `--fixed 32.16` synthesised by
-  Yosys into a real datapath
-- `--emit-jax`: the same program as a JAX module for CPU, GPU and TPU
-  through XLA, a `lax.while_loop` for `⇒`, held to the interpreter to the
-  bit where XLA allows and to an ulp at the scale of the space where it
-  reorders a fold or uses its own `exp`
-- Functions: `smooth:{ X ((▷X + X + ▽X) / 3.0) }` defines one, `smooth INPUT`
-  calls it, `A mix B` calls a function of two between its arguments, and the
-  body is copied in at each call — nothing runs at call time, a function is
-  written once and used at any shape, and a body of flows inside a `⇒` runs
-  on every round
-- `--f32` for single precision, with the interpreter and the `!` check
-  following the width
-- `□` lifting and broadcasting, so an outer product — and a matrix product — is
-  one flow
-- `⇒`, a flow repeated to a fixed point — APL's `f⍣≡`: Jacobi iteration,
-  relaxation and diffusion in one line, capped by `--max-iter`, with the kernel
-  reporting how many sweeps it took and whether it settled
-- Explicit `<4 x double>` vector lowering, verified bit-identical to the scalar path
-- Every sweep split across a pool of threads (`--threads`, `RHO_THREADS`),
-  with the bits independent of the split; 3–4x on grids that fit in cache
-- Zero-copy binding: compile a kernel against a buffer the host already owns
-- One pointer per space at call time, so a kernel with several inputs — a
-  matrix product — runs with nothing baked in
-- Emits a native shared library (`.so`) with a documented C ABI
-- Deterministic output: the same source always produces byte-identical IR
-- A reference interpreter written from the specification; on every push random
-  programs are compiled at both widths, run through both C entrypoints, and
-  compared with it bit for bit — and whatever the `!` check claimed about them
-  is compared with what the kernel actually produced
-
-See [Implementation Status](#implementation-status) for what is designed but not
-yet built. The implementation is deliberately a small core, not a full language
-runtime.
-
----
-
-## Quick Start
-
-### 1. Install or build
-
-The Python package ships the compiler, so a Rust toolchain is not needed to
-use it. clang (LLVM 15 or newer) is: `rhoc` emits LLVM IR and asks clang to
-build the shared library.
-
-```bash
-pip install rho-lang          # once a release is published to PyPI
+```rho
+{
+    /* Jacobi: relax X until no cell moves by more than 𝜏 */
+    INPUT:◯ □ 64 64
+    INPUT → X
+    ((INPUT / 4.0) + ((▷X + ▽X + ▷0X + ▽0X) / 4.0)) ⇒ X
+    X → =
+}
 ```
 
-Until then, or to install your own build, make the wheel with
-[maturin](https://www.maturin.rs) — CI builds it for Linux, macOS and Windows
-on every push, and uploads it as an artifact:
-
 ```bash
-maturin build --release
-pip install target/wheels/rho_lang-*.whl
+rhoc jacobi.rho --tau 1e-12 --max-iter 200 --run INPUT=field.bin --write OUTPUT=out.bin
 ```
 
-To work on the compiler itself, build from source (Rust 1.80+ and clang):
+## What a program becomes
+
+| Target | How | Held to the interpreter |
+|---|---|---|
+| A native kernel (`.so`, C ABI, Python) | `rhoc program.rho` | bit for bit, at f64 and f32, with every sweep split across threads |
+| A JAX module for CPU, GPU, TPU | `rhoc program.rho --emit-jax m.py` | bit for bit where XLA allows; within one ulp at the scale of the space where XLA reorders a fold or uses its own `exp` |
+| A SystemVerilog pipeline, one cell per clock | `rhoc program.rho --emit-sv dir --fixed 32.16` | bit for bit, in `real` and in fixed point; Yosys and nextpnr synthesise it |
+
+## Quick start
+
+### Install
+
+The Python package ships the compiler; clang (LLVM 15 or newer) must be on
+the machine, since `rhoc` asks it to build the shared library.
 
 ```bash
-git clone https://github.com/Escoffier1156/Rho_Lang.git
-cd Rho_Lang
-cargo build --release
-cargo test
+pip install rho-lang                         # once a release is on PyPI
+maturin build --release && pip install target/wheels/rho_lang-*.whl   # your own build
 ```
 
-Or use the container, which pins Rust, LLVM, Clang and Python:
+To work on the compiler itself (Rust 1.88+ and clang):
 
 ```bash
-docker build -t escoffier1156/rho-lang .
-docker run -it escoffier1156/rho-lang
+git clone https://github.com/Escoffier1156/Rho_Lang.git && cd Rho_Lang
+cargo build --release && cargo test
 ```
 
-### 2. Compile a kernel
+### Compile and run
 
 ```bash
-cargo run --release --bin rhoc -- examples/matrix_add.rho
+rhoc examples/matrix_add.rho                       # writes libkernel.so
+printf '1 2 3 4\n5 6 7 8\n' > in.txt
+rhoc examples/matrix_add.rho --run INPUT=in.txt    # runs it: prints OUTPUT, one row per line
 ```
-
-This writes `libkernel.so` and reports how many cells the kernel sweeps, along
-with what the `!` check could and could not settle.
 
 | Flag | Effect |
 |---|---|
-| `--dump-llvm` | Print the generated IR |
-| `--dump-dag` | Print the dataflow trace |
-| `--tau <v>` | Bind the threshold symbol `𝜏` (default `0.0`) |
-| `--bind NAME=0x…` | Point a space at an address the caller owns |
-| `--f32` | Compute at single precision |
+| `--run SPACE=FILE` | Run the kernel once with this input read from a file: raw doubles for `.bin`, whitespace-separated numbers otherwise. Repeat per input |
+| `--write SPACE=FILE` | After `--run`, write a space to a file; intermediates may be named too |
+| `--tau <v>` | Bind the threshold `𝜏` (default `0.0`) |
 | `--max-iter <N>` | Cap every `⇒` at `N` sweeps; required by a program that iterates |
-| `--no-simd` | Emit only scalar loops |
+| `--f32` | Compute at single precision |
 | `--threads <N>` | Split every sweep across `N` threads; `0` (default) is one per CPU. `RHO_THREADS` overrides at run time |
 | `--portable` | Build for any x86-64 rather than this machine |
-| `--emit-sv <DIR>` | Also write the program as a SystemVerilog streaming pipeline, with a Verilator harness |
-| `--fixed <W.F>` | Make the circuit's cells fixed point (e.g. `32.16`), which Yosys synthesises; the interpreter on the same numbers is the reference |
-| `--emit-jax <FILE.py>` | Also write the program as a JAX module (`rho`, `rho_jit`), for CPU, GPU and TPU through XLA |
-| `--run SPACE=FILE` | Run the kernel once with this input read from a file (raw doubles for `.bin`, whitespace-separated numbers otherwise); repeat per input. OUTPUT is printed unless `--write` names a file for it |
-| `--write SPACE=FILE` | After `--run`, write a space to a file (`.bin` raw doubles, text otherwise); intermediates may be named too |
+| `--bind NAME=0x…` | Point a space at an address the caller owns |
+| `--emit-jax <FILE.py>` | Also write the program as a JAX module (`rho`, `rho_jit`) |
+| `--emit-sv <DIR>` | Also write the program as a SystemVerilog pipeline with a Verilator harness |
+| `--fixed <W.F>` | Make the circuit's cells fixed point, e.g. `32.16` |
+| `--dump-llvm`, `--dump-dag`, `--no-simd` | Print the IR, print the dataflow, emit scalar loops only |
 
-### 3. Call it from Python
+### From Python
 
-The short way: write the flows once, without declarations, and let each
-shape you call it with be compiled once and kept in a cache
-(`~/.cache/rho-lang`, or `RHO_CACHE_DIR`). Nested lists or numpy arrays.
+Write the flows once, without declarations; each shape you call with is
+compiled once and cached (`~/.cache/rho-lang`, or `RHO_CACHE_DIR`).
 
 ```python
 from rho import Kernel
 
 blur = Kernel("((▷0INPUT + ▽0INPUT + ▷1INPUT + ▽1INPUT + INPUT) / 5.0) → =")
-out = blur(INPUT=image)            # compiles for image's shape, once
-out = blur(INPUT=another)          # a different shape: another kernel, once
+out = blur(INPUT=image)                       # nested lists or numpy arrays
 mix = Kernel("((A × W) + (B × (1.0 - W))) → =")
-out = mix(A=a, B=b, W=w)           # every named argument is a space
+out = mix(A=a, B=b, W=w)                      # every named argument is a space
+
+relax = Kernel("INPUT → X\n((INPUT / 4.0) + ((▷X + ▽X) / 4.0)) ⇒ X\nX → =", tau=1e-12, max_iter=200)
+x = relax(INPUT=b); relax.sweeps(), relax.converged()
 ```
 
-The long way, against a compiled `.so` by hand:
-
-```python
-import ctypes
-
-lib = ctypes.CDLL('./libkernel.so')
-
-# A kernel's grid size comes from its ◯ □ declaration. Ask for it rather than
-# guessing — a buffer shorter than this is a memory error, not a short result.
-lib.rho_kernel_element_count.restype = ctypes.c_int64
-n = lib.rho_kernel_element_count()
-
-Buffer = ctypes.c_double * n
-src = Buffer(*[float(i + 1) for i in range(n)])
-dst = Buffer()
-
-lib.rho_kernel_exec_with_args.argtypes = [ctypes.POINTER(ctypes.c_double)] * 2
-lib.rho_kernel_exec_with_args.restype = None
-lib.rho_kernel_exec_with_args(src, dst)
-
-print(list(dst))          # [2.0, 4.0, 6.0, 8.0]
-```
-
-Or through the wrapper, which checks buffer lengths for you. Installed from
-the wheel it runs the `rhoc` it shipped; imported from a checkout it runs
-`cargo run`, so an edit to the compiler is what executes:
+Against a compiled `.so` by hand, `rho.RhoEngine` wraps the C ABI and checks
+buffer lengths:
 
 ```python
 from rho import RhoEngine
-
-engine = RhoEngine()
-engine.compile_rho_file("examples/matrix_add.rho")
-print(engine.element_count(), engine.get_metadata())
-engine.execute_kernel_with_args(src, dst)
-```
-
-### 4. Or skip the pointers entirely
-
-Compile the kernel against the address of a buffer you already own, and the
-call takes no arguments at all:
-
-```python
-buf = (ctypes.c_double * 4)(1.0, 2.0, 3.0, 4.0)
-
-engine = RhoEngine()
-engine.compile_rho_file("examples/matrix_add.rho", bind={"INPUT": buf})
-engine.execute_kernel(buf)
-
-print(list(buf))          # [2.0, 4.0, 6.0, 8.0] — written in place
-```
-
-### 5. Iterate to a fixed point
-
-`expr ⇒ U` sweeps `expr` into `U` again and again until no cell moves by more
-than `𝜏` or `--max-iter` sweeps have run. Jacobi for a tridiagonal system:
-
-```rho
-{
-    INPUT:◯ □ 64 1
-    INPUT → X
-    ((INPUT - (▷X + ▽X)) / 4.0) ⇒ X
-    X → =
-}
-```
-
-```python
-engine.compile_rho_file("examples/jacobi.rho", tau=1e-12, max_iter=200)
-engine.execute_kernel_with_args(b, x)
-engine.sweeps(), engine.converged()     # (40, True)
-```
-
-Every sweep reads the whole previous grid — a Jacobi step — so a shift inside
-the loop sees a finished grid, as it does everywhere else. The cap is required:
-it is what makes the kernel terminate, and it changes the answer when the loop
-has not settled, so the kernel says which happened.
-
-### 6. Several inputs
-
-A kernel is not limited to one input. `rho_kernel_exec_spaces` takes one
-pointer per space, in the order the metadata lists them; the wrapper builds the
-table from a dictionary. Inputs must be present, the output is where the result
-lands, and any intermediate may be left out for the kernel to own:
-
-```python
-a = (ctypes.c_double * 6)(1, 2, 3, 4, 5, 6)        # 2x3
-b = (ctypes.c_double * 12)(*range(12))             # 3x4
-c = (ctypes.c_double * 8)()                        # 2x4
-
 engine = RhoEngine()
 engine.compile_rho_file("examples/matmul.rho")
-engine.spaces()                     # [('A', [2,3,1], 'input'), ('B', [1,3,4], 'input'), ('OUTPUT', [2,4], 'output')]
+engine.spaces()      # [('A', [2,3,1], 'input'), ('B', [1,3,4], 'input'), ('OUTPUT', [2,4], 'output')]
 engine.execute_spaces({"A": a, "B": b, "OUTPUT": c})
 ```
 
----
-
-### 7. Run it from the command line
-
-No host language is needed to try a program: `--run` feeds an input from a
-file and runs the kernel once, `--write` keeps any space it wrote.
-
-```bash
-printf '1 2 3 4\n5 6 7 8\n' > in.txt
-rhoc examples/matrix_add.rho --run INPUT=in.txt            # prints OUTPUT, one row per line
-rhoc examples/jacobi.rho --tau 1e-12 --max-iter 200 \
-     --run INPUT=field.bin --write OUTPUT=out.bin          # raw doubles in and out; reports the sweeps
-```
-
-### 8. The same program elsewhere
-
-The kernel is one of three things a program becomes. `--emit-jax module.py`
-writes it as a JAX module (`rho`, `rho_jit`) for CPUs, GPUs and TPUs through
-XLA, and `--emit-sv DIR` as a SystemVerilog streaming pipeline, one cell per
-clock, that Verilator simulates and, with `--fixed 32.16`, Yosys synthesises.
-Both are held to the interpreter: see the specification, §7 and §8.
-
-## C ABI
-
-| Symbol | Signature | Purpose |
-|---|---|---|
-| `rho_kernel_element_count` | `int64_t (void)` | The larger of the input's and the output's cell counts; the minimum buffer length for the two-pointer entrypoints |
-| `rho_kernel_exec_with_args` | `void (const double *in, double *out)` | Run the kernel. Buffers **must** hold `element_count()` doubles |
-| `rho_kernel_exec_bounded` | `void (const double *in, double *out, int64_t n)` | Same, but clamps the sweep to `n` cells |
-| `rho_kernel_exec_spaces` | `void (void **spaces)` | One pointer per space, in the order `rho_kernel_metadata()` lists them. The way to call a kernel with several inputs |
-| `rho_kernel_metadata` | `const char * (void)` | JSON: element count, every space's shape and role, and the iteration cap and tolerance when the kernel iterates |
-| `rho_kernel_sweeps` | `int64_t (void)` | Sweeps the `⇒` loops of the most recent call took, in all |
-| `rho_kernel_converged` | `int64_t (void)` | 1 if every `⇒` of the most recent call stopped on the tolerance rather than on the cap |
-| `rho_kernel_exec` | `void (void)` | Zero-copy: runs against the addresses compiled in via `&[0x…]` or `--bind`. Returns immediately if `INPUT` is unbound |
-
-Passing `NULL` as the output pointer makes the kernel write in place. Passing
-`NULL` as the input pointer makes it return without touching memory.
-
-In the `spaces` table, each entry's metadata `role` says what the pointer is
-for: an `input` is read and must be non-null, or the call returns without
-touching memory; the `output` receives the result; an `internal` space may be
-`NULL`, in which case the kernel uses scratch of its own (kept between calls,
-freed when the library unloads), or supplied, in which case the caller gets to
-see the intermediate — computed for it even when the kernel would otherwise
-fold it into its reader's sweep. Buffers must hold as many values as the
-space's shape multiplies out to.
-
----
-
-## Example Syntax
+## The language, by example
 
 ```rho
 {
     /* a softmax */
-    INPUT:◯ □ 1024 1
+    INPUT:◯ □ 1024
     exp INPUT → E
     (E / (□0 (◇+ E))) → =
 }
@@ -324,43 +116,30 @@ space's shape multiplies out to.
 
 ```rho
 {
-    /* a matrix product, contracted in one flow */
+    /* a matrix product: APL's +.× — any fold over any operation is an inner product */
     A:◯ □ 2 3 1
     B:◯ □ 1 3 4
     ◇+1 (A × B) → =
 }
 ```
 
-That is APL's `+.×`, and the shape is the general inner product: any fold over
-any operation. Fold with `<` over `+` and the same two lines are the min-plus
-product — one step of a shortest-path relaxation:
-
 ```rho
-{
-    /* shortest paths of at most two edges: C[i][j] = min over k of D[i][k] + D[k][j] */
-    D:◯ □ 4 4 1
-    E:◯ □ 1 4 4
-    ◇<1 (D + E) → =
+step:{ U
+    (▷U + ▽U) → S
+    (S / 4.0) → =
 }
-```
-
-Likewise `□1A f □0B` is the outer product under any operation `f`, and `⍳X`
-is the coordinate of each cell — `((□1 X) ^ (□0 (⍳K)))` is a Vandermonde
-matrix, `(0.5 - 0.5 × cos((2π/N) × ⍳X))` a Hann window.
-
-```rho
 {
-    /* the mean and the L2 norm of a vector */
-    INPUT:◯ □ 1024 1
-    ((◇+ INPUT) / 1024.0) → MEAN
-    ((◇+ (INPUT × INPUT)) ^ 0.5) → NORM
-    (NORM - MEAN) → =
+    /* a function with a body of flows, run every round of the loop */
+    INPUT:◯ □ 1024
+    INPUT → X
+    ((INPUT / 4.0) + (step X)) ⇒ X
+    X → =
 }
 ```
 
 ```rho
 {
-    &[0x7A4F]:INPUT:◯ □ 1024 1024
+    INPUT:◯ □ 1024 1024
     (▷INPUT - INPUT) → △
     (▽INPUT - INPUT) → ▽
     ((△ - ▽) / (△ + ▽)) ^ 2 → OUTPUT
@@ -369,83 +148,61 @@ matrix, `(0.5 - 0.5 × cos((2π/N) × ⍳X))` a Hann window.
 }
 ```
 
-`▷INPUT` reads the cell before the current one and `▽INPUT` the cell after, both
-zero at the boundary, so the first two flows are the forward and backward spatial
-differences. On this `1024 1024` grid those neighbours are along a row; write
-`▷0INPUT` to step between rows instead. `𝜏` is a threshold, 0.0 unless `--tau`
-says otherwise; a comparison passes the left value through where it holds and
-collapses the cell to 0 elsewhere.
+`▷` and `▽` read the neighbours along the last axis (`▷0` steps between rows),
+zero at the boundary. A comparison passes the left value through where it
+holds and gives 0 elsewhere. `!` is checked at compile time by interval
+arithmetic that models binary64 rounding; here it proves `OUTPUT >= 0` and
+says the denominator ranges over `[-inf, +inf]`, which includes zero — that is
+the formula, not a compiler fault.
 
-The compiler will tell you that this example can divide by zero:
+The glyphs: shifts `▷ ▽`, folds `◇+ ◇× ◇> ◇<`, scans `◈`, lift `□`, fixed
+point `⇒`, coordinates `⍳`, the greater, lesser and residue `⌈ ⌊ |`, rotate
+`⌽`, reshape `⍴`, transpose `⍉`, take and drop `↑ ↓`, index by value `⌷`,
+roll `?`, `exp log sqrt sin cos abs ind`, and functions `name:{ params body }`
+called prefix or, for two, infix (`A mix B`). Every glyph has an ASCII alias.
+The specification has the dictionary.
 
-```
-[proved]   (OUTPUT >= 0)
-[unproven] ((△ - ▽) / (△ + ▽)) — the denominator ranges over [-inf, +inf], which includes zero
-```
+## C ABI
 
-That is the formula, not a compiler fault: `△ + ▽` is the discrete Laplacian, so
-smooth input drives it to zero and the kernel returns infinities.
+| Symbol | Signature | Purpose |
+|---|---|---|
+| `rho_kernel_exec_spaces` | `void (void **spaces)` | One pointer per space, in the order `rho_kernel_metadata()` lists them. Inputs must be given; a null intermediate is the kernel's own |
+| `rho_kernel_exec_with_args` | `void (const double *in, double *out)` | The two-pointer form; buffers hold `rho_kernel_element_count()` values |
+| `rho_kernel_exec_bounded` | `void (const double *in, double *out, int64_t n)` | Same, clamped to `n` cells |
+| `rho_kernel_metadata` | `const char * (void)` | JSON: every space's name, shape and role, and the loop's cap and tolerance |
+| `rho_kernel_sweeps`, `rho_kernel_converged` | `int64_t (void)` | Sweeps the last call's `⇒` took, and whether every one settled |
+| `rho_kernel_element_count` | `int64_t (void)` | The larger of the input's and the output's cell counts |
+| `rho_kernel_exec` | `void (void)` | Zero-copy: runs against the addresses bound with `&[0x…]` or `--bind` |
 
----
+## Numbers
 
-## Implementation Status
+Measured on an i7-8550U, best of 20, one thread; details and the circuit
+numbers are in the specification (§6, §7, §8).
 
-| Area | Status |
+| | |
 |---|---|
-| Parser, ASCII aliases, symbol validation | ✅ implemented |
-| Shape / flow / undeclared-space checks | ✅ implemented |
-| LLVM lowering, one sweep per `→` | ✅ implemented |
-| Multi-dimensional indexing and per-axis shifts | ✅ implemented |
-| Folds (`◇`) collapsing an axis | ✅ implemented — scalar inner loop, no scan yet |
-| Scans (`◈`) keeping the shape | ✅ implemented — scalar, no parallel scan |
-| Lifting (`□`) and broadcasting | ✅ implemented — no implicit rank promotion |
-| Fixed points (`⇒`) | ✅ implemented — Jacobi sweeps to a tolerance under a cap; a Gauss–Seidel sweep and a multi-flow loop body are not expressible |
-| Named functions and their domain checks | ✅ implemented |
-| Single precision (`--f32`) | ✅ implemented — 5.5x on a bandwidth-bound kernel |
-| Mixed precision, integer types | 📋 not planned — see the specification |
-| Explicit `<4 x double>` vector lowering | ✅ implemented — see the note below |
-| Sweeps split across threads | ✅ implemented — every `→`, `⇒` round, fold and comparison; 3–4x on cache-resident grids, bit-identical to one thread |
-| Fused flows, kept scratch, one sweep a round | ✅ an intermediate one flow reads cell for cell is computed inside that flow's sweep, scratch is kept between calls, and a `⇒` round is one sweep that measures its own largest move and swaps grids instead of copying: a chain of three flows over a million cells 11.6 → 1.4 ms, a Jacobi loop through a `step` body 51 → 11 ms, bit-identical |
-| The program as JAX (`--emit-jax`) | ✅ `rho` / `rho_jit` over `jax.numpy`, every construct including `⇒` and function bodies; bit-identical for arithmetic, shifts, masks and turns, within an ulp at the scale of the space for folds and transcendentals (XLA's own order and `exp`) |
-| The program as a circuit (`--emit-sv`) | ✅ a SystemVerilog streaming pipeline, one cell per clock, simulated with Verilator and bit-identical to the interpreter; flows, shifts, `⍳`, folds and scans with an accumulator per line, `⇒` as a loop over a grid in memory with the kernel's sweep count (a fold or a broadcast in it makes the round two passes), broadcasts, `□`, the turns `⌽ ⍉ ⍴ ↑ ↓` and `⌷` as reads by place out of a replay's memory (a matrix product is one), the arithmetic, the named functions and a body of flows inside `⇒` as stages of the round: the whole language. `real` cells for the structure and timing; `--fixed 32.16` for a datapath Yosys synthesises, bit-identical to the fixed-point interpreter: a 16×16 stencil is 401 LUT4 at 75.8 MHz on an iCE40 HX8K, a 48-cell Jacobi loop 642 LUT4 and 3 block RAMs at 89 MHz on an ECP5 (104 MHz through a `step` body); a division by a constant is a magic-number multiplier (4 DSP at 53 MHz on the ECP5 where the divider ran at 10.8) |
-| Zero-copy binding (`&[0x…]`, `--bind`) | ✅ implemented |
-| `!` constraint check | ✅ interval arithmetic that models binary64 rounding, not ℝ; its claims are held to real runs by the differential test |
-| Diagnostics with source lines | ✅ implemented |
-| Reference interpreter + differential testing | ✅ implemented — both widths, both entrypoints, on every push |
-| C ABI, JSON metadata, Python FFI | ✅ implemented |
-| `pip install rho-lang` | ✅ wheel built in CI for Linux, macOS, Windows; publishing to PyPI waits on a tagged release |
-| NEON width selection, GPU backends | 📋 planned — the kernel is built for the machine at hand (`-march=native`, or `--portable`) |
-| Tiling and cache blocking | 📋 planned — a sweep is one linear pass |
+| Three flows over a million cells | 1.4 ms (was 11.6 before fusion and kept scratch) |
+| Jacobi through a `step` body, four rounds, a million cells | 11 ms (was 51) |
+| Threads on cache-resident grids | 3–4x, bit-identical to one thread; a million cells is memory-bound |
+| A 16×16 stencil as a circuit, Q16.16 | 401 LUT4 at 75.8 MHz on an iCE40 HX8K |
+| A 48-cell Jacobi loop as a circuit, Q16.16 | 642 LUT4, 3 block RAMs at 89 MHz on an ECP5 (104 MHz through the `step` body) |
 
-Two honest caveats on the ✅ rows:
+Two caveats: past the cache the memory bus is the limit, and the `!` check
+models round-to-nearest without infinities, subnormals or NaN.
 
-- **Past the cache, the memory bus is the limit.** Vector lowering and threads
-  together give 2.6x on a 4096-cell stencil and 3–4x on grids of a few hundred
-  thousand cells; on a million cells neither shows, because one core already
-  fills this machine's memory bandwidth. The numbers are in the specification,
-  §3.2.1 and §6. `--no-simd` and `--threads 1` are verified to produce
-  bit-identical results.
-- **The `!` check assumes no overflow, underflow or NaN.** It models
-  round-to-nearest — every result is the exact one times `(1 ± 2⁻⁵³)` — which is
-  what stops it accepting things that only hold over the reals. It does not model
-  infinities, subnormals or NaN.
+## How it stays right
 
----
+A reference interpreter, written from the specification and generic over the
+number type, is the meaning of a program. On every push the differential test
+compiles random programs at f64 and f32 with every sweep split across
+threads, runs them through both entrypoints, and compares them with the
+interpreter bit for bit; whatever the `!` check claimed about them is held to
+what the kernel produced; the circuit leg does the same through Verilator.
 
-## Design Direction
+## Read on
 
-ρ is an array language in the line of APL: matrix and parallel computation
-written over whole arrays, with the shapes known at compile time so that every
-program becomes a native kernel. What gets added next is judged by one
-question — does it make array code shorter and clearer in that sense? The
-checks the compiler runs on itself are how it stays correct while that happens;
-they are not the product.
+- [docs/SPECIFICATION.md](docs/SPECIFICATION.md) — the language, the entrypoints, the numbers
+- [docs/ROADMAP.md](docs/ROADMAP.md) — what 1.0 is, what was decided out, what could follow
+- [CHANGELOG.md](CHANGELOG.md)
 
-See [docs/SPECIFICATION.md](docs/SPECIFICATION.md) for the symbol dictionary and
-[docs/ROADMAP.md](docs/ROADMAP.md) for the staged plan.
-
----
-
-## License
-
-Apache 2.0
+Apache 2.0.

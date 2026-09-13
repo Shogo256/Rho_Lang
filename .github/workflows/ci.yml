@@ -25,7 +25,7 @@ jobs:
     - name: Install LLVM & Clang
       run: |
         sudo apt-get update
-        sudo apt-get install -y clang llvm
+        sudo apt-get install -y clang llvm verilator
 
     - name: Lint (clippy)
       run: cargo clippy --all-targets -- -D warnings
@@ -49,6 +49,11 @@ jobs:
           ./target/release/difftest $seed 300
         done
 
+    # The circuit leg: every generated program the SystemVerilog emitter
+    # accepts is simulated with Verilator and held to the interpreter too.
+    - name: Hold The Circuit To The Interpreter
+      run: DIFFTEST_SV=1 ./target/release/difftest 20260909 40
+
     - name: Run Sample Compilation (`teichmuller.rho`)
       run: cargo run --bin rhoc -- examples/teichmuller.rho --dump-dag --dump-llvm
 
@@ -57,7 +62,7 @@ jobs:
         cargo run --bin rhoc -- examples/jacobi.rho --tau 1e-12 --max-iter 200
         cargo run --bin rhoc -- examples/laplace.rho --tau 1e-6 --max-iter 2000
         cargo run --bin rhoc -- examples/min_plus.rho
-        cargo run --bin rhoc -- examples/window.rho
+        cargo run --bin rhoc -- examples/window.rho --emit-sv target/sv-window
         cargo run --bin rhoc -- examples/lookup.rho
         cargo run --bin rhoc -- examples/montecarlo.rho
         cargo run --bin rhoc -- examples/periodic.rho --tau 1e-9 --max-iter 20000

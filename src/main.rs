@@ -60,6 +60,11 @@ struct Args {
     /// Display generated LLVM IR
     #[arg(long)]
     dump_llvm: bool,
+
+    /// Also write the program as a SystemVerilog streaming pipeline
+    /// (rho_kernel.sv and a Verilator harness) into this directory.
+    #[arg(long, value_name = "DIR")]
+    emit_sv: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -195,6 +200,16 @@ fn run(args: &Args) -> anyhow::Result<()> {
     let out_path = args.output.to_string_lossy();
     codegen.compile_to_so(&llvm_ir, &out_path)?;
     println!("  └─ Compilation Successful: Binary emitted to -> {}", out_path);
+
+    if let Some(dir) = &args.emit_sv {
+        let circuit = rho_lang::codegen::sv::emit(&block, args.tau).map_err(|e| block.attribute(e))?;
+        rho_lang::codegen::sv::write(&circuit, dir)?;
+        println!(
+            "  └─ Circuit emitted to -> {}/rho_kernel.sv (one cell per clock, latency {} clocks)",
+            dir.display(),
+            circuit.latency
+        );
+    }
 
     println!("=====================================================");
     println!("  [SUCCESS] Harmony Achieved: Zero Errors");

@@ -49,6 +49,9 @@ Working prototype. What runs today:
 - `?`, roll without state: `?X` hashes each cell to a number in [0, 1),
   the same on every thread and every run, so a coordinate or a counter is a
   seed — Monte Carlo, noise, a stochastic automaton; `⌊X` and `⌈X` round
+- `--emit-sv`: the same program as a SystemVerilog streaming pipeline, one
+  cell per clock with line buffers for the shifts, simulated with Verilator
+  and held to the interpreter bit for bit
 - Functions: `smooth:{ X ((▷X + X + ▽X) / 3.0) }` defines one, `smooth INPUT`
   calls it, `A mix B` calls a function of two between its arguments, and the
   body is copied in at each call — nothing runs at call time, a function is
@@ -137,6 +140,7 @@ with what the `!` check could and could not settle.
 | `--no-simd` | Emit only scalar loops |
 | `--threads <N>` | Split every sweep across `N` threads; `0` (default) is one per CPU. `RHO_THREADS` overrides at run time |
 | `--portable` | Build for any x86-64 rather than this machine |
+| `--emit-sv <DIR>` | Also write the program as a SystemVerilog streaming pipeline, with a Verilator harness |
 
 ### 3. Call it from Python
 
@@ -369,6 +373,7 @@ smooth input drives it to zero and the kernel returns infinities.
 | Mixed precision, integer types | 📋 not planned — see the specification |
 | Explicit `<4 x double>` vector lowering | ✅ implemented — see the note below |
 | Sweeps split across threads | ✅ implemented — every `→`, `⇒` round, fold and comparison; 3–4x on cache-resident grids, bit-identical to one thread |
+| The program as a circuit (`--emit-sv`) | ✅ a SystemVerilog streaming pipeline, one cell per clock, simulated with Verilator and bit-identical to the interpreter; `real` cells, so the structure and timing, not yet a synthesisable datapath; flows, shifts, `⍳`, the arithmetic and the named functions — folds and `⇒` not yet |
 | Zero-copy binding (`&[0x…]`, `--bind`) | ✅ implemented |
 | `!` constraint check | ✅ interval arithmetic that models binary64 rounding, not ℝ; its claims are held to real runs by the differential test |
 | Diagnostics with source lines | ✅ implemented |

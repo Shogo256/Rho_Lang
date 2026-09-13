@@ -819,7 +819,42 @@ what ρ guarantees is that the split is there to use it. The second thread of
 a core rarely helped in these runs; `RHO_THREADS` set to the core count is a
 good first setting.
 
-## 7. Precision ✅
+## 7. The program as a circuit (`--emit-sv`) ✅
+
+A ρ program is a static dataflow: every `→` is a function of a cell and its
+neighbours, and nothing depends on data for its shape or its control. That is
+what a pipeline is, and `rhoc --emit-sv DIR` writes the program as one, in
+SystemVerilog: `rho_kernel.sv`, a module that takes one cell per clock in
+row-major order on `in_<SPACE>` and gives one cell per clock back on
+`out_OUTPUT`, and `rho_harness.cpp`, a Verilator harness that streams a file
+of doubles through it.
+
+Each flow is a stage. Its sources pass through delay lines deep enough to
+hold the furthest neighbour on either side of the cell; the stage reads the
+taps and its target is one more register. A shift along the innermost axis
+is a tap one cell away; along an outer axis it is a tap one line away — the
+line buffer every stencil accelerator has, here because the language said
+so. A boundary cell reads zero, decided by the cell's coordinates, which a
+counter carries along; `⍳` reads the same counter. A flow's latency is its
+sources' plus its reach plus two, and the module's latency is OUTPUT's: a
+6 × 8 grid through a four-point stencil, a square and a third flow leaves at
+clock 14 and runs in 48 + 14 clocks.
+
+The cells are `real` — IEEE double in simulation, calling the same libm the
+interpreter and the kernel call — so Verilator's run is held to the
+interpreter bit for bit, by the tests and by `DIFFTEST_SV=1 difftest`, which
+simulates every generated program the emitter accepts. `real` does not
+synthesise: what this is, is the structure and the timing of the circuit,
+one cell per clock, with the arithmetic units left to a later step — fixed
+point in the language, or floating-point cores.
+
+In the subset: `→`, arithmetic, comparisons as masks, `⌈ ⌊ |`, the named
+functions, `?`, `⌊X` `⌈X`, `⍳`, shifts along any axis, chains of flows,
+several inputs. Not yet, and said so with a line: folds and scans (an
+accumulator per line), `⇒` (an outer loop with a settled flag), lifts,
+the turns, `⌷`, and any broadcast.
+
+## 8. Precision ✅
 
 `rhoc --f32` compiles the kernel at single precision. There is no syntax for it:
 the width is a property of the artifact, not of the program, and the same source

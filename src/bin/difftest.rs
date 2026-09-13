@@ -592,6 +592,11 @@ fn main() {
     let (mut compared, mut skipped, mut mismatches) = (0usize, 0usize, 0usize);
     let mut two_inputs = 0usize;
     let mut iterating = 0usize;
+    // The circuit leg: every program the SystemVerilog emitter accepts is
+    // also simulated with Verilator and held to the interpreter. Off unless
+    // asked for, since each build takes seconds.
+    let circuit_leg = std::env::var("DIFFTEST_SV").is_ok();
+    let (mut circuit_compared, mut circuit_mismatches, mut circuit_failed) = (0usize, 0usize, 0usize);
     let mut stepping = 0usize;
     let mut narrow_mismatches = 0usize;
     let mut unsound = 0usize;
@@ -815,6 +820,29 @@ fn main() {
         if source.contains(":{") {
             stepping += 1;
         }
+        if circuit_leg {
+            if let Ok(circuit) = rho_lang::codegen::sv::emit(&block, RUN.tau) {
+                let feed: Vec<Vec<f64>> = circuit.inputs.iter().map(|(n, _)| inputs[n].clone()).collect();
+                let dir = std::path::PathBuf::from(format!("target/diffsv{round}"));
+                match rho_lang::codegen::sv::simulate(&circuit, &dir, &feed) {
+                    Ok((out, _)) => {
+                        circuit_compared += 1;
+                        if let Some(cell) = first_gap(&expected.cells, &out) {
+                            circuit_mismatches += 1;
+                            println!("CIRCUIT MISMATCH at cell {cell} (round {round}, shape {shape:?})");
+                            println!("{source}");
+                            println!("  interpreted {:?}", expected.cells[cell]);
+                            println!("  circuit     {:?}\n", out.get(cell));
+                        }
+                    }
+                    Err(e) => {
+                        circuit_failed += 1;
+                        println!("CIRCUIT BUILD FAILED (round {round}, shape {shape:?})\n{source}\n{e}\n");
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
         let mut so_runs = vec![("exec_spaces", output)];
         if let Some(via_args) = output_args {
             so_runs.push(("exec_with_args", via_args));
@@ -843,14 +871,21 @@ fn main() {
          claims checked {claims_checked} ({proofs_checked} proved constraints, \
          {derived_unproved} of {derived} derived ones left open), unsound {unsound}"
     );
+    if circuit_leg {
+        println!(
+            "  circuit: {circuit_compared} compared, {circuit_mismatches} mismatches, {circuit_failed} failed to build"
+        );
+    }
     if std::env::var("DIFFTEST_VERBOSE").is_ok() {
         for (reason, count) in &reasons {
             println!("  skipped {count:4} x {reason}");
         }
     }
-    std::process::exit(if mismatches > 0 || narrow_mismatches > 0 || unsound > 0 {
-        1
-    } else {
-        0
-    });
+    std::process::exit(
+        if mismatches > 0 || narrow_mismatches > 0 || unsound > 0 || circuit_mismatches > 0 || circuit_failed > 0 {
+            1
+        } else {
+            0
+        },
+    );
 }

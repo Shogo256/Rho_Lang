@@ -3894,6 +3894,89 @@ fn test_monadic_floor_and_ceiling() {
     assert_eq!(report.constraints[0].verdict, Verdict::Proved, "{:?}", report.constraints[0]);
 }
 
+// --------------------------------------------------------------------------
+// The program as a circuit: a SystemVerilog streaming pipeline, one cell per
+// clock, simulated with Verilator and held to the interpreter bit for bit.
+// Needs `verilator` on the path or in $VERILATOR; skipped without it.
+// --------------------------------------------------------------------------
+
+fn verilator_available() -> bool {
+    std::process::Command::new(rho_lang::codegen::sv::verilator())
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn test_the_circuit_gives_the_interpreters_bits_one_cell_per_clock() {
+    if !verilator_available() {
+        eprintln!("verilator not found: circuit test skipped");
+        return;
+    }
+    // Shifts along both axes (a tap one cell and one line away), coordinates,
+    // masks, the greater, the residue, a whole power, named functions, the
+    // roll and the floor, through two chained flows.
+    let source = r#"{
+        INPUT:◯ □ 6 8
+        ((▷0INPUT + ▽0INPUT + ▷1INPUT + ▽1INPUT) / 4.0) → M
+        ((M - INPUT) ^ 2) → D
+        ((D > 0.01) + ((⍳1 INPUT) ⌈ (3.0 | (⍳0 INPUT))) + (⌊((?INPUT) × 4.0)) + (abs (sin M)) + (ind (D < M))) → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let input: Vec<f64> = (0..48).map(|i| ((i as f64) * 0.7).sin() * 3.0).collect();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![6, 8], input.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+
+    let circuit = rho_lang::codegen::sv::emit(&block, 0.0).unwrap();
+    assert_eq!(circuit.inputs, vec![("INPUT".to_string(), 48)]);
+    assert_eq!(circuit.output_cells, 48);
+    assert!(circuit.module.contains("module rho_kernel"), "{}", circuit.module);
+    // A shift along axis 0 of a 6x8 grid reaches a line (8 cells) away, so
+    // the first stage's line is 2 * 8 + 1 taps deep.
+    assert!(circuit.module.contains("c0_INPUT [0:16]"), "{}", circuit.module);
+
+    let dir = std::path::Path::new("target/sv_stencil");
+    let (out, cycles) = rho_lang::codegen::sv::simulate(&circuit, dir, std::slice::from_ref(&input)).unwrap();
+    assert_eq!(out.len(), 48);
+    assert_eq!(bits(&out), bits(&meant), "circuit vs interpreter\n{}", circuit.module);
+    // One cell per clock: the run is the cells plus the pipeline's latency.
+    assert!(cycles as usize <= 48 + circuit.latency + 2, "cycles {cycles}, latency {}", circuit.latency);
+    assert!(cycles as usize >= 48 + circuit.latency - 2, "cycles {cycles}, latency {}", circuit.latency);
+
+    // Two inputs, flowing through a mix with a mask.
+    let source = r#"{
+        A:◯ □ 16
+        B:◯ □ 16
+        ((A × 0.25) + (B × 0.75) + (▷A > B)) → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let a: Vec<f64> = (0..16).map(|i| (i as f64 * 0.3).cos()).collect();
+    let b: Vec<f64> = (0..16).map(|i| (i as f64 * 0.5).sin()).collect();
+    let mut env: Env<f64> = Env::new();
+    env.insert("A".to_string(), Grid::from(vec![16], a.clone()));
+    env.insert("B".to_string(), Grid::from(vec![16], b.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    let circuit = rho_lang::codegen::sv::emit(&block, 0.0).unwrap();
+    let (out, _) = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new("target/sv_mix"), &[a, b]).unwrap();
+    assert_eq!(bits(&out), bits(&meant));
+}
+
+#[test]
+fn test_what_is_not_yet_a_circuit_says_so() {
+    for (source, what) in [
+        ("{\n    INPUT:◯ □ 4 4\n    (◇+1 INPUT) → =\n}", "fold"),
+        ("{\n    INPUT:◯ □ 4 4\n    INPUT → X\n    (X × 0.5) ⇒ X\n    X → =\n}", "fixed point"),
+        ("{\n    INPUT:◯ □ 4 4\n    ((1 ⌽ INPUT) + INPUT) → =\n}", "rotation"),
+    ] {
+        let block = parse_rho_program(source).unwrap();
+        let err = rho_lang::codegen::sv::emit(&block, 0.0).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("SystemVerilog subset") && text.contains(what), "{text}");
+    }
+}
+
 #[test]
 fn test_a_sweep_split_across_threads_gives_the_same_bits() {
     // A grid large enough to be split (the grain is lowered so that even

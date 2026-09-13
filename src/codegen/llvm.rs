@@ -107,6 +107,15 @@ impl Mode {
 }
 
 /// How one flow's sweep is split between scalar and vector loops.
+/// What a `⇒` round's sweep measures as it writes: the grid being replaced,
+/// and where the largest move so far is kept — one scalar, one vector of
+/// lanes — for the part to reduce when its range is done.
+struct Measure {
+    cur: String,
+    acc: String,
+    acc_vec: String,
+}
+
 enum Sweep {
     AllScalar,
     Split {
@@ -386,6 +395,7 @@ impl LlvmCodeGen {
         ir.push_str("declare ptr @malloc(i64)\n");
         ir.push_str("declare void @free(ptr)\n");
         ir.push_str("declare i64 @llvm.umax.i64(i64, i64)\n");
+        ir.push_str("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n");
         ir.push_str("declare i64 @llvm.umin.i64(i64, i64)\n");
         // The pool: run a part function over [0, n) split across threads,
         // and say how many parts that was.
@@ -1095,6 +1105,7 @@ impl LlvmCodeGen {
                         &label,
                         &format!("Flow {loop_id}"),
                         counter,
+                        None,
                     )?;
                     if let Some(skip) = guarded {
                         pred = Self::close_given(ir, &skip);
@@ -1129,6 +1140,7 @@ impl LlvmCodeGen {
         label: &str,
         what: &str,
         counter: &mut usize,
+        measured: Option<&str>,
     ) -> Result<String> {
         let mut pred = pred.to_string();
 
@@ -1153,8 +1165,30 @@ impl LlvmCodeGen {
         if bufs.parallel {
             // The sweep as a part over [lo, hi): the pool hands each thread
             // its own range, and this block only makes the call.
-            let (name, mut f, inner, translated) = self.open_part(bufs, &[target_ptr]);
+            let mut extra = vec![target_ptr];
+            extra.extend(measured);
+            let (name, mut f, inner, translated) = self.open_part(bufs, &extra);
             let tp = translated[target_ptr].clone();
+            // A round's sweep measures its largest move as it goes: one
+            // accumulator for the scalar cells, one of lanes for the vector
+            // body, both in the part's own frame, reduced into its slot of
+            // @rho_partial when the range is done.
+            let elem = self.precision.llvm_type();
+            let width = match plan {
+                Sweep::Split { width, .. } => width,
+                Sweep::AllScalar => 1,
+            };
+            let measure = measured.map(|cur| {
+                f.push_str(&format!("  %{label}.macc = alloca {elem}, align 8\n"));
+                f.push_str(&format!("  store {elem} {}, ptr %{label}.macc\n", self.f64_literal(0.0)));
+                f.push_str(&format!("  %{label}.maccv = alloca <{width} x {elem}>, align 64\n"));
+                f.push_str(&format!("  store <{width} x {elem}> zeroinitializer, ptr %{label}.maccv\n"));
+                Measure {
+                    cur: translated[cur].clone(),
+                    acc: format!("%{label}.macc"),
+                    acc_vec: format!("%{label}.maccv"),
+                }
+            });
             let mut p = "entry".to_string();
             match plan {
                 Sweep::AllScalar => {
@@ -1170,6 +1204,7 @@ impl LlvmCodeGen {
                         &inner,
                         counter,
                         &result_shape,
+                    measure.as_ref(),
                     )?;
                 }
                 Sweep::Split {
@@ -1218,6 +1253,7 @@ impl LlvmCodeGen {
                         &inner,
                         counter,
                         &result_shape,
+                    measure.as_ref(),
                     )?;
                     p = self.emit_range_loop(
                         &mut f,
@@ -1231,6 +1267,7 @@ impl LlvmCodeGen {
                         &inner,
                         counter,
                         &result_shape,
+                    measure.as_ref(),
                     )?;
                     p = self.emit_range_loop(
                         &mut f,
@@ -1244,8 +1281,33 @@ impl LlvmCodeGen {
                         &inner,
                         counter,
                         &result_shape,
+                    measure.as_ref(),
                     )?;
                 }
+            }
+            if let Some(m) = &measure {
+                // The largest of the lanes and of the scalar cells, the same
+                // rule as between cells, into this part's slot.
+                f.push_str(&format!("{p}.measure:\n"));
+                let mut acc = format!("%{label}.ms");
+                f.push_str(&format!("  {acc} = load {elem}, ptr {}\n", m.acc));
+                let lanes = Self::fresh(counter);
+                f.push_str(&format!("  {lanes} = load <{width} x {elem}>, ptr {}\n", m.acc_vec));
+                for lane in 0..width {
+                    let (l, grew, next) = (Self::fresh(counter), Self::fresh(counter), Self::fresh(counter));
+                    f.push_str(&format!("  {l} = extractelement <{width} x {elem}> {lanes}, i32 {lane}\n"));
+                    f.push_str(&format!("  {grew} = fcmp ogt {elem} {l}, {acc}\n"));
+                    f.push_str(&format!("  {next} = select i1 {grew}, {elem} {l}, {elem} {acc}\n"));
+                    acc = next;
+                }
+                f.push_str(&format!(
+                    "  %{label}.mslot = getelementptr inbounds {elem}, ptr @rho_partial, i64 %part\n"
+                ));
+                f.push_str(&format!("  store {elem} {acc}, ptr %{label}.mslot, align {}\n", self.precision.bytes()));
+                // the block above must be entered from the last loop's end
+                let text = format!("{p}.measure:\n");
+                let at = f.rfind(&text).unwrap();
+                f.insert_str(at, &format!("  br label %{p}.measure\n\n"));
             }
             let _ = p;
             self.close_part(ir, &name, f, &sweep);
@@ -1266,6 +1328,7 @@ impl LlvmCodeGen {
                     bufs,
                     counter,
                     &result_shape,
+                None,
                 )?;
             }
             Sweep::Split {
@@ -1286,6 +1349,7 @@ impl LlvmCodeGen {
                     bufs,
                     counter,
                     &result_shape,
+                None,
                 )?;
                 pred = self.emit_range_loop(
                     ir,
@@ -1299,6 +1363,7 @@ impl LlvmCodeGen {
                     bufs,
                     counter,
                     &result_shape,
+                None,
                 )?;
                 pred = self.emit_range_loop(
                     ir,
@@ -1312,6 +1377,7 @@ impl LlvmCodeGen {
                     bufs,
                     counter,
                     &result_shape,
+                None,
                 )?;
             }
         }
@@ -1377,6 +1443,30 @@ impl LlvmCodeGen {
         ir.push_str(&format!(
             "  %{label}.k = phi i64 [ 0, %{pred} ], [ %{label}.k.next, %{label}.decide ]\n"
         ));
+        // With the pool, the round reads one grid and writes the other, and
+        // the two swap roles each round through the pointer table the parts
+        // read: no copy back. The sweep measures the largest move as it
+        // writes. (Inline, the round is copied back and measured on the way.)
+        let (slot_held, slot_next) = if bufs.parallel {
+            let slots = self.slots.borrow();
+            (slots[&held], slots[&next])
+        } else {
+            (0, 0)
+        };
+        if bufs.parallel {
+            ir.push_str(&format!(
+                "  %{label}.cur = phi ptr [ {held}, %{pred} ], [ %{label}.nxt, %{label}.decide ]\n"
+            ));
+            ir.push_str(&format!(
+                "  %{label}.nxt = phi ptr [ {next}, %{pred} ], [ %{label}.cur, %{label}.decide ]\n"
+            ));
+            ir.push_str(&format!(
+                "  store ptr %{label}.cur, ptr getelementptr (ptr, ptr @rho_ctx, i64 {slot_held})\n"
+            ));
+            ir.push_str(&format!(
+                "  store ptr %{label}.nxt, ptr getelementptr (ptr, ptr @rho_ctx, i64 {slot_next})\n"
+            ));
+        }
         // The prelude's flows first, every round, each a sweep of its own.
         let mut inner_pred = format!("{label}.header");
         for (i, flow) in prelude.iter().enumerate() {
@@ -1404,6 +1494,7 @@ impl LlvmCodeGen {
                 &plabel,
                 &format!("Iterate {loop_id} prelude {i}"),
                 counter,
+                None,
             )?;
             if let Some(skip) = guarded {
                 inner_pred = Self::close_given(ir, &skip);
@@ -1419,32 +1510,16 @@ impl LlvmCodeGen {
             &format!("{label}.sweep"),
             &format!("Iterate {loop_id} round"),
             counter,
+            if bufs.parallel { Some(&held) } else { None },
         )?;
 
-        // Measure the largest move while copying the round back. A NaN move
-        // never compares greater, so a NaN grid never settles and runs to the
-        // cap — the same rule the reference interpreter follows.
+        // The largest move of the round. A NaN move never compares greater,
+        // the same rule the reference interpreter follows.
         let (settled_from, largest) = if bufs.parallel {
-            // Each part measures its range and leaves the largest move in
-            // its slot; the loop then takes the largest of those. A maximum
-            // is the same whichever order it is taken in, so the answer is
-            // the one thread's answer.
-            let (name, mut f, _inner, translated) = self.open_part(bufs, &[&next, &held]);
-            let (end, d) = self.emit_compare_loop(
-                &mut f,
-                &label,
-                "entry",
-                "%lo",
-                "%hi",
-                &translated[&next],
-                &translated[&held],
-            );
-            f.push_str(&format!("{end}:\n"));
-            f.push_str(&format!(
-                "  %{label}.slot = getelementptr inbounds {elem}, ptr @rho_partial, i64 %part\n"
-            ));
-            f.push_str(&format!("  store {elem} {d}, ptr %{label}.slot, align {align}\n"));
-            self.close_part(ir, &name, f, &length);
+            // Each part of the sweep left its largest move in its slot; the
+            // round's is the largest of those. A maximum is the same
+            // whichever order it is taken in, so the answer is the one
+            // thread's answer.
             ir.push_str(&format!("  %{label}.parts = call i64 @rho_rt_parts()\n"));
             ir.push_str(&format!("  br label %{label}.red\n\n"));
             ir.push_str(&format!("{label}.red:\n"));
@@ -1505,6 +1580,30 @@ impl LlvmCodeGen {
         // on the tolerance. Stopping at the cap counts as not converged even
         // if that last sweep happened to settle — the kernel did not check.
         ir.push_str(&format!("{label}.end:\n"));
+        let mut landing = format!("{label}.end");
+        if bufs.parallel {
+            // The last round wrote one of the two grids; the target's own
+            // buffer gets it if it was the other, once, and the table goes
+            // back to naming the buffers as the rest of the body knows them.
+            ir.push_str(&format!("  %{label}.moved = icmp ne ptr %{label}.nxt, {held}\n"));
+            ir.push_str(&format!(
+                "  br i1 %{label}.moved, label %{label}.copy, label %{label}.fin\n\n"
+            ));
+            ir.push_str(&format!("{label}.copy:\n"));
+            ir.push_str(&format!(
+                "  call void @llvm.memcpy.p0.p0.i64(ptr align {align} {held}, ptr align {align} %{label}.nxt, i64 {}, i1 false)\n",
+                cells * self.precision.bytes()
+            ));
+            ir.push_str(&format!("  br label %{label}.fin\n\n"));
+            ir.push_str(&format!("{label}.fin:\n"));
+            ir.push_str(&format!(
+                "  store ptr {held}, ptr getelementptr (ptr, ptr @rho_ctx, i64 {slot_held})\n"
+            ));
+            ir.push_str(&format!(
+                "  store ptr {next}, ptr getelementptr (ptr, ptr @rho_ctx, i64 {slot_next})\n"
+            ));
+            landing = format!("{label}.fin");
+        }
         ir.push_str(&format!("  %{label}.s0 = load i64, ptr @rho_sweeps\n"));
         ir.push_str(&format!("  %{label}.s1 = add i64 %{label}.s0, %{label}.k.next\n"));
         ir.push_str(&format!("  store i64 %{label}.s1, ptr @rho_sweeps\n"));
@@ -1513,7 +1612,7 @@ impl LlvmCodeGen {
             "  %{label}.c1 = select i1 %{label}.capped, i64 0, i64 %{label}.c0\n"
         ));
         ir.push_str(&format!("  store i64 %{label}.c1, ptr @rho_converged\n"));
-        Ok(format!("{label}.end"))
+        Ok(landing)
     }
 
     /// The loop that copies a round back over [lo, hi) and measures the
@@ -1952,6 +2051,7 @@ impl LlvmCodeGen {
         bufs: &Buffers,
         counter: &mut usize,
         result_shape: &[usize],
+        measure: Option<&Measure>,
     ) -> Result<String> {
         // A statically empty range needs no loop at all.
         if let (Ok(a), Ok(b)) = (lo.parse::<u64>(), hi.parse::<u64>()) {
@@ -1978,6 +2078,40 @@ impl LlvmCodeGen {
 
         ir.push_str(&format!("{body}:\n"));
         let value = self.emit_expr(src, ir, bufs, &idx, counter, mode, result_shape, &[])?;
+        if let Some(m) = measure {
+            // The move this cell makes, kept if it is the largest so far. A
+            // NaN move never compares greater, as in the reference.
+            let ty = mode.ty();
+            let suffix = match mode {
+                Mode::Scalar(_) => self.precision.intrinsic_suffix().to_string(),
+                Mode::Vector(w, _) => format!("v{w}{}", self.precision.intrinsic_suffix()),
+            };
+            let acc = match mode {
+                Mode::Scalar(_) => &m.acc,
+                Mode::Vector(..) => &m.acc_vec,
+            };
+            let (og, old, diff, mag, was, grew, now) = (
+                Self::fresh(counter),
+                Self::fresh(counter),
+                Self::fresh(counter),
+                Self::fresh(counter),
+                Self::fresh(counter),
+                Self::fresh(counter),
+                Self::fresh(counter),
+            );
+            ir.push_str(&format!(
+                "  {og} = getelementptr inbounds {}, ptr {}, i64 {idx}\n",
+                self.precision.llvm_type(),
+                m.cur
+            ));
+            ir.push_str(&format!("  {old} = load {ty}, ptr {og}, align {}\n", self.precision.bytes()));
+            ir.push_str(&format!("  {diff} = fsub {ty} {value}, {old}\n"));
+            ir.push_str(&format!("  {mag} = call {ty} @llvm.fabs.{suffix}({ty} {diff})\n"));
+            ir.push_str(&format!("  {was} = load {ty}, ptr {acc}\n"));
+            ir.push_str(&format!("  {grew} = fcmp ogt {ty} {mag}, {was}\n"));
+            ir.push_str(&format!("  {now} = select {} {grew}, {ty} {mag}, {ty} {was}\n", mode.bool_ty()));
+            ir.push_str(&format!("  store {ty} {now}, ptr {acc}\n"));
+        }
         let gep = Self::fresh(counter);
         ir.push_str(&format!(
             "  {gep} = getelementptr inbounds {}, ptr {target_ptr}, i64 {idx}\n",

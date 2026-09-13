@@ -826,6 +826,17 @@ is written between the flow and its reader. The interpreter and the `!`
 analysis see the program as written; the differential test holds the fused
 kernels to the interpreter as before.
 
+A `⇒` round is one sweep as well. It read the grid, wrote the next one, and
+then a second pass copied the next grid back over the first while measuring
+the largest move — three more passes over memory a round. With the pool the
+round's sweep now measures the move of each cell as it writes it (per part,
+into its slot of the partial table; the round's move is the largest of the
+parts', an order-free maximum with the same NaN rule as before), and the two
+grids swap roles through the pointer table the parts read, so nothing is
+copied until the loop ends, when the newest grid is copied once into the
+target's own buffer if it is the other one. The bounded entrypoint, whose
+loops are inline, keeps the copy-back.
+
 Measured with a C harness calling `rho_kernel_exec_with_args` (best of 20
 calls, one thread, i7-8550U):
 
@@ -835,7 +846,8 @@ calls, one thread, i7-8550U):
 | three flows, each reading the last | 1 M | 11.6 ms | 1.43 ms |
 | five-point stencil, then two flows on it | 1 M | 12.1 ms | 1.48 ms |
 | the same two, cache-resident | 64 K | 0.43 / 0.44 ms | 0.026 / 0.045 ms |
-| Jacobi through a `step` body, 4 rounds | 1 M | 57.1 ms | 20.3 ms |
+| Jacobi through a `step` body, 4 rounds | 1 M | 50.6 ms | 11.0 ms |
+| the same, cache-resident | 64 K | 1.52 ms | 0.21 ms |
 
 A sweep shorter than the grain — 16384 cells unless the kernel was compiled
 with another — runs on the calling thread: at 4096 cells the hand-off cost

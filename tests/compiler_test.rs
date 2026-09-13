@@ -4588,17 +4588,18 @@ fn test_a_sweep_split_across_threads_gives_the_same_bits() {
     }
     assert!(seen.windows(2).all(|w| w[0] == w[1]));
 
-    // The parts are what the pool runs: one function per sweep, per fold
-    // and per comparison, each over [lo, hi). Here: the copy into X, the
-    // fold and the sweep of ROW, the sweep of M, the round of the `⇒` and
-    // its comparison, the scan and the sweep of the output — eight.
+    // The parts are what the pool runs: one function per sweep and per
+    // fold, each over [lo, hi). Here: the copy into X, the fold and the
+    // sweep of ROW, the sweep of M, the round of the `⇒` (which measures
+    // its own largest move as it writes), the scan and the sweep of the
+    // output — seven.
     let ir = LlvmCodeGen::new("threads_ir")
         .with_tau(1e-10)
         .with_max_sweeps(100)
         .generate_llvm_ir(&block)
         .unwrap();
     let parts = ir.matches("define internal void @rho_part").count();
-    assert_eq!(parts, 8, "{ir}");
+    assert_eq!(parts, 7, "{ir}");
     assert!(ir.contains("@rho_partial"), "{ir}");
     // The bounded entrypoint keeps its inline, single-thread loops.
     let bounded = ir

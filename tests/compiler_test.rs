@@ -4798,3 +4798,95 @@ step:{ U
         report.constraints[0].verdict
     );
 }
+
+#[test]
+fn test_an_intermediate_read_once_cell_for_cell_is_computed_inside_its_reader() {
+    // A and B are each read by one later flow, cell for cell: their sweeps
+    // are folded into the reader's and run only for a caller who passes a
+    // buffer for the space. D is read under a shift and stays a sweep of
+    // its own; the fold's operand may be a fused space.
+    let source = "{\n    INPUT:◯ □ 6 8\n    (INPUT × 0.5) → A\n    (A + 1.0) → B\n    ((B × B) - (□1 (◇+1 B))) → D\n    (▷1D + D) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let mut codegen = LlvmCodeGen::new("fusion_chain");
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    assert!(ir.contains("; [A] is fused into its reader"), "{ir}");
+    assert!(ir.contains("; [B] is fused into its reader"), "{ir}");
+    assert!(!ir.contains("; [D] is fused into its reader"), "{ir}");
+    let so = "target/fusion_chain.so";
+    codegen.compile_to_so(&ir, so).unwrap();
+    let grid: Vec<f64> = (0..48).map(|i| ((i as f64) * 0.7).sin() * 3.0 + (i % 7) as f64 * 0.125).collect();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![6, 8], grid.clone()));
+    let meant = interpret_with(&block, &env, &Options { tau: 0.0, max_sweeps: 1 }).unwrap();
+    // The two-pointer entry: the intermediates are the kernel's.
+    let (out, _, _) = run_iterating(so, &grid, 48);
+    assert_eq!(bits(&out), bits(&meant["OUTPUT"].cells));
+    // The spaces entry, with and without buffers for A and B: the output is
+    // the same, and a buffer passed for a fused space is filled all the same.
+    let lib = unsafe { libloading::Library::new(so).unwrap() };
+    let spaces: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> = unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+    let order = kernel_spaces(&lib);
+    for pass_intermediates in [false, true] {
+        let mut bufs: Vec<Vec<f64>> = order.iter().map(|(_, cells, _)| vec![0.0; *cells]).collect();
+        let mut ptrs: Vec<*mut f64> = Vec::new();
+        for (k, (name, _, _)) in order.iter().enumerate() {
+            if name == "INPUT" {
+                bufs[k] = grid.clone();
+            }
+            let give = name == "INPUT" || name == "OUTPUT" || pass_intermediates;
+            ptrs.push(if give { bufs[k].as_mut_ptr() } else { std::ptr::null_mut() });
+        }
+        unsafe { spaces(ptrs.as_ptr()) };
+        for (k, (name, _, _)) in order.iter().enumerate() {
+            if name == "OUTPUT" || (pass_intermediates && name != "INPUT") {
+                assert_eq!(bits(&bufs[k]), bits(&meant[name.as_str()].cells), "{name}, intermediates passed: {pass_intermediates}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_a_bodys_flows_inside_a_loop_are_computed_inside_the_round() {
+    // The body's S and its value are read once each: one sweep a round.
+    let source = "\nstep:{ U\n    (▷U + ▽U) → S\n    (S / 4.0) → =\n}\n{\n    INPUT:◯ □ 48\n    INPUT → X\n    ((INPUT / 4.0) + (step X)) ⇒ X\n    X → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let mut codegen = LlvmCodeGen::new("fusion_body").with_tau(1e-9).with_max_sweeps(100);
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    assert!(ir.contains("; [step·1·S] is fused into its reader"), "{ir}");
+    assert!(ir.contains("; [step·1·=] is fused into its reader"), "{ir}");
+    let so = "target/fusion_body.so";
+    codegen.compile_to_so(&ir, so).unwrap();
+    let grid: Vec<f64> = (0..48).map(|i| ((i as f64) * 0.37).sin() * 2.0 + (i % 5) as f64 * 0.25).collect();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![48], grid.clone()));
+    let options = Options { tau: 1e-9, max_sweeps: 100 };
+    let meant = interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone();
+    let (out, sweeps, converged) = run_iterating(so, &grid, 48);
+    assert_eq!(bits(&out), bits(&meant));
+    assert!(converged && sweeps > 1, "{sweeps} sweeps");
+}
+
+#[test]
+fn test_scratch_is_kept_between_calls_and_the_bits_do_not_change() {
+    // An intermediate no caller asked for, a fold's lines and a loop's next
+    // grid are made once and kept; the second and third call reuse them.
+    let source = "{\n    INPUT:◯ □ 64 1024\n    (INPUT × 0.5) → A\n    (A - (□1 ((◇+1 A) / 1024.0))) → X\n    ((X × 0.5) + (▷1X × 0.25)) ⇒ X\n    X → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let mut codegen = LlvmCodeGen::new("kept_scratch").with_tau(1e-9).with_max_sweeps(50);
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    assert!(ir.contains("@rho_rt_scratch(ptr @rho_keep"), "{ir}");
+    assert!(!ir.contains("call ptr @malloc("), "{ir}");
+    let so = "target/kept_scratch.so";
+    codegen.compile_to_so(&ir, so).unwrap();
+    let grid: Vec<f64> = (0..65536).map(|i| ((i as f64) * 0.11).cos() * 4.0 + (i % 9) as f64 * 0.5).collect();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![64, 1024], grid.clone()));
+    let meant = interpret_with(&block, &env, &Options { tau: 1e-9, max_sweeps: 50 }).unwrap()["OUTPUT"].cells.clone();
+    let lib = unsafe { libloading::Library::new(so).unwrap() };
+    let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> = unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    for call in 0..3 {
+        let mut out = vec![0.0f64; 65536];
+        unsafe { func(grid.as_ptr(), out.as_mut_ptr()) };
+        assert_eq!(bits(&out), bits(&meant), "call {call}");
+    }
+}

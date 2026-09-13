@@ -281,9 +281,11 @@ Passing `NULL` as the output pointer makes the kernel write in place. Passing
 In the `spaces` table, each entry's metadata `role` says what the pointer is
 for: an `input` is read and must be non-null, or the call returns without
 touching memory; the `output` receives the result; an `internal` space may be
-`NULL`, in which case the kernel uses scratch of its own, or supplied, in which
-case the caller gets to see the intermediate. Buffers must hold as many values
-as the space's shape multiplies out to.
+`NULL`, in which case the kernel uses scratch of its own (kept between calls,
+freed when the library unloads), or supplied, in which case the caller gets to
+see the intermediate — computed for it even when the kernel would otherwise
+fold it into its reader's sweep. Buffers must hold as many values as the
+space's shape multiplies out to.
 
 ---
 
@@ -381,6 +383,7 @@ smooth input drives it to zero and the kernel returns infinities.
 | Mixed precision, integer types | 📋 not planned — see the specification |
 | Explicit `<4 x double>` vector lowering | ✅ implemented — see the note below |
 | Sweeps split across threads | ✅ implemented — every `→`, `⇒` round, fold and comparison; 3–4x on cache-resident grids, bit-identical to one thread |
+| Fused flows, kept scratch | ✅ an intermediate one flow reads cell for cell is computed inside that flow's sweep, and scratch is kept between calls: a chain of three flows over a million cells 11.6 → 1.4 ms, a Jacobi loop through a `step` body 57 → 20 ms, bit-identical |
 | The program as JAX (`--emit-jax`) | ✅ `rho` / `rho_jit` over `jax.numpy`, every construct including `⇒` and function bodies; bit-identical for arithmetic, shifts, masks and turns, within an ulp at the scale of the space for folds and transcendentals (XLA's own order and `exp`) |
 | The program as a circuit (`--emit-sv`) | ✅ a SystemVerilog streaming pipeline, one cell per clock, simulated with Verilator and bit-identical to the interpreter; flows, shifts, `⍳`, folds and scans with an accumulator per line, `⇒` as a loop over a grid in memory with the kernel's sweep count (a fold or a broadcast in it makes the round two passes), broadcasts, `□`, the turns `⌽ ⍉ ⍴ ↑ ↓` and `⌷` as reads by place out of a replay's memory (a matrix product is one), the arithmetic, the named functions and a body of flows inside `⇒` as stages of the round: the whole language. `real` cells for the structure and timing; `--fixed 32.16` for a datapath Yosys synthesises, bit-identical to the fixed-point interpreter: a 16×16 stencil is 401 LUT4 at 75.8 MHz on an iCE40 HX8K, a 48-cell Jacobi loop 642 LUT4 and 3 block RAMs at 89 MHz on an ECP5 (104 MHz through a `step` body); a division by a constant is a magic-number multiplier (4 DSP at 53 MHz on the ECP5 where the divider ran at 10.8) |
 | Zero-copy binding (`&[0x…]`, `--bind`) | ✅ implemented |

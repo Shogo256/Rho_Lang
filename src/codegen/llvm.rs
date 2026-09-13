@@ -212,6 +212,12 @@ pub struct LlvmCodeGen {
     slots: RefCell<BTreeMap<String, usize>>,
     slot_count: Cell<usize>,
     outlined_count: Cell<usize>,
+    /// The globals that hold scratch kept between calls, and their count.
+    keeps: RefCell<String>,
+    keep_count: Cell<usize>,
+    /// Intermediates fused into their reader (see `fuse`): their flows run
+    /// only when a caller passed a buffer for the space.
+    fused: BTreeSet<String>,
 }
 
 impl LlvmCodeGen {
@@ -237,6 +243,9 @@ impl LlvmCodeGen {
             slots: RefCell::new(BTreeMap::new()),
             slot_count: Cell::new(0),
             outlined_count: Cell::new(0),
+            keeps: RefCell::new(String::new()),
+            keep_count: Cell::new(0),
+            fused: BTreeSet::new(),
         }
     }
 
@@ -299,6 +308,13 @@ impl LlvmCodeGen {
 
     /// Generate complete LLVM IR (.ll) from a ToposBlock AST
     pub fn generate_llvm_ir(&mut self, block: &ToposBlock) -> Result<String> {
+        // An intermediate one flow reads cell for cell is computed inside
+        // that flow's sweep; its own sweep runs only for a caller who asked
+        // for the space. The interpreter and the analysis see the program
+        // as written.
+        let (fused_block, fused) = super::fuse::fuse(block);
+        self.fused = fused;
+        let block = &fused_block;
         self.statement_lines = block.lines.clone();
         self.written_spaces = Self::written_spaces(block);
         self.iterates = block
@@ -374,6 +390,7 @@ impl LlvmCodeGen {
         // The pool: run a part function over [0, n) split across threads,
         // and say how many parts that was.
         ir.push_str("declare void @rho_rt_run(ptr, i64, i64, i64)\n");
+        ir.push_str("declare ptr @rho_rt_scratch(ptr, i64)\n");
         ir.push_str("declare i64 @rho_rt_parts()\n\n");
         // What each part of a comparison found: the largest move in its range.
         ir.push_str(&format!(
@@ -432,6 +449,7 @@ impl LlvmCodeGen {
                 None => self.emit_scratch(&mut ir, "OUTPUT_local", self.elements, &mut heap),
             };
             let provided = Self::in_out(&in_sym, &out_sym);
+            self.emit_given(&mut ir, &|_| None);
             self.emit_entry(&mut ir, &provided, heap);
         } else {
             ir.push_str("  ; Not every space this kernel reads has an & binding:\n");
@@ -454,6 +472,7 @@ impl LlvmCodeGen {
         ir.push_str("exec_start:\n");
         ir.push_str("  %out_null = icmp eq ptr %out_ptr, null\n");
         ir.push_str("  %out_effective = select i1 %out_null, ptr %in_ptr, ptr %out_ptr\n");
+        self.emit_given(&mut ir, &|_| None);
         self.emit_entry(&mut ir, &Self::in_out("%in_ptr", "%out_effective"), Vec::new());
         ir.push_str("}\n\n");
 
@@ -479,6 +498,7 @@ impl LlvmCodeGen {
             "  %sweep = select i1 %b_short, i64 %n, i64 {}\n",
             self.elements
         ));
+        self.emit_given(&mut ir, &|_| None);
         self.emit_body(
             block,
             &mut ir,
@@ -525,8 +545,13 @@ impl LlvmCodeGen {
         // The parts the pool runs, and the table of pointers they read.
         ir.push_str(&self.outlined.borrow());
         ir.push_str(&format!(
-            "@rho_ctx = internal global [{} x ptr] zeroinitializer\n\n",
+            "@rho_ctx = internal global [{} x ptr] zeroinitializer\n",
             self.slot_count.get().max(1)
+        ));
+        ir.push_str(&self.keeps.borrow());
+        ir.push_str(&format!(
+            "@rho_given = internal global [{} x i8] zeroinitializer  ; which fused spaces the caller passed\n\n",
+            self.space_shapes.len().max(1)
         ));
 
         // No target-cpu pin in the IR: clang is told the machine, or not.
@@ -624,6 +649,54 @@ impl LlvmCodeGen {
 
     // --------------------------------------------------------------- buffers
 
+    /// Position of a space in the order every table uses.
+    fn space_slot(&self, name: &str) -> usize {
+        self.space_shapes.keys().position(|n| n == name).unwrap_or(0)
+    }
+
+    /// Record, for the body, whether the caller passed each fused space:
+    /// `null_flag(name)` is the i1 that is true when its pointer was null,
+    /// or None for an entrypoint through which no intermediate arrives.
+    fn emit_given(&self, ir: &mut String, null_flag: &dyn Fn(&str) -> Option<String>) {
+        let n = self.space_shapes.len().max(1);
+        for name in &self.fused {
+            let slot = self.space_slot(name);
+            let ident = self.sanitize_ident(name);
+            let value = match null_flag(name) {
+                Some(flag) => {
+                    ir.push_str(&format!("  %{ident}_have = xor i1 {flag}, true\n"));
+                    ir.push_str(&format!("  %{ident}_given = zext i1 %{ident}_have to i8\n"));
+                    format!("%{ident}_given")
+                }
+                None => "0".to_string(),
+            };
+            ir.push_str(&format!(
+                "  store i8 {value}, ptr getelementptr ([{n} x i8], ptr @rho_given, i64 0, i64 {slot})\n"
+            ));
+        }
+    }
+
+    /// A fused space's own sweep, run only when the caller asked for the
+    /// space: the test on @rho_given and the blocks around the sweep.
+    /// Returns the label the sweep starts in and the one that follows it.
+    fn open_given(&self, ir: &mut String, name: &str, label: &str) -> (String, String) {
+        let n = self.space_shapes.len().max(1);
+        let slot = self.space_slot(name);
+        let (run, skip) = (format!("{label}.given"), format!("{label}.owned"));
+        ir.push_str(&format!("  ; [{name}] is fused into its reader: its own sweep only if the caller passed it\n"));
+        ir.push_str(&format!(
+            "  %{label}.g = load i8, ptr getelementptr ([{n} x i8], ptr @rho_given, i64 0, i64 {slot})\n"
+        ));
+        ir.push_str(&format!("  %{label}.gb = icmp ne i8 %{label}.g, 0\n"));
+        ir.push_str(&format!("  br i1 %{label}.gb, label %{run}, label %{skip}\n\n{run}:\n"));
+        (run, skip)
+    }
+
+    fn close_given(ir: &mut String, skip: &str) -> String {
+        ir.push_str(&format!("  br label %{skip}\n\n{skip}:\n"));
+        skip.to_string()
+    }
+
     fn emit_scratch(
         &self,
         ir: &mut String,
@@ -634,12 +707,20 @@ impl LlvmCodeGen {
         let count = count.max(1);
         let sym = format!("%{label}");
         if count * 8 > STACK_LIMIT_BYTES {
-            ir.push_str(&format!("  ; [{label}] {count} cells -> heap\n"));
+            // Kept between calls (see rho_rt_scratch): the size is fixed
+            // here, and fresh pages cost more than the sweep at a million
+            // cells. Nothing goes on the free list.
+            let _ = &heap;
+            let keep = self.keep_count.get();
+            self.keep_count.set(keep + 1);
+            self.keeps
+                .borrow_mut()
+                .push_str(&format!("@rho_keep{keep} = internal global ptr null  ; [{label}]\n"));
+            ir.push_str(&format!("  ; [{label}] {count} cells -> scratch kept between calls\n"));
             ir.push_str(&format!(
-                "  {sym} = call ptr @malloc(i64 {})\n",
+                "  {sym} = call ptr @rho_rt_scratch(ptr @rho_keep{keep}, i64 {})\n",
                 count * self.precision.bytes()
             ));
-            heap.push(sym.clone());
         } else {
             ir.push_str(&format!("  ; [{label}] {count} cells -> stack\n"));
             ir.push_str(&format!(
@@ -872,6 +953,7 @@ impl LlvmCodeGen {
 
         ir.push_str("spaces_start:\n");
         let mut heap = Vec::new();
+        let mut null_flags: BTreeMap<String, String> = BTreeMap::new();
         for (name, arg, flag) in optional {
             let ident = self.sanitize_ident(&name);
             let count = self.space_shapes[&name].iter().product::<usize>().max(1);
@@ -880,8 +962,11 @@ impl LlvmCodeGen {
             ir.push_str(&format!(
                 "  {effective} = select i1 {flag}, ptr {own}, ptr {arg}\n"
             ));
-            provided.insert(name, effective);
+            provided.insert(name.clone(), effective);
+            null_flags.insert(name, flag);
         }
+        // A fused space's own flow runs here only when its pointer came in.
+        self.emit_given(ir, &|name: &str| null_flags.get(name).cloned());
 
         self.emit_entry(ir, &provided, heap);
         ir.push_str("}\n\n");
@@ -991,6 +1076,15 @@ impl LlvmCodeGen {
                         FlowTarget::Var(name) => self.lookup(bufs, name)?,
                         FlowTarget::Equilibrium => self.lookup(bufs, "OUTPUT")?,
                     };
+                    let label = format!("f{loop_id}");
+                    let guarded = match target {
+                        FlowTarget::Var(name) if self.fused.contains(name) => {
+                            let (run, skip) = self.open_given(ir, name, &label);
+                            pred = run;
+                            Some(skip)
+                        }
+                        _ => None,
+                    };
                     pred = self.emit_sweep(
                         src,
                         target,
@@ -998,10 +1092,13 @@ impl LlvmCodeGen {
                         ir,
                         bufs,
                         &pred,
-                        &format!("f{loop_id}"),
+                        &label,
                         &format!("Flow {loop_id}"),
                         counter,
                     )?;
+                    if let Some(skip) = guarded {
+                        pred = Self::close_given(ir, &skip);
+                    }
                     if matches!(target, FlowTarget::Equilibrium) {
                         break;
                     }
@@ -1291,6 +1388,12 @@ impl LlvmCodeGen {
                 continue;
             };
             let ptr = self.lookup(bufs, t)?;
+            let plabel = format!("{label}.p{i}");
+            let guarded = self.fused.contains(t).then(|| {
+                let (run, skip) = self.open_given(ir, t, &plabel);
+                inner_pred = run;
+                skip
+            });
             inner_pred = self.emit_sweep(
                 flow_src,
                 &FlowTarget::Var(t.clone()),
@@ -1298,10 +1401,13 @@ impl LlvmCodeGen {
                 ir,
                 bufs,
                 &inner_pred,
-                &format!("{label}.p{i}"),
+                &plabel,
                 &format!("Iterate {loop_id} prelude {i}"),
                 counter,
             )?;
+            if let Some(skip) = guarded {
+                inner_pred = Self::close_given(ir, &skip);
+            }
         }
         let after_sweep = self.emit_sweep(
             src,

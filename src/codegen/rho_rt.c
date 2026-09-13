@@ -9,6 +9,28 @@
  * A sweep shorter than the grain — what the kernel was compiled with, 16384
  * cells unless said otherwise, or RHO_GRAIN — runs on the caller alone.
  */
+#include <stdlib.h>
+
+/* Scratch a kernel keeps between calls: an intermediate no caller asked for,
+ * a fold's lines, a loop's next grid. Its size is fixed by the shapes at
+ * compile time, so it is made on first use and kept until the library
+ * unloads; a call then pays no page faults for memory it only borrows,
+ * which cost more than the sweeps did at a million cells. */
+#define RT_MAX_SCRATCH 4096
+static void *rt_scratch[RT_MAX_SCRATCH];
+static long rt_scratch_count;
+void *rho_rt_scratch(void **slot, unsigned long bytes) {
+    if (*slot == 0) {
+        *slot = malloc(bytes);
+        if (rt_scratch_count < RT_MAX_SCRATCH) rt_scratch[rt_scratch_count++] = *slot;
+    }
+    return *slot;
+}
+static void rt_free_scratch(void) {
+    for (long i = 0; i < rt_scratch_count; i++) free(rt_scratch[i]);
+    rt_scratch_count = 0;
+}
+
 #if defined(_WIN32)
 
 typedef void (*rho_part_fn)(long lo, long hi, long part);
@@ -100,13 +122,15 @@ static void *rt_worker(void *arg) {
 /* The kernel is being unloaded (or the process is ending): no worker may
  * outlive its code. Wake them all, tell them to leave, and wait. */
 __attribute__((destructor)) static void rt_stop(void) {
-    if (rt_made == 0) return;
-    pthread_mutex_lock(&rt_mu);
-    atomic_store_explicit(&rt_quit, 1, memory_order_release);
-    pthread_cond_broadcast(&rt_cv);
-    pthread_mutex_unlock(&rt_mu);
-    for (long i = 0; i < rt_made; i++) pthread_join(rt_workers[i], 0);
-    rt_made = 0;
+    if (rt_made > 0) {
+        pthread_mutex_lock(&rt_mu);
+        atomic_store_explicit(&rt_quit, 1, memory_order_release);
+        pthread_cond_broadcast(&rt_cv);
+        pthread_mutex_unlock(&rt_mu);
+        for (long i = 0; i < rt_made; i++) pthread_join(rt_workers[i], 0);
+        rt_made = 0;
+    }
+    rt_free_scratch();
 }
 
 static long rt_env(const char *name, long fallback) {

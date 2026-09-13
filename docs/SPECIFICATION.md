@@ -236,6 +236,9 @@ this.
 Each `→` is a complete, ordered sweep of the grid: every cell of the target is
 written before the next flow begins. This is what makes a shift well-defined —
 it always reads the previous flow's finished result, never a half-written buffer.
+(The compiled kernel computes an intermediate inside its reader's sweep when
+exactly one later flow reads it cell for cell — §6.1; nothing in the language
+can tell, and the bits are the same.)
 
 `=` marks the final output and ends the pipeline; statements after it are not
 lowered.
@@ -631,7 +634,7 @@ instead. `spaces[i]` is the *i*-th entry of the `spaces` array in
 |---|---|---|
 | `input` — no flow writes it | supplies it | returns without touching memory |
 | `output` — where `=` lands | reads the result from it | the kernel keeps the result to itself |
-| `internal` — written by a flow | may supply it to observe the intermediate | the kernel uses scratch of its own |
+| `internal` — written by a flow | may supply it to observe the intermediate (a fused one is then computed for it too, §6.1) | the kernel uses scratch of its own, kept between calls |
 
 A null table returns at once. The order is the metadata's, which is fixed by the
 names alone, so the same table serves every rebuild of the same source.
@@ -794,6 +797,45 @@ rhoc kernel.rho --threads 4      # 0, the default, is one per online CPU
 RHO_THREADS=4 ./a.out            # the kernel honours this when it runs
 RHO_GRAIN=65536 ./a.out          # do not split a sweep shorter than this
 ```
+
+### 6.1 Fused flows and kept scratch ✅
+
+Two things cost more than the sweeps did. An intermediate was written whole
+and read back by the next flow — two passes over memory for a value each
+cell could have kept in a register — and the scratch a call borrows for it
+(and for a fold's lines and a loop's next grid) was taken from the system
+and given back on every call, so every call paid the page faults of fresh
+memory: a chain of three flows over a million cells took nine times a single
+flow, not three.
+
+So the kernel keeps its scratch. Each site's size is fixed by the shapes at
+compile time; the memory is made on the first call and freed when the library
+unloads (`rho_rt_scratch` in the runtime). And an intermediate that exactly
+one later flow reads cell for cell — a plain name, under a lift, inside a
+fold's operand, as the index side of `⌷` — is computed inside that flow's
+sweep: its expression stands where its name stood, the same operations in the
+same order, only not stored and loaded in between. Its space stays declared;
+its own sweep runs when a caller of `rho_kernel_exec_spaces` passes a buffer
+for it, and not otherwise. Inside a `⇒` the same holds for the flows a body
+expands into, so `step:{ U (▷U + ▽U) → S (S / 4.0) → = }` is one sweep a
+round. Not fused: a space read under a shift, a turn, `⍳` or as what `⌷`
+gathers from; one read by two statements or by a loop (it would be
+recomputed); an expression with a turn or a gather in it (it would put the
+reader on the scalar path); and any case where something the expression reads
+is written between the flow and its reader. The interpreter and the `!`
+analysis see the program as written; the differential test holds the fused
+kernels to the interpreter as before.
+
+Measured with a C harness calling `rho_kernel_exec_with_args` (best of 20
+calls, one thread, i7-8550U):
+
+| Program | Cells | Before | After |
+|---|---|---|---|
+| one flow `(INPUT × 0.5) + 1.0` | 1 M | 1.19 ms | 0.99 ms |
+| three flows, each reading the last | 1 M | 11.6 ms | 1.43 ms |
+| five-point stencil, then two flows on it | 1 M | 12.1 ms | 1.48 ms |
+| the same two, cache-resident | 64 K | 0.43 / 0.44 ms | 0.026 / 0.045 ms |
+| Jacobi through a `step` body, 4 rounds | 1 M | 57.1 ms | 20.3 ms |
 
 A sweep shorter than the grain — 16384 cells unless the kernel was compiled
 with another — runs on the calling thread: at 4096 cells the hand-off cost

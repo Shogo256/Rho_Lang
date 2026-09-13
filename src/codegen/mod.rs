@@ -1,3 +1,4 @@
+pub(crate) mod fuse;
 pub mod jax;
 pub mod llvm;
 pub mod sv;

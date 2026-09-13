@@ -289,3 +289,186 @@ pub fn integer_power<S: Numeric>(base: &S, exponent: &S) -> S {
         acc
     }
 }
+
+/// A fixed-point number: `raw` / 2^F in two's complement of W bits. The
+/// arithmetic an integer datapath does, and the reference for a circuit's
+/// bits: a sum wraps, a product is shifted down with the floor, a quotient
+/// is truncated toward zero and a division by zero gives zero, a literal is
+/// rounded to the nearest step (half away from zero). There is no NaN, no
+/// infinity and no negative zero. The named functions that a circuit cannot
+/// do in integers — exp, log, sqrt, sin, cos, a power with a fractional
+/// exponent — go through a double here and are refused by the emitter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fixed<const W: u32, const F: u32> {
+    pub raw: i64,
+}
+
+impl<const W: u32, const F: u32> Fixed<W, F> {
+    pub const ONE: i64 = 1i64 << F;
+    const MASK: i64 = (1i64 << F) - 1;
+
+    /// Keep the low W bits, sign-extended: what a W-bit register holds.
+    pub fn wrap(v: i128) -> Self {
+        let shift = 128 - W;
+        Fixed {
+            raw: ((v << shift) >> shift) as i64,
+        }
+    }
+
+    /// The most positive and most negative values the width holds.
+    pub const MAX: i64 = (1i64 << (W - 1)) - 1;
+    pub const MIN: i64 = -(1i64 << (W - 1));
+
+    /// Round to the nearest step, half away from zero; an infinity is the
+    /// end of the range it points to (so a fold's identity is the extreme),
+    /// a NaN is zero; a value past the range wraps as the register would.
+    pub fn from_f64(v: f64) -> Self {
+        if v.is_nan() {
+            return Fixed { raw: 0 };
+        }
+        if v == f64::INFINITY {
+            return Fixed { raw: Self::MAX };
+        }
+        if v == f64::NEG_INFINITY {
+            return Fixed { raw: Self::MIN };
+        }
+        Self::wrap((v * (1u64 << F) as f64).round() as i128)
+    }
+
+    pub fn to_f64(self) -> f64 {
+        self.raw as f64 / (1u64 << F) as f64
+    }
+}
+
+impl<const W: u32, const F: u32> Numeric for Fixed<W, F> {
+    type Bool = bool;
+
+    fn constant(value: f64) -> Self {
+        Self::from_f64(value)
+    }
+    fn as_constant(&self) -> Option<f64> {
+        Some(self.to_f64())
+    }
+    fn add(&self, o: &Self) -> Self {
+        Self::wrap(self.raw as i128 + o.raw as i128)
+    }
+    fn sub(&self, o: &Self) -> Self {
+        Self::wrap(self.raw as i128 - o.raw as i128)
+    }
+    fn mul(&self, o: &Self) -> Self {
+        Self::wrap((self.raw as i128 * o.raw as i128) >> F)
+    }
+    fn div(&self, o: &Self) -> Self {
+        if o.raw == 0 {
+            return Fixed { raw: 0 };
+        }
+        Self::wrap(((self.raw as i128) << F) / o.raw as i128)
+    }
+    fn power(&self, o: &Self) -> Self {
+        Self::from_f64(self.to_f64().powf(o.to_f64()))
+    }
+    fn unary(&self, op: BuiltinOp) -> Self {
+        match op {
+            BuiltinOp::Abs => Self::wrap((self.raw as i128).abs()),
+            BuiltinOp::Indicator => Fixed {
+                raw: if self.raw != 0 { Self::ONE } else { 0 },
+            },
+            BuiltinOp::Floor => Fixed {
+                raw: self.raw & !Self::MASK,
+            },
+            BuiltinOp::Ceil => Self::wrap(((self.raw as i128) + Self::MASK as i128) & !(Self::MASK as i128)),
+            // The roll over the value's W bits, sign-extended to 64: the top
+            // F bits of the hash are the fraction of a number in [0, 1).
+            BuiltinOp::Roll => {
+                let bits = self.raw as u64;
+                let mut z = bits.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                Fixed {
+                    raw: (z >> (64 - F)) as i64,
+                }
+            }
+            BuiltinOp::Exp => Self::from_f64(self.to_f64().exp()),
+            BuiltinOp::Log => Self::from_f64(self.to_f64().ln()),
+            BuiltinOp::Sqrt => Self::from_f64(self.to_f64().sqrt()),
+            BuiltinOp::Sin => Self::from_f64(self.to_f64().sin()),
+            BuiltinOp::Cos => Self::from_f64(self.to_f64().cos()),
+        }
+    }
+    fn floor(&self) -> Self {
+        self.unary(BuiltinOp::Floor)
+    }
+    fn compare(&self, o: &Self, how: Compare) -> bool {
+        match how {
+            Compare::Gt => self.raw > o.raw,
+            Compare::Lt => self.raw < o.raw,
+            Compare::Gte => self.raw >= o.raw,
+            Compare::Lte => self.raw <= o.raw,
+            Compare::Eq => self.raw == o.raw,
+            Compare::Ne => self.raw != o.raw,
+        }
+    }
+    fn select(condition: &bool, a: &Self, b: &Self) -> Self {
+        if *condition {
+            *a
+        } else {
+            *b
+        }
+    }
+    fn truth(flag: &bool) -> bool {
+        *flag
+    }
+}
+
+#[cfg(test)]
+mod fixed_tests {
+    use super::*;
+
+    type Q = Fixed<32, 16>;
+
+    #[test]
+    fn a_literal_rounds_to_the_nearest_step_and_wraps_to_the_width() {
+        assert_eq!(Q::constant(1.0).raw, 1 << 16);
+        assert_eq!(Q::constant(0.5).raw, 1 << 15);
+        // Half a step away from zero rounds away from zero, as `round` does.
+        assert_eq!(Q::constant(1.0 / 131072.0).raw, 1);
+        assert_eq!(Q::constant(-1.0 / 131072.0).raw, -1);
+        assert_eq!(Q::constant(f64::NAN).raw, 0);
+        assert_eq!(Q::constant(f64::INFINITY).raw, i32::MAX as i64);
+        assert_eq!(Q::constant(f64::NEG_INFINITY).raw, i32::MIN as i64);
+        // 2^15 does not fit in Q16.16: it wraps to the negative end.
+        assert_eq!(Q::constant(32768.0).raw, i32::MIN as i64);
+        assert_eq!(Q::constant(1.5).to_f64(), 1.5);
+    }
+
+    #[test]
+    fn products_floor_quotients_truncate_and_zero_divides_to_zero() {
+        let (a, b) = (Q::constant(1.5), Q::constant(-2.25));
+        assert_eq!(a.mul(&b).to_f64(), -3.375);
+        assert_eq!(a.add(&b).to_f64(), -0.75);
+        assert_eq!(a.sub(&b).to_f64(), 3.75);
+        // -1 / 3 in Q16.16: the exact quotient is -21845.33 steps; toward zero.
+        assert_eq!(Q::constant(-1.0).div(&Q::constant(3.0)).raw, -21845);
+        // A tiny product shifts down with the floor: -1 step x 0.5 is -0.5 step, floored to -1.
+        assert_eq!(Fixed::<32, 16> { raw: -1 }.mul(&Q::constant(0.5)).raw, -1);
+        assert_eq!(Q::constant(1.0).div(&Q::constant(0.0)).raw, 0);
+        // The sum of two large values wraps rather than saturating.
+        assert_eq!(Q::constant(20000.0).add(&Q::constant(20000.0)).to_f64(), -25536.0);
+    }
+
+    #[test]
+    fn the_named_functions_a_datapath_has() {
+        assert_eq!(Q::constant(-2.5).unary(BuiltinOp::Abs).to_f64(), 2.5);
+        assert_eq!(Q::constant(-2.5).unary(BuiltinOp::Floor).to_f64(), -3.0);
+        assert_eq!(Q::constant(-2.5).unary(BuiltinOp::Ceil).to_f64(), -2.0);
+        assert_eq!(Q::constant(2.0).unary(BuiltinOp::Ceil).to_f64(), 2.0);
+        assert_eq!(Q::constant(0.001).unary(BuiltinOp::Indicator).to_f64(), 1.0);
+        assert_eq!(Q::constant(0.0).unary(BuiltinOp::Indicator).to_f64(), 0.0);
+        let rolls: Vec<f64> = (0..64).map(|i| Q::constant(i as f64).unary(BuiltinOp::Roll).to_f64()).collect();
+        assert!(rolls.iter().all(|r| (0.0..1.0).contains(r)));
+        assert!(rolls.windows(2).any(|w| w[0] != w[1]));
+        assert!(Q::constant(1.0).compare(&Q::constant(0.999), Compare::Gt));
+        assert_eq!(integer_power(&Q::constant(1.5), &Q::constant(3.0)).to_f64(), 3.375);
+    }
+}

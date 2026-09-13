@@ -65,6 +65,11 @@ struct Args {
     /// (rho_kernel.sv and a Verilator harness) into this directory.
     #[arg(long, value_name = "DIR")]
     emit_sv: Option<PathBuf>,
+
+    /// Make the circuit's cells fixed point, WIDTH.FRAC bits (e.g. 32.16),
+    /// which Yosys synthesises; without it they are `real`, for simulation.
+    #[arg(long, value_name = "W.F")]
+    fixed: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -202,7 +207,20 @@ fn run(args: &Args) -> anyhow::Result<()> {
     println!("  └─ Compilation Successful: Binary emitted to -> {}", out_path);
 
     if let Some(dir) = &args.emit_sv {
-        let circuit = rho_lang::codegen::sv::emit(&block, args.tau, args.max_iter).map_err(|e| block.attribute(e))?;
+        let numbers = match &args.fixed {
+            None => rho_lang::codegen::sv::Numbers::Real,
+            Some(spec) => {
+                let (w, f) = spec
+                    .split_once('.')
+                    .ok_or_else(|| anyhow::anyhow!("--fixed expects WIDTH.FRAC, such as 32.16, got '{spec}'"))?;
+                rho_lang::codegen::sv::Numbers::Fixed {
+                    width: w.parse().map_err(|_| anyhow::anyhow!("--fixed width '{w}' is not a number"))?,
+                    frac: f.parse().map_err(|_| anyhow::anyhow!("--fixed fraction '{f}' is not a number"))?,
+                }
+            }
+        };
+        let circuit = rho_lang::codegen::sv::emit(&block, args.tau, args.max_iter, numbers)
+            .map_err(|e| block.attribute(e))?;
         rho_lang::codegen::sv::write(&circuit, dir)?;
         println!(
             "  └─ Circuit emitted to -> {}/rho_kernel.sv (one cell per clock, latency {} clocks)",

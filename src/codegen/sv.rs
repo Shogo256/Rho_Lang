@@ -42,6 +42,69 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Command;
 
+/// What the cells are made of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Numbers {
+    /// SystemVerilog `real`: a double in simulation, not synthesisable.
+    /// The structure and timing of the circuit, with the arithmetic units
+    /// left for later.
+    Real,
+    /// Two's complement of `width` bits with `frac` fraction bits — a
+    /// datapath Yosys synthesises. The reference is `numeric::Fixed`: sums
+    /// wrap, products floor, quotients truncate toward zero, a division by
+    /// zero is zero. exp, log, sqrt, sin, cos and a fractional power are
+    /// refused.
+    Fixed { width: u32, frac: u32 },
+}
+
+impl Numbers {
+    /// The SystemVerilog type of a cell.
+    fn ty(self) -> String {
+        match self {
+            Numbers::Real => "real".to_string(),
+            Numbers::Fixed { width, .. } => format!("logic signed [{}:0]", width - 1),
+        }
+    }
+
+    /// A literal cell.
+    fn lit(self, v: f64) -> String {
+        match self {
+            Numbers::Real => format!("$bitstoreal(64'h{:016X})", v.to_bits()),
+            Numbers::Fixed { width, frac } => {
+                let raw = fixed_raw(v, width, frac);
+                format!("{width}'sh{:0w$X}", raw as u64 & mask(width), w = width.div_ceil(4) as usize)
+            }
+        }
+    }
+}
+
+fn mask(width: u32) -> u64 {
+    if width >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    }
+}
+
+/// `numeric::Fixed::from_f64` for a width and fraction known at run time.
+fn fixed_raw(v: f64, width: u32, frac: u32) -> i64 {
+    let max = (1i128 << (width - 1)) - 1;
+    let min = -(1i128 << (width - 1));
+    let wrap = |x: i128| -> i64 {
+        let shift = 128 - width;
+        ((x << shift) >> shift) as i64
+    };
+    if v.is_nan() {
+        0
+    } else if v == f64::INFINITY {
+        max as i64
+    } else if v == f64::NEG_INFINITY {
+        min as i64
+    } else {
+        wrap((v * (1u64 << frac) as f64).round() as i128)
+    }
+}
+
 /// What the emitter produced: the module, a Verilator harness for it, and
 /// the numbers a caller needs to drive it.
 #[derive(Debug)]
@@ -54,6 +117,7 @@ pub struct Circuit {
     pub output_cells: usize,
     /// Clocks from a cell entering to its output cell leaving.
     pub latency: usize,
+    pub numbers: Numbers,
 }
 
 /// What a simulation produced.
@@ -130,9 +194,6 @@ fn unsupported(what: &str, line: usize) -> HarmonyDisruption {
     }
 }
 
-fn real_literal(v: f64) -> String {
-    format!("$bitstoreal(64'h{:016X})", v.to_bits())
-}
 
 /// The spaces an expression reads, and the furthest a shift reaches along
 /// the buffer (in cells): the delay lines have to hold that much either side.
@@ -170,10 +231,13 @@ fn sources(expr: &Expr, shapes: &BTreeMap<String, Vec<usize>>, line: usize) -> R
                 out.insert(name.clone());
             }
             Expr::Index { operand, .. } => {
-                // A coordinate reads nothing; the operand only lends its shape.
-                let Expr::Var(_) = &**operand else {
+                // A coordinate reads no cell, but it takes the space's
+                // timing: the stage counts the space's cells to know where
+                // it is, so the space is a source of the stage all the same.
+                let Expr::Var(name) = &**operand else {
                     return Err(unsupported("`⍳` of a computed value", line));
                 };
+                out.insert(name.clone());
             }
             // A fold or scan was made a stage of its own before this walk;
             // only its name is left in the expression.
@@ -205,13 +269,14 @@ struct Lowering<'a> {
     stage: usize,
     tau: f64,
     line: usize,
+    numbers: Numbers,
 }
 
 impl Lowering<'_> {
     fn lower(&self, expr: &Expr) -> Result<String> {
         Ok(match expr {
-            Expr::Number(v) => real_literal(*v),
-            Expr::Var(name) if is_tau(name) => real_literal(self.tau),
+            Expr::Number(v) => self.numbers.lit(*v),
+            Expr::Var(name) if is_tau(name) => self.numbers.lit(self.tau),
             Expr::Var(name) => {
                 let (_, _, _, _, centre) = &self.chains[name];
                 format!("c{}_{}[{centre}]", self.stage, ident(name))
@@ -224,7 +289,7 @@ impl Lowering<'_> {
                 let shape = &self.shapes[name];
                 let (stride, extent) = axis_geometry(shape, *axis).ok_or_else(|| unsupported("an axis past the shape", self.line))?;
                 if extent <= 1 {
-                    return Ok(real_literal(0.0));
+                    return Ok(self.numbers.lit(0.0));
                 }
                 let a = axis.unwrap_or_else(|| default_axis(shape));
                 let (_, _, _, _, centre) = &self.chains[name];
@@ -234,7 +299,7 @@ impl Lowering<'_> {
                 };
                 format!(
                     "((pos[{a}] == {edge}) ? {} : c{}_{}[{tap}])",
-                    real_literal(0.0),
+                    self.numbers.lit(0.0),
                     self.stage,
                     ident(name)
                 )
@@ -245,11 +310,18 @@ impl Lowering<'_> {
                 };
                 let shape = &self.shapes[name];
                 let a = axis.unwrap_or_else(|| default_axis(shape));
-                format!("real'(pos[{a}])")
+                match self.numbers {
+                    Numbers::Real => format!("real'(pos[{a}])"),
+                    Numbers::Fixed { .. } => format!("fx_int(pos[{a}])"),
+                }
             }
             Expr::Builtin { op, operand } => {
                 let x = self.lower(operand)?;
+                let fixed = matches!(self.numbers, Numbers::Fixed { .. });
                 match op {
+                    BuiltinOp::Exp | BuiltinOp::Log | BuiltinOp::Sqrt | BuiltinOp::Sin | BuiltinOp::Cos if fixed => {
+                        return Err(unsupported(&format!("`{op}` in fixed point"), self.line))
+                    }
                     BuiltinOp::Exp => format!("$exp({x})"),
                     BuiltinOp::Log => format!("$ln({x})"),
                     BuiltinOp::Sqrt => format!("$sqrt({x})"),
@@ -258,6 +330,8 @@ impl Lowering<'_> {
                     BuiltinOp::Abs => format!("rho_abs({x})"),
                     BuiltinOp::Indicator => format!("rho_ind({x})"),
                     BuiltinOp::Roll => format!("rho_roll({x})"),
+                    BuiltinOp::Floor if fixed => format!("fx_floor({x})"),
+                    BuiltinOp::Ceil if fixed => format!("fx_ceil({x})"),
                     BuiltinOp::Floor => format!("$floor({x})"),
                     BuiltinOp::Ceil => format!("$ceil({x})"),
                 }
@@ -265,26 +339,35 @@ impl Lowering<'_> {
             Expr::BinaryOp { op, lhs, rhs } => {
                 let l = self.lower(lhs)?;
                 let r = self.lower(rhs)?;
+                let fixed = matches!(self.numbers, Numbers::Fixed { .. });
+                let bin = |f: &str, sym: &str, a: &str, b: &str| {
+                    if fixed {
+                        format!("{f}({a}, {b})")
+                    } else {
+                        format!("({a} {sym} {b})")
+                    }
+                };
                 match op {
-                    BinaryOpKind::Add => format!("({l} + {r})"),
-                    BinaryOpKind::Sub => format!("({l} - {r})"),
-                    BinaryOpKind::Mul => format!("({l} * {r})"),
-                    BinaryOpKind::Div => format!("({l} / {r})"),
+                    BinaryOpKind::Add => bin("fx_add", "+", &l, &r),
+                    BinaryOpKind::Sub => bin("fx_sub", "-", &l, &r),
+                    BinaryOpKind::Mul => bin("fx_mul", "*", &l, &r),
+                    BinaryOpKind::Div => bin("fx_div", "/", &l, &r),
                     BinaryOpKind::Pow => match whole_exponent(rhs) {
                         // Repeated multiplication, as the kernel and the
                         // interpreter do it, from the same rule.
                         Some(n) => {
                             let steps = n.unsigned_abs();
-                            let mut acc = real_literal(1.0);
+                            let mut acc = self.numbers.lit(1.0);
                             for _ in 0..steps {
-                                acc = format!("({acc} * {l})");
+                                acc = bin("fx_mul", "*", &acc, &l);
                             }
                             if n < 0 {
-                                format!("({} / {acc})", real_literal(1.0))
+                                bin("fx_div", "/", &self.numbers.lit(1.0), &acc)
                             } else {
                                 acc
                             }
                         }
+                        None if fixed => return Err(unsupported("a fractional power in fixed point", self.line)),
                         None => format!("$pow({l}, {r})"),
                     },
                     BinaryOpKind::Gt => format!("rho_mask({l} > {r}, {l})"),
@@ -312,7 +395,13 @@ fn ident(name: &str) -> String {
 }
 
 /// Emit the circuit for `block`, or say what in it is not yet a circuit.
-pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>) -> Result<Circuit> {
+pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) -> Result<Circuit> {
+    if let Numbers::Fixed { width, frac } = numbers {
+        if !(2..=64).contains(&width) || frac >= width {
+            return Err(unsupported(&format!("a fixed format of {width} bits with {frac} fraction bits"), 0));
+        }
+    }
+    let ty = numbers.ty();
     let mut shapes: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     let mut inputs: Vec<String> = Vec::new();
     for stmt in &block.statements {
@@ -399,6 +488,7 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>) -> Result<Circuit>
                     Kind::Flow,
                     line,
                     tau,
+                    numbers,
                     &shapes,
                     &streams,
                     stages.len(),
@@ -435,7 +525,7 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>) -> Result<Circuit>
                 };
                 // Every fold or scan in the expression becomes a stage first,
                 // innermost first, and its name stands in the expression.
-                let src = extract_folds(src, line, tau, &mut shapes, &mut streams, &mut stages, &mut folds_made)?;
+                let src = extract_folds(src, line, tau, numbers, &mut shapes, &mut streams, &mut stages, &mut folds_made)?;
                 let shape = expr_shape(&src, &shapes)
                     .or_else(|| shapes.get(&target).cloned())
                     .ok_or_else(|| unsupported("a flow with no shape", line))?;
@@ -446,6 +536,7 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>) -> Result<Circuit>
                     Kind::Flow,
                     line,
                     tau,
+                    numbers,
                     &shapes,
                     &streams,
                     stages.len(),
@@ -506,36 +597,36 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>) -> Result<Circuit>
     let _ = writeln!(sv, "  input  logic rst,");
     let _ = writeln!(sv, "  input  logic in_valid,");
     for (name, _) in &inputs {
-        let _ = writeln!(sv, "  input  real  in_{},", ident(name));
+        let _ = writeln!(sv, "  input  {ty} in_{},", ident(name));
     }
     let _ = writeln!(sv, "  output logic out_valid,");
-    let _ = writeln!(sv, "  output real  out_OUTPUT,");
+    let _ = writeln!(sv, "  output {ty} out_OUTPUT,");
     let _ = writeln!(sv, "  output longint out_sweeps,");
     let _ = writeln!(sv, "  output logic out_converged");
     let _ = writeln!(sv, ");");
-    sv.push_str(FUNCTIONS);
+    sv.push_str(&functions(numbers));
     for (name, cells) in &inputs {
         let id = ident(name);
         let _ = writeln!(sv, "  // the stream of {name}: {cells} cells, latency 1");
-        let _ = writeln!(sv, "  real  s_in_{id};");
+        let _ = writeln!(sv, "  {ty} s_in_{id};");
         let _ = writeln!(sv, "  logic v_in_{id};");
         let _ = writeln!(sv, "  longint n_in_{id};");
         let _ = writeln!(sv, "  always_ff @(posedge clk) begin");
-        let _ = writeln!(sv, "    if (rst) begin n_in_{id} <= 0; v_in_{id} <= 1'b0; s_in_{id} <= {}; end", real_literal(0.0));
+        let _ = writeln!(sv, "    if (rst) begin n_in_{id} <= 0; v_in_{id} <= 1'b0; s_in_{id} <= {}; end", numbers.lit(0.0));
         let _ = writeln!(sv, "    else begin");
         let _ = writeln!(sv, "      v_in_{id} <= in_valid && (n_in_{id} < {cells});");
-        let _ = writeln!(sv, "      s_in_{id} <= in_valid ? in_{id} : {};", real_literal(0.0));
+        let _ = writeln!(sv, "      s_in_{id} <= in_valid ? in_{id} : {};", numbers.lit(0.0));
         let _ = writeln!(sv, "      if (in_valid) n_in_{id} <= n_in_{id} + 1;");
         let _ = writeln!(sv, "    end");
         let _ = writeln!(sv, "  end");
     }
     for stage in &stages {
         if let Some(l) = loops.iter().find(|l| l.update == stage.index) {
-            emit_loop_declarations(&mut sv, l);
+            emit_loop_declarations(&mut sv, l, numbers);
         }
-        emit_stage(&mut sv, stage, &streams, &shapes);
+        emit_stage(&mut sv, stage, &streams, numbers);
         if let Some(l) = loops.iter().find(|l| l.update == stage.index) {
-            emit_loop_logic(&mut sv, l, stage);
+            emit_loop_logic(&mut sv, l, stage, numbers);
         }
     }
     let _ = writeln!(sv);
@@ -560,6 +651,7 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>) -> Result<Circuit>
     let _ = writeln!(h, "#include \"verilated.h\"");
     let _ = writeln!(h, "#include <cstdio>");
     let _ = writeln!(h, "#include <cstdlib>");
+    let _ = writeln!(h, "#include <cmath>");
     let _ = writeln!(h, "#include <vector>");
     let _ = writeln!(h, "int main(int argc, char** argv) {{");
     let _ = writeln!(h, "  Verilated::commandArgs(argc, argv);");
@@ -568,6 +660,26 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>) -> Result<Circuit>
     let _ = writeln!(h, "  std::vector<double> in({total_in});");
     let _ = writeln!(h, "  if ({total_in} > 0) {{ FILE* f = std::fopen(argv[1], \"rb\"); if (!f || std::fread(in.data(), sizeof(double), {total_in}, f) != {total_in}) {{ std::fprintf(stderr, \"short input\\n\"); return 3; }} std::fclose(f); }}");
     let _ = writeln!(h, "  Vrho_kernel m;");
+    match numbers {
+        Numbers::Real => {
+            let _ = writeln!(h, "  auto to_cell = [](double v) {{ return v; }};");
+            let _ = writeln!(h, "  auto from_cell = [](double v) {{ return v; }};");
+        }
+        Numbers::Fixed { width, frac } => {
+            // The same rounding as numeric::Fixed::from_f64, and the sign
+            // extension of a W-bit port read back as an unsigned word.
+            let _ = writeln!(h, "  const double scale = (double)(1ULL << {frac});");
+            let _ = writeln!(h, "  auto to_cell = [&](double v) -> unsigned long long {{");
+            let _ = writeln!(h, "    long long raw;");
+            let _ = writeln!(h, "    if (v != v) raw = 0; else if (v == 1.0/0.0) raw = (long long)(((unsigned long long)1 << ({width} - 1)) - 1); else if (v == -1.0/0.0) raw = -(long long)((unsigned long long)1 << ({width} - 1)); else raw = (long long)std::llround(v * scale);");
+            let _ = writeln!(h, "    return (unsigned long long)raw & {}ULL;", mask(width));
+            let _ = writeln!(h, "  }};");
+            let _ = writeln!(h, "  auto from_cell = [&](unsigned long long w) -> double {{");
+            let _ = writeln!(h, "    long long raw = (long long)(w << (64 - {width})) >> (64 - {width});");
+            let _ = writeln!(h, "    return (double)raw / scale;");
+            let _ = writeln!(h, "  }};");
+        }
+    }
     let _ = writeln!(h, "  auto tick = [&]() {{ m.clk = 0; m.eval(); m.clk = 1; m.eval(); }};");
     let _ = writeln!(h, "  m.rst = 1; m.in_valid = 0; tick(); m.rst = 0;");
     let _ = writeln!(h, "  std::vector<double> out; out.reserve({out_cells});");
@@ -577,11 +689,11 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>) -> Result<Circuit>
     let _ = writeln!(h, "    m.in_valid = t < {feed_cells};");
     let mut offset = 0usize;
     for (name, cells) in &inputs {
-        let _ = writeln!(h, "    m.in_{} = (t < {cells}) ? in[{offset} + t] : 0.0;", ident(name));
+        let _ = writeln!(h, "    m.in_{} = to_cell((t < {cells}) ? in[{offset} + t] : 0.0);", ident(name));
         offset += cells;
     }
     let _ = writeln!(h, "    tick(); cycles++;");
-    let _ = writeln!(h, "    if (m.out_valid) out.push_back(m.out_OUTPUT);");
+    let _ = writeln!(h, "    if (m.out_valid) out.push_back(from_cell(m.out_OUTPUT));");
     let _ = writeln!(h, "  }}");
     let _ = writeln!(h, "  m.final();");
     let _ = writeln!(h, "  FILE* o = std::fopen(argv[2], \"wb\"); if (!o) return 4;");
@@ -596,6 +708,7 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>) -> Result<Circuit>
         inputs,
         output_cells: out_cells,
         latency: out_latency,
+        numbers,
     })
 }
 
@@ -606,18 +719,19 @@ fn extract_folds(
     expr: &Expr,
     line: usize,
     tau: f64,
+    numbers: Numbers,
     shapes: &mut BTreeMap<String, Vec<usize>>,
     streams: &mut BTreeMap<String, Stream>,
     stages: &mut Vec<Stage>,
     made: &mut usize,
 ) -> Result<Expr> {
     let sub = |e: &Expr, shapes: &mut BTreeMap<String, Vec<usize>>, streams: &mut BTreeMap<String, Stream>, stages: &mut Vec<Stage>, made: &mut usize| -> Result<Box<Expr>> {
-        Ok(Box::new(extract_folds(e, line, tau, shapes, streams, stages, made)?))
+        Ok(Box::new(extract_folds(e, line, tau, numbers, shapes, streams, stages, made)?))
     };
     Ok(match expr {
         Expr::Reduce { op, axis, operand } | Expr::Scan { op, axis, operand } => {
             let running = matches!(expr, Expr::Scan { .. });
-            let operand = extract_folds(operand, line, tau, shapes, streams, stages, made)?;
+            let operand = extract_folds(operand, line, tau, numbers, shapes, streams, stages, made)?;
             let in_shape = expr_shape(&operand, shapes).ok_or_else(|| unsupported("a fold with no shape", line))?;
             let a = axis.unwrap_or_else(|| default_axis(&in_shape));
             if a >= in_shape.len() {
@@ -632,6 +746,7 @@ fn extract_folds(
                 Kind::Fold { op: *op, axis: a, running },
                 line,
                 tau,
+                numbers,
                 shapes,
                 streams,
                 stages.len(),
@@ -690,6 +805,7 @@ fn plan_stage(
     kind: Kind,
     line: usize,
     tau: f64,
+    numbers: Numbers,
     shapes: &BTreeMap<String, Vec<usize>>,
     streams: &BTreeMap<String, Stream>,
     index: usize,
@@ -746,6 +862,7 @@ fn plan_stage(
         stage: index,
         tau,
         line,
+        numbers,
     };
     let expr = lowering.lower(src)?;
     let _ = lowering.shape;
@@ -800,42 +917,44 @@ fn rename(expr: &Expr, f: &dyn Fn(&str) -> String) -> Expr {
 
 /// A loop's memories and the signals its update stage reads, declared ahead
 /// of the stage.
-fn emit_loop_declarations(sv: &mut String, l: &Loop) {
+fn emit_loop_declarations(sv: &mut String, l: &Loop, numbers: Numbers) {
     let k = l.id;
     let n = l.cells;
+    let ty = numbers.ty();
     let _ = writeln!(sv);
     let _ = writeln!(sv, "  // ---- loop {k}: ... ⇒ {} ({n} cells, at most {} sweeps)", l.target, l.cap);
     for (name, _) in &l.sources {
         let sid = ident(name);
         if *name == l.target {
-            let _ = writeln!(sv, "  real m{k}_{sid}_a [0:{}];  // {name}: the round's grid", n - 1);
-            let _ = writeln!(sv, "  real m{k}_{sid}_b [0:{}];  // {name}: the grid being written", n - 1);
+            let _ = writeln!(sv, "  {ty} m{k}_{sid}_a [0:{}];  // {name}: the round's grid", n - 1);
+            let _ = writeln!(sv, "  {ty} m{k}_{sid}_b [0:{}];  // {name}: the grid being written", n - 1);
         } else {
-            let _ = writeln!(sv, "  real m{k}_{sid} [0:{}];  // {name}, captured", n - 1);
+            let _ = writeln!(sv, "  {ty} m{k}_{sid} [0:{}];  // {name}, captured", n - 1);
         }
         let _ = writeln!(sv, "  longint cap{k}_{sid};  // cells captured");
-        let _ = writeln!(sv, "  real  rr{k}_{sid};  // the round stream of {name}");
+        let _ = writeln!(sv, "  {ty} rr{k}_{sid};  // the round stream of {name}");
     }
     let _ = writeln!(sv, "  logic rv{k};  // the round streams' valid");
     let _ = writeln!(sv, "  logic rs{k};  // a round starts: the update stage begins afresh");
     let _ = writeln!(sv, "  logic cur{k};  // which buffer of {} the round reads", l.target);
     let _ = writeln!(sv, "  longint i{k}, w{k}, round{k}, sw{k};");
     let _ = writeln!(sv, "  logic cv{k};");
-    let _ = writeln!(sv, "  real  d{k};  // the largest move this round");
+    let _ = writeln!(sv, "  {ty} d{k};  // the largest move this round");
     let _ = writeln!(sv, "  int   ls{k};  // 0 capture, 1 read, 2 drain, 3 emit, 4 done");
-    let _ = writeln!(sv, "  real  px{k};  // {} after the loop, streamed out", l.target);
+    let _ = writeln!(sv, "  {ty} px{k};  // {} after the loop, streamed out", l.target);
     let _ = writeln!(sv, "  logic pv{k};");
 }
 
 /// The loop's controller: capture, rounds, the decision, the read-out.
-fn emit_loop_logic(sv: &mut String, l: &Loop, update: &Stage) {
+fn emit_loop_logic(sv: &mut String, l: &Loop, update: &Stage, numbers: Numbers) {
     let k = l.id;
     let n = l.cells;
+    let ty = numbers.ty();
     let tid = ident(&l.target);
     let upd_value = format!("st{}_{}", update.index, ident(&update.target));
     let upd_valid = format!("v{}_out", update.index);
     let _ = writeln!(sv, "  always_ff @(posedge clk) begin : loop{k}");
-    let _ = writeln!(sv, "    real old, diff;");
+    let _ = writeln!(sv, "    {ty} old, diff;");
     let _ = writeln!(sv, "    logic all_captured, settled, capped;");
     let _ = writeln!(sv, "    if (rst) begin");
     for (name, _) in &l.sources {
@@ -844,7 +963,7 @@ fn emit_loop_logic(sv: &mut String, l: &Loop, update: &Stage) {
     let _ = writeln!(
         sv,
         "      rv{k} <= 1'b0; rs{k} <= 1'b0; cur{k} <= 1'b0; i{k} <= 0; w{k} <= 0; round{k} <= 0; sw{k} <= 0; cv{k} <= 1'b1; d{k} <= {}; ls{k} <= 0; pv{k} <= 1'b0;",
-        real_literal(0.0)
+        numbers.lit(0.0)
     );
     let _ = writeln!(sv, "    end else begin");
     let _ = writeln!(sv, "      rv{k} <= 1'b0; rs{k} <= 1'b0; pv{k} <= 1'b0;");
@@ -857,7 +976,7 @@ fn emit_loop_logic(sv: &mut String, l: &Loop, update: &Stage) {
     let all: Vec<String> = l.sources.iter().map(|(name, _)| format!("(cap{k}_{} == {n})", ident(name))).collect();
     let _ = writeln!(sv, "      all_captured = {};", all.join(" && "));
     let _ = writeln!(sv, "      case (ls{k})");
-    let _ = writeln!(sv, "        0: if (all_captured) begin ls{k} <= 1; i{k} <= 0; w{k} <= 0; d{k} <= {}; rs{k} <= 1'b1; end", real_literal(0.0));
+    let _ = writeln!(sv, "        0: if (all_captured) begin ls{k} <= 1; i{k} <= 0; w{k} <= 0; d{k} <= {}; rs{k} <= 1'b1; end", numbers.lit(0.0));
     // Read: one cell per clock from every source's memory.
     let _ = writeln!(sv, "        1: begin");
     for (name, _) in &l.sources {
@@ -873,14 +992,14 @@ fn emit_loop_logic(sv: &mut String, l: &Loop, update: &Stage) {
     let _ = writeln!(sv, "        end");
     // Drain: the update stage finishes; when every cell is written, decide.
     let _ = writeln!(sv, "        2: if (w{k} == {n}) begin");
-    let _ = writeln!(sv, "          settled = (d{k} <= {});", real_literal(l.tau));
+    let _ = writeln!(sv, "          settled = (d{k} <= {});", numbers.lit(l.tau));
     let _ = writeln!(sv, "          capped = (round{k} + 1 >= {});", l.cap);
     let _ = writeln!(sv, "          sw{k} <= sw{k} + 1;");
     let _ = writeln!(sv, "          if (settled || capped) begin");
     let _ = writeln!(sv, "            if (capped) cv{k} <= 1'b0;");
     let _ = writeln!(sv, "            cur{k} <= ~cur{k}; ls{k} <= 3; i{k} <= 0;");
     let _ = writeln!(sv, "          end else begin");
-    let _ = writeln!(sv, "            cur{k} <= ~cur{k}; round{k} <= round{k} + 1; i{k} <= 0; w{k} <= 0; d{k} <= {}; rs{k} <= 1'b1; ls{k} <= 1;", real_literal(0.0));
+    let _ = writeln!(sv, "            cur{k} <= ~cur{k}; round{k} <= round{k} + 1; i{k} <= 0; w{k} <= 0; d{k} <= {}; rs{k} <= 1'b1; ls{k} <= 1;", numbers.lit(0.0));
     let _ = writeln!(sv, "          end");
     let _ = writeln!(sv, "        end");
     // Emit: the settled grid streamed out for what follows.
@@ -895,7 +1014,14 @@ fn emit_loop_logic(sv: &mut String, l: &Loop, update: &Stage) {
     let _ = writeln!(sv, "      if ((ls{k} == 1 || ls{k} == 2) && {upd_valid}) begin");
     let _ = writeln!(sv, "        old = cur{k} ? m{k}_{tid}_b[w{k}] : m{k}_{tid}_a[w{k}];");
     let _ = writeln!(sv, "        if (cur{k}) m{k}_{tid}_a[w{k}] <= {upd_value}; else m{k}_{tid}_b[w{k}] <= {upd_value};");
-    let _ = writeln!(sv, "        diff = rho_abs({upd_value} - old);");
+    match numbers {
+        Numbers::Real => {
+            let _ = writeln!(sv, "        diff = rho_abs({upd_value} - old);");
+        }
+        Numbers::Fixed { .. } => {
+            let _ = writeln!(sv, "        diff = rho_abs(fx_sub({upd_value}, old));");
+        }
+    }
     let _ = writeln!(sv, "        if (diff > d{k}) d{k} <= diff;");
     let _ = writeln!(sv, "        w{k} <= w{k} + 1;");
     let _ = writeln!(sv, "      end");
@@ -905,7 +1031,8 @@ fn emit_loop_logic(sv: &mut String, l: &Loop, update: &Stage) {
 
 /// The SystemVerilog of one stage: alignment, lines, counters, flush, the
 /// computation, and for a fold the accumulators.
-fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>, _shapes: &BTreeMap<String, Vec<usize>>) {
+fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>, numbers: Numbers) {
+    let ty = numbers.ty();
     let k = stage.index;
     let tid = ident(&stage.target);
     let r = stage.reach;
@@ -934,16 +1061,16 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
         let sid = ident(src);
         let delay = base - latency;
         if delay == 0 {
-            let _ = writeln!(sv, "  real  a{k}_{sid};  always_comb a{k}_{sid} = {value};");
+            let _ = writeln!(sv, "  {ty} a{k}_{sid};  always_comb a{k}_{sid} = {value};");
             let _ = writeln!(sv, "  logic av{k}_{sid}; assign av{k}_{sid} = {valid};");
         } else {
-            let _ = writeln!(sv, "  real  ad{k}_{sid} [0:{}];", delay - 1);
+            let _ = writeln!(sv, "  {ty} ad{k}_{sid} [0:{}];", delay - 1);
             let _ = writeln!(sv, "  logic adv{k}_{sid} [0:{}];", delay - 1);
             let _ = writeln!(sv, "  always_ff @(posedge clk) begin");
             let _ = writeln!(sv, "    ad{k}_{sid}[0] <= {value}; adv{k}_{sid}[0] <= {clear} ? 1'b0 : {valid};");
             let _ = writeln!(sv, "    for (int i = 1; i < {delay}; i++) begin ad{k}_{sid}[i] <= ad{k}_{sid}[i - 1]; adv{k}_{sid}[i] <= {clear} ? 1'b0 : adv{k}_{sid}[i - 1]; end");
             let _ = writeln!(sv, "  end");
-            let _ = writeln!(sv, "  real  a{k}_{sid};  always_comb a{k}_{sid} = ad{k}_{sid}[{}];", delay - 1);
+            let _ = writeln!(sv, "  {ty} a{k}_{sid};  always_comb a{k}_{sid} = ad{k}_{sid}[{}];", delay - 1);
             let _ = writeln!(sv, "  logic av{k}_{sid}; assign av{k}_{sid} = adv{k}_{sid}[{}];", delay - 1);
         }
     }
@@ -962,25 +1089,25 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
     for (src, (_, _, _, length, centre)) in &stage.chains {
         let sid = ident(src);
         let l = format!("c{k}_{sid}");
-        let _ = writeln!(sv, "  real {l} [0:{}];  // {src}; centre tap {centre}", length - 1);
+        let _ = writeln!(sv, "  {ty} {l} [0:{}];  // {src}; centre tap {centre}", length - 1);
         let _ = writeln!(sv, "  always_ff @(posedge clk) if (en{k}) begin");
-        let _ = writeln!(sv, "    {l}[0] <= v{k}_src ? a{k}_{sid} : {};", real_literal(0.0));
+        let _ = writeln!(sv, "    {l}[0] <= v{k}_src ? a{k}_{sid} : {};", numbers.lit(0.0));
         let _ = writeln!(sv, "    for (int i = 1; i < {length}; i++) {l}[i] <= {l}[i - 1];");
         let _ = writeln!(sv, "  end");
     }
     let rank = stage.shape.len();
-    let _ = writeln!(sv, "  real  st{k}_{tid};");
+    let _ = writeln!(sv, "  {ty} st{k}_{tid};");
     let _ = writeln!(sv, "  logic v{k}_out;");
     if let Kind::Fold { axis, .. } = stage.kind {
         let (stride, _) = axis_geometry(&stage.shape, Some(axis)).unwrap_or((1, 1));
-        let _ = writeln!(sv, "  real acc{k} [0:{}];  // one accumulator per line across axis {axis}", stride - 1);
+        let _ = writeln!(sv, "  {ty} acc{k} [0:{}];  // one accumulator per line across axis {axis}", stride - 1);
     }
     let _ = writeln!(sv, "  always_ff @(posedge clk) begin : stage{k}");
     let _ = writeln!(sv, "    longint here;");
     let _ = writeln!(sv, "    longint pos [0:{}];", rank.max(1) - 1);
-    let _ = writeln!(sv, "    real x;");
+    let _ = writeln!(sv, "    {ty} x;");
     let _ = writeln!(sv, "    if ({clear}) begin");
-    let _ = writeln!(sv, "      n{k}_in <= 0; n{k}_real <= 0; n{k}_flushed <= 0; v{k}_out <= 1'b0; st{k}_{tid} <= {};", real_literal(0.0));
+    let _ = writeln!(sv, "      n{k}_in <= 0; n{k}_real <= 0; n{k}_flushed <= 0; v{k}_out <= 1'b0; st{k}_{tid} <= {};", numbers.lit(0.0));
     let _ = writeln!(sv, "    end else begin");
     let _ = writeln!(sv, "      v{k}_out <= 1'b0;");
     let _ = writeln!(sv, "      if (v{k}_src) n{k}_real <= n{k}_real + 1;");
@@ -1001,18 +1128,21 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
         }
         Kind::Fold { op, axis, running } => {
             let (stride, extent) = axis_geometry(&stage.shape, Some(axis)).unwrap_or((1, 1));
-            let step = match op {
-                FoldOp::Sum => "(a + x)",
-                FoldOp::Product => "(a * x)",
-                FoldOp::Max => "((x > a) ? x : a)",
-                FoldOp::Min => "((x < a) ? x : a)",
+            let fixed = matches!(numbers, Numbers::Fixed { .. });
+            let step = match (op, fixed) {
+                (FoldOp::Sum, false) => "(a + x)",
+                (FoldOp::Product, false) => "(a * x)",
+                (FoldOp::Sum, true) => "fx_add(a, x)",
+                (FoldOp::Product, true) => "fx_mul(a, x)",
+                (FoldOp::Max, _) => "((x > a) ? x : a)",
+                (FoldOp::Min, _) => "((x < a) ? x : a)",
             };
             let _ = writeln!(sv, "          begin : accumulate");
-            let _ = writeln!(sv, "            real a, next;");
+            let _ = writeln!(sv, "            {ty} a, next;");
             let _ = writeln!(sv, "            longint t, m;");
             let _ = writeln!(sv, "            t = here % {stride};");
             let _ = writeln!(sv, "            m = (here / {stride}) % {extent};");
-            let _ = writeln!(sv, "            a = (m == 0) ? {} : acc{k}[t];", real_literal(op.identity()));
+            let _ = writeln!(sv, "            a = (m == 0) ? {} : acc{k}[t];", numbers.lit(op.identity()));
             let _ = writeln!(sv, "            next = {step};");
             let _ = writeln!(sv, "            acc{k}[t] <= next;");
             if running {
@@ -1031,8 +1161,108 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
 }
 
 /// The helpers every module carries: the language's operations that are not
-/// one SystemVerilog operator, written to give the interpreter's bits.
-const FUNCTIONS: &str = r#"
+/// one SystemVerilog operator, written to give the reference's bits.
+fn functions(numbers: Numbers) -> String {
+    match numbers {
+        Numbers::Real => REAL_FUNCTIONS.to_string(),
+        Numbers::Fixed { width, frac } => {
+            let w = width;
+            let f = frac;
+            let one = numbers.lit(1.0);
+            let zero = numbers.lit(0.0);
+            let step_mask = format!("{w}'sh{:0wd$X}", ((1u128 << f) - 1) as u64 & mask(w), wd = w.div_ceil(4) as usize);
+            // No casts: Yosys and Verilator agree on assignments, which
+            // sign-extend into a wider variable and truncate into a narrower.
+            format!(
+                r#"
+  // Fixed point Q{w}.{f}: what an integer datapath does. The reference is
+  // numeric::Fixed in the compiler: sums wrap, products floor, quotients
+  // truncate toward zero, a division by zero is zero.
+  typedef logic signed [{wm}:0] cell_t;
+  typedef logic signed [{w2m}:0] wide_t;
+  function automatic cell_t fx_add(input cell_t a, input cell_t b);
+    fx_add = a + b;
+  endfunction
+  function automatic cell_t fx_sub(input cell_t a, input cell_t b);
+    fx_sub = a - b;
+  endfunction
+  function automatic cell_t fx_mul(input cell_t a, input cell_t b);
+    wide_t x, y, p;
+    x = a;
+    y = b;
+    p = x * y;
+    fx_mul = p >>> {f};
+  endfunction
+  function automatic cell_t fx_div(input cell_t a, input cell_t b);
+    wide_t n, d, q;
+    if (b == {zero}) fx_div = {zero};
+    else begin
+      n = a;
+      n = n <<< {f};
+      d = b;
+      q = n / d;
+      fx_div = q;
+    end
+  endfunction
+  function automatic cell_t fx_floor(input cell_t a);
+    fx_floor = a & ~{step_mask};
+  endfunction
+  function automatic cell_t fx_ceil(input cell_t a);
+    cell_t r;
+    r = a + {step_mask};
+    fx_ceil = r & ~{step_mask};
+  endfunction
+  // A whole number as a cell: the coordinate `⍳` reads.
+  function automatic cell_t fx_int(input longint i);
+    wide_t x;
+    x = i;
+    x = x <<< {f};
+    fx_int = x;
+  endfunction
+  function automatic cell_t rho_mask(input logic holds, input cell_t l);
+    rho_mask = holds ? l : {zero};
+  endfunction
+  function automatic cell_t rho_abs(input cell_t x);
+    cell_t r;
+    r = -x;
+    rho_abs = (x < {zero}) ? r : x;
+  endfunction
+  function automatic cell_t rho_ind(input cell_t x);
+    rho_ind = (x != {zero}) ? {one} : {zero};
+  endfunction
+  function automatic cell_t rho_extreme(input cell_t l, input cell_t r, input logic greater);
+    rho_extreme = greater ? ((l > r) ? l : r) : ((l < r) ? l : r);
+  endfunction
+  // APL's residue: B - A * floor(B / A); 0 | B is B.
+  function automatic cell_t rho_residue(input cell_t a, input cell_t b);
+    cell_t q, rem;
+    q = fx_floor(fx_div(b, a));
+    rem = fx_sub(b, fx_mul(a, q));
+    rho_residue = (a == {zero}) ? b : rem;
+  endfunction
+  // The roll over the cell's bits, sign-extended to 64: the top {f} bits of
+  // the hash are the fraction of a number in [0, 1).
+  function automatic cell_t rho_roll(input cell_t x);
+    longint signed xs;
+    longint unsigned z;
+    xs = x;
+    z = xs;
+    z = z + 64'h9E3779B97F4A7C15;
+    z = (z ^ (z >> 30)) * 64'hBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) * 64'h94D049BB133111EB;
+    z = z ^ (z >> 31);
+    rho_roll = z >> {shift};
+  endfunction
+"#,
+                wm = w - 1,
+                w2m = 2 * w - 1,
+                shift = 64 - f
+            )
+        }
+    }
+}
+
+const REAL_FUNCTIONS: &str = r#"
   // A comparison masks: the left value where it holds, zero elsewhere.
   function automatic real rho_mask(input logic holds, input real l);
     return holds ? l : $bitstoreal(64'h0);
@@ -1085,6 +1315,76 @@ pub fn write(circuit: &Circuit, dir: &Path) -> std::io::Result<()> {
 /// The verilator to run: $VERILATOR, else `verilator` on the path.
 pub fn verilator() -> String {
     std::env::var("VERILATOR").unwrap_or_else(|_| "verilator".to_string())
+}
+
+/// What synthesis and place-and-route reported for a circuit.
+#[derive(Debug, Default, Clone)]
+pub struct Synthesis {
+    /// Cell counts from Yosys `stat`, by cell type.
+    pub cells: BTreeMap<String, u64>,
+    /// nextpnr's maximum clock frequency in MHz, when it ran.
+    pub fmax_mhz: Option<f64>,
+    pub log: String,
+}
+
+/// Synthesise the circuit in `dir` for an FPGA family with Yosys ($YOSYS
+/// or `yosys`), and place and route it with nextpnr when that is found
+/// ($NEXTPNR_ICE40 / $NEXTPNR_ECP5 or on the path) to get a clock rate.
+/// `family` is "ice40" (hx8k) or "ecp5" (85k). Only a fixed-point circuit
+/// synthesises; `real` cells stop at Yosys with an error.
+pub fn synthesize(dir: &Path, family: &str) -> std::io::Result<Synthesis> {
+    let yosys = std::env::var("YOSYS").unwrap_or_else(|_| "yosys".to_string());
+    let json = dir.join("rho_kernel.json");
+    let script = format!(
+        "read_verilog -sv {}; synth_{family} -top rho_kernel -json {}; stat",
+        dir.join("rho_kernel.sv").display(),
+        json.display()
+    );
+    // Not quiet: `stat` writes to the log, which is what is parsed.
+    let out = Command::new(&yosys).args(["-Q", "-T", "-p", &script]).output()?;
+    let mut log = String::from_utf8_lossy(&out.stdout).to_string();
+    log.push_str(&String::from_utf8_lossy(&out.stderr));
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!("yosys failed:\n{log}")));
+    }
+    // `stat` lines read `     567   SB_LUT4` (or `TRELLIS_FF`, `$_...`).
+    let mut cells = BTreeMap::new();
+    for line in log.lines() {
+        let mut words = line.split_whitespace();
+        if let (Some(count), Some(kind), None) = (words.next(), words.next(), words.next()) {
+            if let Ok(n) = count.parse::<u64>() {
+                if kind.chars().next().is_some_and(|c| c.is_ascii_uppercase() || c == '$') {
+                    *cells.entry(kind.to_string()).or_insert(0) = n;
+                }
+            }
+        }
+    }
+    let (tool_env, tool, device_args): (&str, &str, Vec<&str>) = match family {
+        "ecp5" => ("NEXTPNR_ECP5", "nextpnr-ecp5", vec!["--85k", "--lpf-allow-unconstrained"]),
+        _ => ("NEXTPNR_ICE40", "nextpnr-ice40", vec!["--hx8k", "--package", "ct256", "--pcf-allow-unconstrained"]),
+    };
+    let nextpnr = std::env::var(tool_env).unwrap_or_else(|_| tool.to_string());
+    let mut fmax_mhz = None;
+    if let Ok(pnr) = Command::new(&nextpnr)
+        .args(&device_args)
+        .args(["--json", &json.display().to_string(), "--freq", "1"])
+        .output()
+    {
+        let text = format!("{}{}", String::from_utf8_lossy(&pnr.stdout), String::from_utf8_lossy(&pnr.stderr));
+        // "Max frequency for clock 'clk...': 61.23 MHz (PASS at 1.00 MHz)"
+        for line in text.lines().rev() {
+            if line.contains("Max frequency for clock") {
+                if let Some((_, rest)) = line.rsplit_once(':') {
+                    if let Some(num) = rest.split_whitespace().next() {
+                        fmax_mhz = num.parse().ok();
+                        break;
+                    }
+                }
+            }
+        }
+        log.push_str(&text);
+    }
+    Ok(Synthesis { cells, fmax_mhz, log })
 }
 
 /// Build the circuit in `dir` with Verilator and run it over `inputs` (in

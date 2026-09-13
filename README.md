@@ -50,8 +50,10 @@ Working prototype. What runs today:
   the same on every thread and every run, so a coordinate or a counter is a
   seed — Monte Carlo, noise, a stochastic automaton; `⌊X` and `⌈X` round
 - `--emit-sv`: the same program as a SystemVerilog streaming pipeline, one
-  cell per clock with line buffers for the shifts, simulated with Verilator
-  and held to the interpreter bit for bit
+  cell per clock with line buffers for the shifts, folds as accumulators
+  and `⇒` as a loop over block RAM; simulated with Verilator and held to
+  the interpreter bit for bit, and with `--fixed 32.16` synthesised by
+  Yosys into a real datapath
 - Functions: `smooth:{ X ((▷X + X + ▽X) / 3.0) }` defines one, `smooth INPUT`
   calls it, `A mix B` calls a function of two between its arguments, and the
   body is copied in at each call — nothing runs at call time, a function is
@@ -141,6 +143,7 @@ with what the `!` check could and could not settle.
 | `--threads <N>` | Split every sweep across `N` threads; `0` (default) is one per CPU. `RHO_THREADS` overrides at run time |
 | `--portable` | Build for any x86-64 rather than this machine |
 | `--emit-sv <DIR>` | Also write the program as a SystemVerilog streaming pipeline, with a Verilator harness |
+| `--fixed <W.F>` | Make the circuit's cells fixed point (e.g. `32.16`), which Yosys synthesises; the interpreter on the same numbers is the reference |
 
 ### 3. Call it from Python
 
@@ -373,7 +376,7 @@ smooth input drives it to zero and the kernel returns infinities.
 | Mixed precision, integer types | 📋 not planned — see the specification |
 | Explicit `<4 x double>` vector lowering | ✅ implemented — see the note below |
 | Sweeps split across threads | ✅ implemented — every `→`, `⇒` round, fold and comparison; 3–4x on cache-resident grids, bit-identical to one thread |
-| The program as a circuit (`--emit-sv`) | ✅ a SystemVerilog streaming pipeline, one cell per clock, simulated with Verilator and bit-identical to the interpreter; `real` cells, so the structure and timing, not yet a synthesisable datapath; flows, shifts, `⍳`, folds and scans with an accumulator per line, `⇒` as a loop over a grid in memory with the kernel's sweep count, the arithmetic and the named functions — broadcasts not yet |
+| The program as a circuit (`--emit-sv`) | ✅ a SystemVerilog streaming pipeline, one cell per clock, simulated with Verilator and bit-identical to the interpreter; flows, shifts, `⍳`, folds and scans with an accumulator per line, `⇒` as a loop over a grid in memory with the kernel's sweep count, the arithmetic and the named functions — broadcasts not yet. `real` cells for the structure and timing; `--fixed 32.16` for a datapath Yosys synthesises, bit-identical to the fixed-point interpreter: a 16×16 stencil is 928 LUT4 at 28.9 MHz on an iCE40, unoptimised |
 | Zero-copy binding (`&[0x…]`, `--bind`) | ✅ implemented |
 | `!` constraint check | ✅ interval arithmetic that models binary64 rounding, not ℝ; its claims are held to real runs by the differential test |
 | Diagnostics with source lines | ✅ implemented |

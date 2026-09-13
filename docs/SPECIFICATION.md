@@ -852,13 +852,39 @@ inside the fold; a fold of a fold is two stages; a fold's stream may be
 shifted like any other. Streams of one origin — the dense inputs of a shape,
 or one fold's completions — are aligned by whole clocks.
 
-The cells are `real` — IEEE double in simulation, calling the same libm the
-interpreter and the kernel call — so Verilator's run is held to the
-interpreter bit for bit, by the tests and by `DIFFTEST_SV=1 difftest`, which
-simulates every generated program the emitter accepts. `real` does not
-synthesise: what this is, is the structure and the timing of the circuit,
-one cell per clock, with the arithmetic units left to a later step — fixed
-point in the language, or floating-point cores.
+The cells are `real` by default — IEEE double in simulation, calling the
+same libm the interpreter and the kernel call — so Verilator's run is held
+to the interpreter bit for bit, by the tests and by `DIFFTEST_SV=1 difftest`,
+which simulates every generated program the emitter accepts. `real` does not
+synthesise: it is the structure and the timing of the circuit, one cell per
+clock.
+
+`--fixed W.F` makes the cells two's complement of W bits with F fraction
+bits — `--fixed 32.16` is Q16.16 — and that datapath Yosys synthesises. The
+reference is `numeric::Fixed` in the compiler, and the interpreter runs on
+it: a literal rounds to the nearest step (half away from zero), a sum wraps,
+a product is shifted down with the floor, a quotient is truncated toward
+zero, a division by zero is zero, an infinity is the end of the range (so a
+fold's identity is the extreme), there is no NaN. Every cell of a
+fixed-point circuit is the fixed-point interpreter's, bit for bit, on the
+same programs the `real` circuit is checked with — a stencil, a fold, a
+scan, a Jacobi loop. exp, log, sqrt, sin, cos and a fractional power are
+refused in fixed point with a line; the roll hashes the cell's bits and
+takes the top F bits as the fraction.
+
+First numbers, unoptimised, Q16.16, from Yosys 0.67 and nextpnr 0.11:
+
+| Circuit | Target | Cells | Clock |
+|---|---|---|---|
+| 16 × 16 five-point stencil and a blend, two stages | iCE40 HX8K | 928 LUT4, 2239 FF | 28.9 MHz |
+| Jacobi `⇒` on 48 cells, two buffers and INPUT in memory | ECP5 85K | 1020 LUT4, 2078 carry, 1553 FF, 5 BRAM | 5.5 MHz |
+
+The flip-flops are the line buffers (a 16-wide line, 32 bits a cell, twice
+over per source); the memories of the loop became block RAM on their own.
+The low clock of the loop is the 64-bit divider a `/ 4.0` becomes and the
+64-bit counters the coordinates are taken from: a division by a constant
+should be a multiplication or a shift, and a counter should be as wide as
+its count. Those are the next steps, not the language's.
 
 A `⇒` is a loop around a stage. The spaces the update reads are captured
 into memories as their streams arrive — the target into one of two buffers
@@ -874,10 +900,11 @@ round costs the cells plus the pipeline's drain.
 
 In the subset: `→`, arithmetic, comparisons as masks, `⌈ ⌊ |`, the named
 functions, `?`, `⌊X` `⌈X`, `⍳`, shifts along any axis, folds and scans along
-any axis, chains of flows, several inputs, `⇒` with an expression body. Not
-yet, and said so with a line: lifts and any broadcast, the turns, `⌷`, a
-fold or a body of flows inside `⇒`, and a flow that reads two streams of
-different timing (a fold's or a loop's and a dense one).
+any axis, chains of flows, several inputs, `⇒` with an expression body, and
+all of it in `real` or in fixed point. Not yet, and said so with a line:
+lifts and any broadcast, the turns, `⌷`, a fold or a body of flows inside
+`⇒`, a flow that reads two streams of different timing (a fold's or a
+loop's and a dense one), and in fixed point the transcendental functions.
 
 ## 8. Precision ✅
 

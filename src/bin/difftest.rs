@@ -821,7 +821,7 @@ fn main() {
             stepping += 1;
         }
         if circuit_leg {
-            if let Ok(circuit) = rho_lang::codegen::sv::emit(&block, RUN.tau, Some(SWEEPS)) {
+            if let Ok(circuit) = rho_lang::codegen::sv::emit(&block, RUN.tau, Some(SWEEPS), rho_lang::codegen::sv::Numbers::Real) {
                 let feed: Vec<Vec<f64>> = circuit.inputs.iter().map(|(n, _)| inputs[n].clone()).collect();
                 let dir = std::path::PathBuf::from(format!("target/diffsv{round}"));
                 match rho_lang::codegen::sv::simulate(&circuit, &dir, &feed) {

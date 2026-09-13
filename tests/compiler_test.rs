@@ -3929,7 +3929,7 @@ fn test_the_circuit_gives_the_interpreters_bits_one_cell_per_clock() {
     env.insert("INPUT".to_string(), Grid::from(vec![6, 8], input.clone()));
     let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
 
-    let circuit = rho_lang::codegen::sv::emit(&block, 0.0, None).unwrap();
+    let circuit = rho_lang::codegen::sv::emit(&block, 0.0, None, rho_lang::codegen::sv::Numbers::Real).unwrap();
     assert_eq!(circuit.inputs, vec![("INPUT".to_string(), 48)]);
     assert_eq!(circuit.output_cells, 48);
     assert!(circuit.module.contains("module rho_kernel"), "{}", circuit.module);
@@ -3959,7 +3959,7 @@ fn test_the_circuit_gives_the_interpreters_bits_one_cell_per_clock() {
     env.insert("A".to_string(), Grid::from(vec![16], a.clone()));
     env.insert("B".to_string(), Grid::from(vec![16], b.clone()));
     let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
-    let circuit = rho_lang::codegen::sv::emit(&block, 0.0, None).unwrap();
+    let circuit = rho_lang::codegen::sv::emit(&block, 0.0, None, rho_lang::codegen::sv::Numbers::Real).unwrap();
     let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new("target/sv_mix"), &[a, b]).unwrap();
     assert_eq!(bits(&run.output), bits(&meant));
 }
@@ -3990,7 +3990,7 @@ fn test_folds_and_scans_are_stages_of_the_circuit() {
         let mut env: Env<f64> = Env::new();
         env.insert("INPUT".to_string(), Grid::from(vec![4, 16], grid.clone()));
         let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
-        let circuit = rho_lang::codegen::sv::emit(&block, 0.0, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let circuit = rho_lang::codegen::sv::emit(&block, 0.0, None, rho_lang::codegen::sv::Numbers::Real).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(circuit.output_cells, meant.len(), "{name}");
         let dir_name = format!("target/sv_{name}");
         let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new(&dir_name), std::slice::from_ref(&grid))
@@ -4026,7 +4026,7 @@ fn test_a_fixed_point_is_a_loop_in_the_circuit() {
     let meant = interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone();
     let so = compile_iterating("sv_jacobi_ref", source, options.tau, options.max_sweeps, true);
     let (_, kernel_sweeps, kernel_converged) = run_iterating(&so, &b, 64);
-    let circuit = rho_lang::codegen::sv::emit(&block, options.tau, Some(options.max_sweeps)).unwrap();
+    let circuit = rho_lang::codegen::sv::emit(&block, options.tau, Some(options.max_sweeps), rho_lang::codegen::sv::Numbers::Real).unwrap();
     let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new("target/sv_jacobi"), std::slice::from_ref(&b)).unwrap();
     assert_eq!(bits(&run.output), bits(&meant), "{}", circuit.module);
     assert!(run.converged && kernel_converged);
@@ -4047,11 +4047,85 @@ fn test_a_fixed_point_is_a_loop_in_the_circuit() {
     env.insert("INPUT".to_string(), Grid::from(vec![6, 8], grid.clone()));
     let options = Options { tau: 1e-300, max_sweeps: 5 };
     let meant = interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone();
-    let circuit = rho_lang::codegen::sv::emit(&block, options.tau, Some(options.max_sweeps)).unwrap();
+    let circuit = rho_lang::codegen::sv::emit(&block, options.tau, Some(options.max_sweeps), rho_lang::codegen::sv::Numbers::Real).unwrap();
     let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new("target/sv_laplace"), std::slice::from_ref(&grid)).unwrap();
     assert_eq!(bits(&run.output), bits(&meant), "{}", circuit.module);
     assert_eq!(run.sweeps, 5);
     assert!(!run.converged);
+}
+
+#[test]
+fn test_a_fixed_point_circuit_gives_the_fixed_point_interpreters_bits() {
+    if !verilator_available() {
+        eprintln!("verilator not found: circuit test skipped");
+        return;
+    }
+    use rho_lang::codegen::sv::Numbers;
+    use rho_lang::numeric::Fixed;
+    type Q = Fixed<32, 16>;
+    let q = Numbers::Fixed { width: 32, frac: 16 };
+    // The interpreter on Q16.16 numbers is the reference: the same program,
+    // the same rounding, the same wrapping.
+    let cases: [(&str, &str, Option<usize>); 4] = [
+        ("fx_stencil", "{\n    INPUT:◯ □ 6 8\n    ((▷0INPUT + ▽0INPUT + ▷1INPUT + ▽1INPUT) / 4.0) → M\n    (((M - INPUT) ^ 2) + (M > 0.25) + ((⍳1 INPUT) ⌈ (3.0 | (⍳0 INPUT))) + (⌊((?INPUT) × 4.0)) + (abs M) + (ind (M < INPUT))) → =\n}", None),
+        ("fx_fold", "{\n    INPUT:◯ □ 6 8\n    ((◇+1 (INPUT × 0.5)) / 8.0) → ROW\n    ((▷ROW + ROW) × 0.5) → =\n}", None),
+        ("fx_scan", "{\n    INPUT:◯ □ 6 8\n    ((◈+1 INPUT) - (INPUT × 0.5)) → =\n}", None),
+        ("fx_jacobi", "{\n    INPUT:◯ □ 48\n    INPUT → X\n    ((INPUT - (▷X + ▽X)) / 4.0) ⇒ X\n    X → =\n}", Some(200)),
+    ];
+    let values: Vec<f64> = (0..48).map(|i| ((i as f64) * 0.7).sin() * 3.0 + (i % 7) as f64 * 0.125).collect();
+    for (name, source, cap) in cases {
+        let block = parse_rho_program(source).unwrap();
+        let shape: Vec<usize> = if name == "fx_jacobi" { vec![48] } else { vec![6, 8] };
+        let cells: Vec<Q> = values.iter().map(|v| Q::from_f64(*v)).collect();
+        let mut env: Env<Q> = Env::new();
+        env.insert("INPUT".to_string(), Grid::from(shape, cells));
+        let options = Options { tau: 1e-3, max_sweeps: cap.unwrap_or(1) };
+        let meant: Vec<f64> = interpret_with(&block, &env, &options).unwrap()["OUTPUT"]
+            .cells
+            .iter()
+            .map(|c| c.to_f64())
+            .collect();
+        let circuit = rho_lang::codegen::sv::emit(&block, options.tau, cap, q).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(circuit.module.contains("logic signed [31:0]"), "{name}");
+        let dir = format!("target/sv_{name}");
+        let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new(&dir), std::slice::from_ref(&values))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(bits(&run.output), bits(&meant), "{name}: fixed circuit vs fixed interpreter\n{}", circuit.module);
+        if name == "fx_jacobi" {
+            assert!(run.converged, "{} sweeps", run.sweeps);
+        }
+    }
+
+    // What fixed point cannot do is refused with the reason.
+    let block = parse_rho_program("{\n    INPUT:◯ □ 4\n    (exp INPUT) → =\n}").unwrap();
+    let err = rho_lang::codegen::sv::emit(&block, 0.0, None, q).unwrap_err().to_string();
+    assert!(err.contains("`exp` in fixed point"), "{err}");
+}
+
+#[test]
+fn test_a_fixed_point_circuit_synthesises() {
+    // Yosys turns the fixed-point stencil into cells; nextpnr, when it is
+    // there, gives a clock rate. The numbers are printed for the record; the
+    // test asserts that synthesis succeeds and that the datapath is real
+    // logic rather than nothing. Skipped without yosys.
+    let yosys = std::env::var("YOSYS").unwrap_or_else(|_| "yosys".to_string());
+    if !std::process::Command::new(&yosys).arg("-V").output().map(|o| o.status.success()).unwrap_or(false) {
+        eprintln!("yosys not found: synthesis test skipped");
+        return;
+    }
+    use rho_lang::codegen::sv::Numbers;
+    let q = Numbers::Fixed { width: 32, frac: 16 };
+    let source = "{\n    INPUT:◯ □ 16 16\n    ((▷0INPUT + ▽0INPUT + ▷1INPUT + ▽1INPUT) / 4.0) → M\n    ((M × 0.5) + (INPUT × 0.5)) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let circuit = rho_lang::codegen::sv::emit(&block, 0.0, None, q).unwrap();
+    let dir = std::path::Path::new("target/sv_synth_stencil");
+    rho_lang::codegen::sv::write(&circuit, dir).unwrap();
+    let synth = rho_lang::codegen::sv::synthesize(dir, "ice40").unwrap_or_else(|e| panic!("{e}"));
+    let luts = synth.cells.get("SB_LUT4").copied().unwrap_or(0);
+    let ffs: u64 = synth.cells.iter().filter(|(k, _)| k.starts_with("SB_DFF")).map(|(_, v)| *v).sum();
+    eprintln!("ice40 stencil 16x16 Q16.16: {luts} LUT4, {ffs} FF, fmax {:?} MHz", synth.fmax_mhz);
+    assert!(luts > 100, "{:?}", synth.cells);
+    assert!(ffs > 100, "{:?}", synth.cells);
 }
 
 #[test]
@@ -4062,7 +4136,7 @@ fn test_what_is_not_yet_a_circuit_says_so() {
         ("{\n    INPUT:◯ □ 4 4\n    ((1 ⌽ INPUT) + INPUT) → =\n}", "rotation"),
     ] {
         let block = parse_rho_program(source).unwrap();
-        let err = rho_lang::codegen::sv::emit(&block, 0.0, Some(8)).unwrap_err();
+        let err = rho_lang::codegen::sv::emit(&block, 0.0, Some(8), rho_lang::codegen::sv::Numbers::Real).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("SystemVerilog subset") && text.contains(what), "{text}");
     }

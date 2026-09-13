@@ -820,7 +820,13 @@ fn main() {
         if source.contains(":{") {
             stepping += 1;
         }
-        if circuit_leg {
+        // DIFFTEST_ROUND=n simulates the circuit of one round only; every
+        // round is still compiled and run, so the random stream is the same.
+        let this_round = std::env::var("DIFFTEST_ROUND")
+            .ok()
+            .and_then(|r| r.parse::<usize>().ok())
+            .is_none_or(|only| only == round);
+        if circuit_leg && this_round {
             if let Ok(circuit) = rho_lang::codegen::sv::emit(&block, RUN.tau, Some(SWEEPS), rho_lang::codegen::sv::Numbers::Real) {
                 let feed: Vec<Vec<f64>> = circuit.inputs.iter().map(|(n, _)| inputs[n].clone()).collect();
                 let dir = std::path::PathBuf::from(format!("target/diffsv{round}"));

@@ -903,6 +903,14 @@ a replay with no streamed source at all: 24 places read out of two
 memories into one accumulator. Subtracting each row's mean is the fold's
 stream captured next to the input and both replayed.
 
+A turn — `⌽ ⍉ ⍴ ↑ ↓` — and `⌷` read their space by place out of a replay's
+memory too: the place is computed from the cell's coordinates as the
+interpreter computes it (the rotation's wrap, the transpose's permutation,
+the reshape's reading round, the take's offset with zero past the end), or
+for `⌷` from the data, floored and checked against the space's cells. A
+space read only by a turn is captured whole and never streamed; one read
+both ways is streamed and its captured copy read by place.
+
 A `⇒` is a loop around a stage. The spaces the update reads are captured
 into memories as their streams arrive — the target into one of two buffers
 — and once all are there, each round streams every source out of its memory
@@ -925,11 +933,11 @@ Subtracting each row's mean and halving, `((X - □1 ((◇+1 X) / 16.0)) × 0.5)
 
 In the subset: `→`, arithmetic, comparisons as masks, `⌈ ⌊ |`, the named
 functions, `?`, `⌊X` `⌈X`, `⍳`, shifts along any axis, folds and scans along
-any axis, lifts and broadcasts, chains of flows, several inputs, `⇒` with
-an expression body that may fold and broadcast, and all of it in `real` or
-in fixed point. Not yet, and said so with a line: the turns, `⌷`, a body of
-flows inside `⇒`, a shift of a lifted space, and in fixed point the
-transcendental functions.
+any axis, lifts and broadcasts, the turns `⌽ ⍉ ⍴ ↑ ↓` and `⌷`, chains of
+flows, several inputs, `⇒` with an expression body that may fold, broadcast
+and turn, and all of it in `real` or in fixed point. Not yet, and said so
+with a line: a body of flows inside `⇒`, a shift of a lifted space, a flow
+with no space in it, and in fixed point the transcendental functions.
 
 ## 8. Precision ✅
 

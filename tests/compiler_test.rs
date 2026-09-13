@@ -4260,10 +4260,76 @@ fn test_a_fold_or_a_broadcast_inside_a_loop_makes_the_round_two_passes() {
 }
 
 #[test]
+fn test_the_turns_and_index_by_value_read_a_replays_memory_by_place() {
+    if !verilator_available() {
+        eprintln!("verilator not found: circuit test skipped");
+        return;
+    }
+    use rho_lang::codegen::sv::Numbers;
+    use rho_lang::numeric::Fixed;
+    type Q = Fixed<32, 16>;
+    // Every turn on one grid, each a place computed from the cell's
+    // coordinates: rotations on both axes, a reversal, a transpose, a
+    // reshape that reads round, a take past the end and a drop.
+    let turns = "{\n    INPUT:◯ □ 4 6\n    ((1 ⌽1 INPUT) + (-1 ⌽0 INPUT) + (⌽INPUT) + (INPUT × 0.5)) → T\n    (⍉T) → U\n    (4 6 ⍴ U) → V\n    (8 ↑1 V) → W\n    ((2 ↓1 W) - (-6 ↑1 W)) → =\n}";
+    // A lookup table read at places the data names, out of range giving zero.
+    let lookup = "{\n    INPUT:◯ □ 4 6\n    TABLE:◯ □ 8\n    ((INPUT × 3.0) ⌷ TABLE) → =\n}";
+    // A ring: rotation inside a fixed point, the round replayed each time.
+    let ring = "{\n    INPUT:◯ □ 16\n    INPUT → U\n    (((1 ⌽ U) + U + (-1 ⌽ U)) / 3.0) ⇒ U\n    U → =\n}";
+    let grid: Vec<f64> = (0..24).map(|i| ((i as f64) * 0.7).sin() * 2.0 + (i % 5) as f64 * 0.25).collect();
+    let table: Vec<f64> = (0..8).map(|i| (i as f64) * 1.5 - 2.0).collect();
+    let line: Vec<f64> = (0..16).map(|i| if i == 5 { 8.0 } else { 0.0 }).collect();
+    type Spaces = Vec<(&'static str, Vec<usize>, Vec<f64>)>;
+    let cases: [(&str, &str, Spaces, Option<usize>); 3] = [
+        ("turns", turns, vec![("INPUT", vec![4, 6], grid.clone())], None),
+        ("lookup", lookup, vec![("INPUT", vec![4, 6], grid.clone()), ("TABLE", vec![8], table.clone())], None),
+        ("ring", ring, vec![("INPUT", vec![16], line.clone())], Some(200)),
+    ];
+    for (name, source, inputs, cap) in &cases {
+        let block = parse_rho_program(source).unwrap();
+        let options = Options { tau: 1e-6, max_sweeps: cap.unwrap_or(1) };
+        for numbers in [Numbers::Real, Numbers::Fixed { width: 32, frac: 16 }] {
+            let meant: Vec<f64> = match numbers {
+                Numbers::Real => {
+                    let mut env: Env<f64> = Env::new();
+                    for (n, shape, data) in inputs {
+                        env.insert(n.to_string(), Grid::from(shape.clone(), data.clone()));
+                    }
+                    interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone()
+                }
+                Numbers::Fixed { .. } => {
+                    let mut env: Env<Q> = Env::new();
+                    for (n, shape, data) in inputs {
+                        env.insert(n.to_string(), Grid::from(shape.clone(), data.iter().map(|v| Q::from_f64(*v)).collect()));
+                    }
+                    interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.iter().map(|c| c.to_f64()).collect()
+                }
+            };
+            let circuit = rho_lang::codegen::sv::emit(&block, options.tau, *cap, numbers).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let dir = format!("target/sv_turn_{name}_{}", if matches!(numbers, Numbers::Real) { "real" } else { "fixed" });
+            let feed: Vec<Vec<f64>> = circuit.inputs.iter().map(|(n, _)| inputs.iter().find(|(m, _, _)| m == n).unwrap().2.clone()).collect();
+            let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new(&dir), &feed).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(bits(&run.output), bits(&meant), "{name} {numbers:?}: circuit vs interpreter\n{}", circuit.module);
+            // The ring relaxes slowly: at this tolerance it runs into its
+            // cap, as the interpreter did, and says so.
+            if let Some(cap) = cap {
+                assert_eq!(run.sweeps as usize, *cap, "{name} {numbers:?}");
+                assert!(!run.converged, "{name} {numbers:?}");
+            }
+        }
+    }
+    // By hand, the lookup: 0.25 * 3 = 0.75 floors to place 0, the table's -2.
+    let block = parse_rho_program(lookup).unwrap();
+    let circuit = rho_lang::codegen::sv::emit(&block, 0.0, None, Numbers::Real).unwrap();
+    let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new("target/sv_turn_lookup_real"), &[grid.clone(), table.clone()]).unwrap();
+    assert_eq!(run.output[0], -2.0);
+}
+
+#[test]
 fn test_what_is_not_yet_a_circuit_says_so() {
     for (source, what) in [
         ("\nstep:{ U\n    (▷U + ▽U) → S\n    (S / 4.0) → =\n}\n{\n    INPUT:◯ □ 4 4\n    INPUT → X\n    (step X) ⇒ X\n    X → =\n}", "body of flows"),
-        ("{\n    INPUT:◯ □ 4 4\n    ((1 ⌽ INPUT) + INPUT) → =\n}", "rotation"),
+        ("{\n    INPUT:◯ □ 4 4\n    (1.0 + 2.0) → OUTPUT\n    OUTPUT → =\n}", "no shape"),
     ] {
         let block = parse_rho_program(source).unwrap();
         let err = rho_lang::codegen::sv::emit(&block, 0.0, Some(8), rho_lang::codegen::sv::Numbers::Real).unwrap_err();

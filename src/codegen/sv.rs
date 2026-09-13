@@ -38,8 +38,10 @@
 //! are streamed out of them, the broadcast ones read at the mapped place —
 //! which is what makes a matrix product a circuit. Inside a `⇒` a fold or
 //! a broadcast makes the round two passes: the first streams the grid
-//! through the folds, the second replays it with their results. Not yet:
-//! the turns, `⌷`, and a body of flows inside `⇒`.
+//! through the folds, the second replays it with their results. A turn —
+//! `⌽ ⍉ ⍴ ↑ ↓` — and `⌷` read their space out of a replay's memory at a
+//! place computed from the cell's coordinates, or from the data. Not yet:
+//! a body of flows inside `⇒`.
 
 use crate::ast::*;
 use crate::error::{HarmonyDisruption, Result};
@@ -282,10 +284,25 @@ fn sources(expr: &Expr, shapes: &BTreeMap<String, Vec<usize>>, line: usize) -> R
             // A lift reads its space at a mapped place; the place is the
             // stage's business (see `usage`), the space is a source.
             Expr::Lift { operand, .. } => walk(operand, shapes, line, out, reach)?,
-            Expr::Rotate { .. } | Expr::Reverse { .. } => return Err(unsupported("a rotation or reversal", line)),
-            Expr::Reshape { .. } | Expr::Transpose { .. } => return Err(unsupported("a reshape or transpose", line)),
-            Expr::Take { .. } | Expr::Drop { .. } => return Err(unsupported("a take or drop", line)),
-            Expr::Gather { .. } => return Err(unsupported("an index by value (`⌷`)", line)),
+            // A turn reads its space at a computed place, out of memory.
+            Expr::Rotate { operand, .. }
+            | Expr::Reverse { operand, .. }
+            | Expr::Reshape { operand, .. }
+            | Expr::Transpose { operand, .. }
+            | Expr::Take { operand, .. }
+            | Expr::Drop { operand, .. } => {
+                let Expr::Var(name) = &**operand else {
+                    return Err(unsupported("a turn of a computed value", line));
+                };
+                out.insert(name.clone());
+            }
+            Expr::Gather { index, operand } => {
+                let Expr::Var(name) = &**operand else {
+                    return Err(unsupported("`⌷` of a computed value", line));
+                };
+                out.insert(name.clone());
+                walk(index, shapes, line, out, reach)?;
+            }
             Expr::Call { name, .. } => return Err(unsupported(&format!("the call to `{name}`, which was not expanded"), line)),
         }
         Ok(())
@@ -327,6 +344,17 @@ fn usage(expr: &Expr, line: usize, lifts: &mut Vec<usize>, out: &mut BTreeMap<St
             usage(operand, line, lifts, out)?;
         }
         Expr::AuditTrace(inner) | Expr::Builtin { operand: inner, .. } => usage(inner, line, lifts, out)?,
+        Expr::Gather { index, .. } => {
+            if !lifts.is_empty() {
+                return Err(unsupported("a lift of an index by value", line));
+            }
+            usage(index, line, lifts, out)?;
+        }
+        Expr::Rotate { .. } | Expr::Reverse { .. } | Expr::Reshape { .. } | Expr::Transpose { .. } | Expr::Take { .. } | Expr::Drop { .. } => {
+            if !lifts.is_empty() {
+                return Err(unsupported("a lift of a turn", line));
+            }
+        }
         // A lift around a fold applies to the fold's result, not to what
         // the fold reads.
         Expr::Reduce { operand: inner, .. } | Expr::Scan { operand: inner, .. } => {
@@ -340,6 +368,39 @@ fn usage(expr: &Expr, line: usize, lifts: &mut Vec<usize>, out: &mut BTreeMap<St
         _ => {}
     }
     Ok(())
+}
+
+/// The spaces a turn or `⌷` reads by place: captured whole, never streamed.
+fn turned(expr: &Expr, out: &mut BTreeSet<String>) {
+    match expr {
+        Expr::Rotate { operand, .. }
+        | Expr::Reverse { operand, .. }
+        | Expr::Reshape { operand, .. }
+        | Expr::Transpose { operand, .. }
+        | Expr::Take { operand, .. }
+        | Expr::Drop { operand, .. } => {
+            if let Expr::Var(name) = &**operand {
+                out.insert(name.clone());
+            }
+        }
+        Expr::Gather { index, operand } => {
+            if let Expr::Var(name) = &**operand {
+                out.insert(name.clone());
+            }
+            turned(index, out);
+        }
+        Expr::AuditTrace(inner)
+        | Expr::Builtin { operand: inner, .. }
+        | Expr::Lift { operand: inner, .. }
+        | Expr::Shift { operand: inner, .. }
+        | Expr::Reduce { operand: inner, .. }
+        | Expr::Scan { operand: inner, .. } => turned(inner, out),
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            turned(lhs, out);
+            turned(rhs, out);
+        }
+        _ => {}
+    }
 }
 
 /// The shape a space is viewed at under `lifts`, and which of the view's
@@ -420,6 +481,96 @@ impl Lowering<'_> {
                 let mut nested = lifts.to_vec();
                 nested.push(*axis);
                 self.lower_with(operand, &nested)?
+            }
+            // A turn: the space read out of the replay's memory at a place
+            // computed from this cell's coordinates, as the interpreter
+            // computes it.
+            Expr::Rotate { axis, operand, .. } | Expr::Reverse { axis, operand } if matches!(**operand, Expr::Var(_)) => {
+                let name = match &**operand { Expr::Var(n) => n.clone(), _ => unreachable!() };
+                let shape = self.shapes[&name].clone();
+                let a = axis.unwrap_or_else(|| default_axis(&shape));
+                let (stride, extent) = axis_geometry(&shape, Some(a)).ok_or_else(|| unsupported("an axis past the shape", self.line))?;
+                let along = match expr {
+                    Expr::Rotate { by, .. } => {
+                        let k = by.rem_euclid(extent as i64);
+                        format!("(((pos[{a}] + {k}) % {extent}) * {stride})")
+                    }
+                    _ => format!("(({} - pos[{a}]) * {stride})", extent - 1),
+                };
+                let mut terms = vec![along];
+                for (i, _) in shape.iter().enumerate() {
+                    if i != a {
+                        let (st, _) = axis_geometry(&shape, Some(i)).unwrap_or((1, 1));
+                        terms.push(format!("(pos[{i}] * {st})"));
+                    }
+                }
+                format!("rpm{}_{}[{}]", self.stage, ident(&name), terms.join(" + "))
+            }
+            Expr::Transpose { axes, operand } if matches!(**operand, Expr::Var(_)) => {
+                let name = match &**operand { Expr::Var(n) => n.clone(), _ => unreachable!() };
+                let shape = self.shapes[&name].clone();
+                let perm = transpose_axes(shape.len(), axes.as_deref())
+                    .ok_or_else(|| unsupported("a transpose that is not a permutation of the axes", self.line))?;
+                let terms: Vec<String> = (0..shape.len())
+                    .map(|k| {
+                        let (st, _) = axis_geometry(&shape, Some(k)).unwrap_or((1, 1));
+                        format!("(pos[{}] * {st})", perm[k])
+                    })
+                    .collect();
+                format!("rpm{}_{}[{}]", self.stage, ident(&name), terms.join(" + "))
+            }
+            Expr::Reshape { shape: target, operand } if matches!(**operand, Expr::Var(_)) => {
+                let name = match &**operand { Expr::Var(n) => n.clone(), _ => unreachable!() };
+                let count = self.shapes[&name].iter().product::<usize>().max(1);
+                let wanted = target.iter().product::<usize>().max(1);
+                // The cell's flat index reads round the source when short.
+                if wanted <= count {
+                    format!("rpm{}_{}[nc{}]", self.stage, ident(&name), self.stage)
+                } else {
+                    format!("rpm{}_{}[nc{} % {count}]", self.stage, ident(&name), self.stage)
+                }
+            }
+            Expr::Take { count, axis, operand } | Expr::Drop { count, axis, operand } if matches!(**operand, Expr::Var(_)) => {
+                let name = match &**operand { Expr::Var(n) => n.clone(), _ => unreachable!() };
+                let dropping = matches!(expr, Expr::Drop { .. });
+                let shape = self.shapes[&name].clone();
+                let a = axis.unwrap_or_else(|| default_axis(&shape));
+                let extent = shape[a];
+                let offset = taken_offset(extent, *count, dropping);
+                let mut terms: Vec<String> = Vec::new();
+                for (b, _) in shape.iter().enumerate() {
+                    let (st, _) = axis_geometry(&shape, Some(b)).unwrap_or((1, 1));
+                    if b == a {
+                        terms.push(format!("((pos[{a}] + ({offset})) * {st})"));
+                    } else {
+                        terms.push(format!("(pos[{b}] * {st})"));
+                    }
+                }
+                format!(
+                    "(((pos[{a}] + ({offset}) >= 0) && (pos[{a}] + ({offset}) < {extent})) ? rpm{}_{}[{}] : {})",
+                    self.stage,
+                    ident(&name),
+                    terms.join(" + "),
+                    self.numbers.lit(0.0)
+                )
+            }
+            // Index by value: the place is the data's, floored; zero where it
+            // is no place of the space.
+            Expr::Gather { index, operand } if matches!(**operand, Expr::Var(_)) => {
+                let name = match &**operand { Expr::Var(n) => n.clone(), _ => unreachable!() };
+                let count = self.shapes[&name].iter().product::<usize>().max(1);
+                let v = self.lower_with(index, &[])?;
+                let mem = format!("rpm{}_{}", self.stage, ident(&name));
+                match self.numbers {
+                    Numbers::Real => format!(
+                        "((($floor({v}) >= 0.0) && ($floor({v}) < {count}.0)) ? {mem}[$rtoi($floor({v}))] : {})",
+                        self.numbers.lit(0.0)
+                    ),
+                    Numbers::Fixed { frac, .. } => format!(
+                        "(((({v}) >= {z}) && ((({v}) >>> {frac}) < {count})) ? {mem}[(({v}) >>> {frac})] : {z})",
+                        z = self.numbers.lit(0.0)
+                    ),
+                }
             }
             Expr::AuditTrace(inner) => self.lower_with(inner, lifts)?,
             Expr::Shift { dir, axis, operand } => {
@@ -772,9 +923,12 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
             (n, cells)
         })
         .collect();
+    // Clocks the harness allows: the input, every stage's drain, every
+    // replay's capture and read-out, every loop's rounds, and slack.
     let budget: usize = inputs.iter().map(|(_, c)| *c).max().unwrap_or(0)
         + out_cells
         + stages.iter().map(|s| s.reach + 3).sum::<usize>()
+        + replays.iter().map(|r| 2 * r.cells + 8).sum::<usize>()
         + loops
             .iter()
             .map(|l| (l.cap + 1) * (3 * l.cells + stages[l.update].reach + 32) + 2 * l.cells)
@@ -1019,11 +1173,24 @@ fn plan_stage(
     }
     let mut lifts_of: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     usage(src, line, &mut Vec::new(), &mut lifts_of)?;
+    let mut by_place: BTreeSet<String> = BTreeSet::new();
+    turned(src, &mut by_place);
     // Main sources have the result's shape and stream; broadcast ones are
-    // read by place.
+    // read by place; a space a turn reads is captured whole.
     let mut main: Vec<String> = Vec::new();
     let mut broadcast: BTreeMap<String, BroadcastRead> = BTreeMap::new();
+    let mut whole: Vec<String> = Vec::new();
     for s in &srcs {
+        if by_place.contains(s) && !lifts_of.contains_key(s) {
+            if !streams.contains_key(s) {
+                return Err(HarmonyDisruption::SpaceErr {
+                    space_name: s.clone(),
+                    line,
+                });
+            }
+            whole.push(s.clone());
+            continue;
+        }
         let source_shape = shapes.get(s).cloned().ok_or_else(|| HarmonyDisruption::SpaceErr {
             space_name: s.clone(),
             line,
@@ -1052,7 +1219,7 @@ fn plan_stage(
         broadcast.insert(
             s.clone(),
             BroadcastRead {
-                memory: format!("m{index}_{}", ident(s)),
+                memory: format!("rpm{index}_{}", ident(s)),
                 source_shape,
                 lifted,
             },
@@ -1062,7 +1229,7 @@ fn plan_stage(
     let base = main.iter().map(|s| streams[s].latency).max().unwrap_or(1);
     let sparse = origins.iter().any(|o| o.0.starts_with("fold"));
     let uneven = sparse && main.iter().any(|s| streams[s].latency != base);
-    let replay = !broadcast.is_empty() || origins.len() > 1 || uneven;
+    let replay = !broadcast.is_empty() || !whole.is_empty() || !by_place.is_empty() || origins.len() > 1 || uneven;
 
     // A replay captures every source and streams the main ones back under
     // aliases; the expression reads the aliases.
@@ -1071,24 +1238,30 @@ fn plan_stage(
         let mut captured_main: Vec<(String, Stream)> = Vec::new();
         let mut renamed: BTreeMap<String, String> = BTreeMap::new();
         let cells = shape.iter().product::<usize>().max(1);
+        // The captured copy goes by the alias, so a turn that reads the
+        // alias by place finds its memory: m<stage>_<alias>.
         for s in &main {
             let alias = format!("{s}⟳r{index}");
             shapes.insert(alias.clone(), shapes[s].clone());
+            let original = streams[s].clone();
             streams.insert(
                 alias.clone(),
                 Stream {
-                    value: format!("rr{index}_{}", ident(s)),
-                    valid: format!("rv{index}"),
+                    value: format!("rpr{index}_{}", ident(&alias)),
+                    valid: format!("rpv{index}"),
                     latency: 1,
                     origin: Origin(format!("replay{index}")),
                     cells,
                 },
             );
-            captured_main.push((s.clone(), streams[s].clone()));
+            captured_main.push((alias.clone(), original));
             renamed.insert(s.clone(), alias);
         }
-        let captured_broadcast: Vec<(String, Stream)> =
-            broadcast.keys().map(|s| (s.clone(), streams[s].clone())).collect();
+        let captured_broadcast: Vec<(String, Stream)> = broadcast
+            .keys()
+            .chain(whole.iter())
+            .map(|s| (s.clone(), streams[s].clone()))
+            .collect();
         replays.push(Replay {
             id: index,
             cells,
@@ -1105,7 +1278,7 @@ fn plan_stage(
                 (alias.clone(), (st.value.clone(), st.valid.clone(), st.latency, 2 * reach + 1, reach))
             })
             .collect();
-        let timing = if renamed.is_empty() { Some(format!("rv{index}")) } else { None };
+        let timing = if renamed.is_empty() { Some(format!("rpv{index}")) } else { None };
         (src, chains, timing, 1)
     } else {
         let chains: Chains = main
@@ -1162,24 +1335,24 @@ fn emit_replay(sv: &mut String, r: &Replay, numbers: Numbers) {
     let all: Vec<&(String, Stream)> = r.main.iter().chain(r.broadcast.iter()).collect();
     for (name, stream) in &all {
         let sid = ident(name);
-        let _ = writeln!(sv, "  {ty} m{k}_{sid} [0:{}];  // {name}, captured", stream.cells - 1);
-        let _ = writeln!(sv, "  logic [{}:0] cap{k}_{sid};", bits(stream.cells) - 1);
+        let _ = writeln!(sv, "  {ty} rpm{k}_{sid} [0:{}];  // {name}, captured", stream.cells - 1);
+        let _ = writeln!(sv, "  logic [{}:0] rpc{k}_{sid};", bits(stream.cells) - 1);
     }
     for (name, _) in &r.main {
-        let _ = writeln!(sv, "  {ty} rr{k}_{};  // {name} streamed back", ident(name));
+        let _ = writeln!(sv, "  {ty} rpr{k}_{};  // {name} streamed back", ident(name));
     }
-    let _ = writeln!(sv, "  logic rv{k};");
-    let _ = writeln!(sv, "  logic [1:0] rst{k};  // 0 capture, 1 read, 2 done");
-    let _ = writeln!(sv, "  logic [{}:0] ri{k};", bits(r.cells) - 1);
+    let _ = writeln!(sv, "  logic rpv{k};");
+    let _ = writeln!(sv, "  logic [1:0] rps{k};  // 0 capture, 1 read, 2 done");
+    let _ = writeln!(sv, "  logic [{}:0] rpi{k};", bits(r.cells) - 1);
     // Each capture restarts on its own terms: a stream of the round's own
     // making every round, one from outside the loop only on reset.
     for (name, stream) in &all {
         let sid = ident(name);
         let _ = writeln!(sv, "  always_ff @(posedge clk) begin");
-        let _ = writeln!(sv, "    if ({}) cap{k}_{sid} <= 0;", round(stream));
+        let _ = writeln!(sv, "    if ({}) rpc{k}_{sid} <= 0;", round(stream));
         let _ = writeln!(
             sv,
-            "    else if (rst{k} == 0 && {} && cap{k}_{sid} < {}) begin m{k}_{sid}[cap{k}_{sid}] <= {}; cap{k}_{sid} <= cap{k}_{sid} + 1; end",
+            "    else if (rps{k} == 0 && {} && rpc{k}_{sid} < {}) begin rpm{k}_{sid}[rpc{k}_{sid}] <= {}; rpc{k}_{sid} <= rpc{k}_{sid} + 1; end",
             stream.valid, stream.cells, stream.value
         );
         let _ = writeln!(sv, "  end");
@@ -1187,20 +1360,20 @@ fn emit_replay(sv: &mut String, r: &Replay, numbers: Numbers) {
     let _ = writeln!(sv, "  always_ff @(posedge clk) begin : replay{k}");
     let _ = writeln!(sv, "    logic all_captured;");
     let _ = writeln!(sv, "    if ({restart}) begin");
-    let _ = writeln!(sv, "      rv{k} <= 1'b0; rst{k} <= 0; ri{k} <= 0;");
+    let _ = writeln!(sv, "      rpv{k} <= 1'b0; rps{k} <= 0; rpi{k} <= 0;");
     let _ = writeln!(sv, "    end else begin");
-    let _ = writeln!(sv, "      rv{k} <= 1'b0;");
-    let done: Vec<String> = all.iter().map(|(n, st)| format!("(cap{k}_{} == {})", ident(n), st.cells)).collect();
+    let _ = writeln!(sv, "      rpv{k} <= 1'b0;");
+    let done: Vec<String> = all.iter().map(|(n, st)| format!("(rpc{k}_{} == {})", ident(n), st.cells)).collect();
     let _ = writeln!(sv, "      all_captured = {};", done.join(" && "));
-    let _ = writeln!(sv, "      case (rst{k})");
-    let _ = writeln!(sv, "        0: if (all_captured) begin rst{k} <= 1; ri{k} <= 0; end");
+    let _ = writeln!(sv, "      case (rps{k})");
+    let _ = writeln!(sv, "        0: if (all_captured) begin rps{k} <= 1; rpi{k} <= 0; end");
     let _ = writeln!(sv, "        1: begin");
     for (name, _) in &r.main {
         let sid = ident(name);
-        let _ = writeln!(sv, "          rr{k}_{sid} <= m{k}_{sid}[ri{k}];");
+        let _ = writeln!(sv, "          rpr{k}_{sid} <= rpm{k}_{sid}[rpi{k}];");
     }
-    let _ = writeln!(sv, "          rv{k} <= 1'b1;");
-    let _ = writeln!(sv, "          if (ri{k} == {}) rst{k} <= 2; else ri{k} <= ri{k} + 1;", r.cells - 1);
+    let _ = writeln!(sv, "          rpv{k} <= 1'b1;");
+    let _ = writeln!(sv, "          if (rpi{k} == {}) rps{k} <= 2; else rpi{k} <= rpi{k} + 1;", r.cells - 1);
     let _ = writeln!(sv, "        end");
     let _ = writeln!(sv, "        default: ;");
     let _ = writeln!(sv, "      endcase");
@@ -1256,6 +1429,13 @@ fn rename(expr: &Expr, f: &dyn Fn(&str) -> String) -> Expr {
         Expr::Reduce { op, axis, operand } => Expr::Reduce { op: *op, axis: *axis, operand: sub(operand) },
         Expr::Scan { op, axis, operand } => Expr::Scan { op: *op, axis: *axis, operand: sub(operand) },
         Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp { op: op.clone(), lhs: sub(lhs), rhs: sub(rhs) },
+        Expr::Rotate { by, axis, operand } => Expr::Rotate { by: *by, axis: *axis, operand: sub(operand) },
+        Expr::Reverse { axis, operand } => Expr::Reverse { axis: *axis, operand: sub(operand) },
+        Expr::Reshape { shape, operand } => Expr::Reshape { shape: shape.clone(), operand: sub(operand) },
+        Expr::Transpose { axes, operand } => Expr::Transpose { axes: axes.clone(), operand: sub(operand) },
+        Expr::Take { count, axis, operand } => Expr::Take { count: *count, axis: *axis, operand: sub(operand) },
+        Expr::Drop { count, axis, operand } => Expr::Drop { count: *count, axis: *axis, operand: sub(operand) },
+        Expr::Gather { index, operand } => Expr::Gather { index: sub(index), operand: sub(operand) },
         other => other.clone(),
     }
 }

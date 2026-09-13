@@ -4325,6 +4325,96 @@ fn test_the_turns_and_index_by_value_read_a_replays_memory_by_place() {
     assert_eq!(run.output[0], -2.0);
 }
 
+// --------------------------------------------------------------------------
+// The program as JAX: run on the CPU through XLA and held to the interpreter.
+// Needs a python that imports jax ($RHO_JAX_PYTHON or python3); skipped
+// without it.
+// --------------------------------------------------------------------------
+
+/// The largest distance in units in the last place between two runs, NaN
+/// matching NaN.
+fn worst_ulps(a: &[f64], b: &[f64]) -> u64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| {
+            if x.is_nan() && y.is_nan() {
+                0
+            } else {
+                let (p, q) = (x.to_bits() as i64, y.to_bits() as i64);
+                (p - q).unsigned_abs()
+            }
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The largest gap between the cells, in ulps of the largest cell of `b`:
+/// a rounding difference is judged against the scale the numbers were
+/// made at, not against a cell that cancellation left near zero.
+fn worst_scaled_ulps(a: &[f64], b: &[f64]) -> u64 {
+    let scale = b.iter().fold(0.0f64, |m, x| if x.is_finite() { m.max(x.abs()) } else { m });
+    let ulp = f64::from_bits(scale.to_bits() + 1) - scale;
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| if x.is_nan() && y.is_nan() { 0.0 } else { ((x - y).abs() / ulp).ceil() })
+        .fold(0.0f64, f64::max) as u64
+}
+
+#[test]
+fn test_the_jax_module_gives_the_interpreters_cells() {
+    if !rho_lang::codegen::jax::available() {
+        eprintln!("jax not importable: JAX test skipped");
+        return;
+    }
+    use rho_lang::numeric::Precision;
+    type Spaces = Vec<(&'static str, Vec<usize>, Vec<f64>)>;
+    let grid: Vec<f64> = (0..48).map(|i| ((i as f64) * 0.7).sin() * 3.0 + (i % 7) as f64 * 0.125).collect();
+    let table: Vec<f64> = (0..8).map(|i| (i as f64) * 1.5 - 2.0).collect();
+    let a: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b: Vec<f64> = vec![1.0, 0.0, 2.0, 1.0, 0.0, 1.0, 1.0, 2.0, 3.0, 1.0, 0.0, 1.0];
+    // (name, program, inputs, cap, ulps allowed, measured at the scale of
+    // the space's largest cell). Arithmetic, shifts, masks, turns and `⌷`
+    // are bit-identical; a fold's order and XLA's own transcendentals
+    // differ in the last place, which a cancelled cell magnifies against
+    // itself (the mixed case: one ulp of 1.0 on a cell near 0.003).
+    let cases: [(&str, &str, Spaces, Option<usize>, u64); 11] = [
+        ("stencil", "{\n    INPUT:◯ □ 6 8\n    ((▷0INPUT + ▽0INPUT + ▷1INPUT + ▽1INPUT) / 4.0) → M\n    (((M - INPUT) ^ 2) + (M > 0.25) + ((⍳1 INPUT) ⌈ (3.0 | (⍳0 INPUT))) + (⌊((?INPUT) × 4.0)) + (abs M) + (ind (M < INPUT))) → =\n}", vec![("INPUT", vec![6, 8], grid.clone())], None, 0),
+        ("turns", "{\n    INPUT:◯ □ 6 8\n    ((1 ⌽1 INPUT) + (-1 ⌽0 INPUT) + (⌽INPUT)) → T\n    (⍉T) → U\n    (6 8 ⍴ U) → V\n    (10 ↑1 V) → W\n    ((2 ↓1 W) - (-8 ↑1 W)) → =\n}", vec![("INPUT", vec![6, 8], grid.clone())], None, 0),
+        ("bound", "{\n    &[0x7A4F]:INPUT:◯ □ 6 8\n    (INPUT + INPUT) → =\n}", vec![("INPUT", vec![6, 8], grid.clone())], None, 0),
+        ("lookup", "{\n    INPUT:◯ □ 6 8\n    TABLE:◯ □ 8\n    ((INPUT × 3.0) ⌷ TABLE) → =\n}", vec![("INPUT", vec![6, 8], grid.clone()), ("TABLE", vec![8], table.clone())], None, 0),
+        ("matmul", "{\n    A:◯ □ 2 3 1\n    B:◯ □ 1 3 4\n    ◇+1 (A × B) → OUTPUT\n    OUTPUT → =\n}", vec![("A", vec![2, 3, 1], a.clone()), ("B", vec![1, 3, 4], b.clone())], None, 0),
+        ("fold", "{\n    INPUT:◯ □ 6 8\n    (INPUT - (□1 ((◇+1 INPUT) / 8.0))) → =\n}", vec![("INPUT", vec![6, 8], grid.clone())], None, 1),
+        ("scan", "{\n    INPUT:◯ □ 6 8\n    (◈+1 INPUT) → =\n}", vec![("INPUT", vec![6, 8], grid.clone())], None, 1),
+        ("exp", "{\n    INPUT:◯ □ 6 8\n    (exp (INPUT × 0.1)) → =\n}", vec![("INPUT", vec![6, 8], grid.clone())], None, 1),
+        ("sin", "{\n    INPUT:◯ □ 6 8\n    (sin INPUT) → =\n}", vec![("INPUT", vec![6, 8], grid.clone())], None, 1),
+        ("mixed", "{\n    INPUT:◯ □ 6 8\n    ((INPUT - (□1 ((◇+1 INPUT) / 8.0))) + (◈+1 INPUT) + (exp (INPUT × 0.1)) + (sin INPUT)) → =\n}", vec![("INPUT", vec![6, 8], grid.clone())], None, 1),
+        ("jacobi", "\nstep:{ U\n    (▷U + ▽U) → S\n    (S / 4.0) → =\n}\n{\n    INPUT:◯ □ 48\n    INPUT → X\n    ((INPUT / 4.0) - (step X)) ⇒ X\n    X → =\n}", vec![("INPUT", vec![48], grid.clone())], Some(200), 0),
+    ];
+    for (name, source, inputs, cap, ulps) in &cases {
+        let block = parse_rho_program(source).unwrap();
+        let options = Options { tau: 1e-12, max_sweeps: cap.unwrap_or(1) };
+        let mut env: Env<f64> = Env::new();
+        for (n, shape, data) in inputs {
+            env.insert(n.to_string(), Grid::from(shape.clone(), data.clone()));
+        }
+        let meant = interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone();
+        let module = rho_lang::codegen::jax::emit(&block, options.tau, *cap, Precision::F64).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let dir = format!("target/jax_{name}");
+        let feed: Vec<Vec<f64>> = inputs.iter().map(|(_, _, d)| d.clone()).collect();
+        let run = rho_lang::codegen::jax::run(&module, std::path::Path::new(&dir), &feed).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(run.output.len(), meant.len(), "{name}");
+        let worst = worst_scaled_ulps(&run.output, &meant);
+        assert!(worst <= *ulps, "{name}: {worst} ulps of the largest cell apart, {ulps} allowed ({} in the cells' own)\n{module}", worst_ulps(&run.output, &meant));
+        if cap.is_some() {
+            // The loop's sweeps and its settling are the kernel's.
+            let so = compile_iterating(&format!("jax_{name}_ref"), source, options.tau, options.max_sweeps, true);
+            let (_, kernel_sweeps, kernel_converged) = run_iterating(&so, &feed[0], 48);
+            assert_eq!(run.sweeps as i64, kernel_sweeps, "{name}: sweeps");
+            assert_eq!(run.converged, kernel_converged, "{name}: converged");
+        }
+    }
+}
+
 #[test]
 fn test_what_is_not_yet_a_circuit_says_so() {
     for (source, what) in [

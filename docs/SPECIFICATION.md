@@ -939,7 +939,36 @@ and turn, and all of it in `real` or in fixed point. Not yet, and said so
 with a line: a body of flows inside `⇒`, a shift of a lifted space, a flow
 with no space in it, and in fixed point the transcendental functions.
 
-## 8. Precision ✅
+## 8. As JAX (`--emit-jax`) ✅
+
+`rhoc program.rho --emit-jax module.py` writes the program as a JAX module:
+`rho(<inputs>)` over `jax.numpy` arrays, returning every written space with
+`rho_sweeps` and `rho_converged`, and `rho_jit`, the same under `jax.jit`.
+XLA then runs it on a CPU, a GPU or a TPU. Every construct has a direct
+counterpart: a shift is a pad and a slice, a fold a reduction, a scan a
+cumulative one, a lift an expanded axis, a rotation a roll, a transpose a
+transpose with the inverse permutation, a reshape `jnp.resize`, a take a
+slice and a pad, `⌷` a clipped take under a mask, the roll the same hash
+over the value's bits, and `⇒` a `lax.while_loop` whose state carries the
+target and whatever a function's body of flows writes each round. The
+program's own numbers are kept: a whole power is repeated multiplication,
+a comparison masks, the residue is `b - a * floor(b / a)`. A bound address
+(`&[…]:`) is the compiled kernel's; the module takes that space as an
+argument like any other and says so in a comment.
+
+What it does not promise is the interpreter's bits everywhere. XLA orders a
+reduction as it likes and its `exp` and `sin` are its own, so a fold or a
+transcendental may differ in the last place; arithmetic, shifts, masks,
+turns and `⌷` are bit-identical on the CPU. Measured on the test grids:
+`exp` one ulp per cell, `sin` and a scan none, an axis sum within eight,
+and every program within one ulp at the scale of its largest cell. Held
+against a cell that cancellation left near zero the same difference reads
+as hundreds of its own ulps, as it would under any rewrite of the
+arithmetic; the interpreter and the compiled kernel remain the bit-exact
+pair. A `⇒` takes the kernel's number of sweeps and settles as the kernel
+does.
+
+## 9. Precision ✅
 
 `rhoc --f32` compiles the kernel at single precision. There is no syntax for it:
 the width is a property of the artifact, not of the program, and the same source

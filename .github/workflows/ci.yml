@@ -33,6 +33,9 @@ jobs:
     - name: Build Compiler (`rhoc`)
       run: cargo build --verbose
 
+    - name: Install JAX For The Emitter's Tests
+      run: python3 -m pip install --quiet --break-system-packages jax || python3 -m pip install --quiet jax
+
     - name: Run Unit Tests
       run: cargo test --verbose
 
@@ -66,7 +69,8 @@ jobs:
         cargo run --bin rhoc -- examples/lookup.rho
         cargo run --bin rhoc -- examples/montecarlo.rho
         cargo run --bin rhoc -- examples/periodic.rho --tau 1e-9 --max-iter 20000
-        cargo run --bin rhoc -- examples/functions.rho --tau 1e-12 --max-iter 200
+        cargo run --bin rhoc -- examples/functions.rho --tau 1e-12 --max-iter 200 --emit-jax target/jax-functions.py
+        python3 -m py_compile target/jax-functions.py
 
     - name: Check Codegen Determinism
       run: |

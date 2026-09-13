@@ -70,6 +70,11 @@ struct Args {
     /// which Yosys synthesises; without it they are `real`, for simulation.
     #[arg(long, value_name = "W.F")]
     fixed: Option<String>,
+
+    /// Also write the program as a JAX module (a `rho(...)` function over
+    /// jax arrays, and `rho_jit`), for CPU, GPU and TPU through XLA.
+    #[arg(long, value_name = "FILE.py")]
+    emit_jax: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -205,6 +210,20 @@ fn run(args: &Args) -> anyhow::Result<()> {
     let out_path = args.output.to_string_lossy();
     codegen.compile_to_so(&llvm_ir, &out_path)?;
     println!("  └─ Compilation Successful: Binary emitted to -> {}", out_path);
+
+    if let Some(path) = &args.emit_jax {
+        let module = rho_lang::codegen::jax::emit(&block, args.tau, args.max_iter, precision)
+            .map_err(|e| block.attribute(e))?;
+        let mut with_source = module;
+        with_source.push_str("\n# ---- the program this was made from\n");
+        for line in source_code.lines() {
+            with_source.push_str("# ");
+            with_source.push_str(line);
+            with_source.push('\n');
+        }
+        std::fs::write(path, with_source)?;
+        println!("  └─ JAX module emitted to -> {}", path.display());
+    }
 
     if let Some(dir) = &args.emit_sv {
         let numbers = match &args.fixed {

@@ -54,6 +54,10 @@ Working prototype. What runs today:
   and `⇒` as a loop over block RAM; simulated with Verilator and held to
   the interpreter bit for bit, and with `--fixed 32.16` synthesised by
   Yosys into a real datapath
+- `--emit-jax`: the same program as a JAX module for CPU, GPU and TPU
+  through XLA, a `lax.while_loop` for `⇒`, held to the interpreter to the
+  bit where XLA allows and to an ulp at the scale of the space where it
+  reorders a fold or uses its own `exp`
 - Functions: `smooth:{ X ((▷X + X + ▽X) / 3.0) }` defines one, `smooth INPUT`
   calls it, `A mix B` calls a function of two between its arguments, and the
   body is copied in at each call — nothing runs at call time, a function is
@@ -144,6 +148,7 @@ with what the `!` check could and could not settle.
 | `--portable` | Build for any x86-64 rather than this machine |
 | `--emit-sv <DIR>` | Also write the program as a SystemVerilog streaming pipeline, with a Verilator harness |
 | `--fixed <W.F>` | Make the circuit's cells fixed point (e.g. `32.16`), which Yosys synthesises; the interpreter on the same numbers is the reference |
+| `--emit-jax <FILE.py>` | Also write the program as a JAX module (`rho`, `rho_jit`), for CPU, GPU and TPU through XLA |
 
 ### 3. Call it from Python
 
@@ -376,6 +381,7 @@ smooth input drives it to zero and the kernel returns infinities.
 | Mixed precision, integer types | 📋 not planned — see the specification |
 | Explicit `<4 x double>` vector lowering | ✅ implemented — see the note below |
 | Sweeps split across threads | ✅ implemented — every `→`, `⇒` round, fold and comparison; 3–4x on cache-resident grids, bit-identical to one thread |
+| The program as JAX (`--emit-jax`) | ✅ `rho` / `rho_jit` over `jax.numpy`, every construct including `⇒` and function bodies; bit-identical for arithmetic, shifts, masks and turns, within an ulp at the scale of the space for folds and transcendentals (XLA's own order and `exp`) |
 | The program as a circuit (`--emit-sv`) | ✅ a SystemVerilog streaming pipeline, one cell per clock, simulated with Verilator and bit-identical to the interpreter; flows, shifts, `⍳`, folds and scans with an accumulator per line, `⇒` as a loop over a grid in memory with the kernel's sweep count (a fold or a broadcast in it makes the round two passes), broadcasts, `□`, the turns `⌽ ⍉ ⍴ ↑ ↓` and `⌷` as reads by place out of a replay's memory (a matrix product is one), the arithmetic and the named functions; what is left out is a body of flows inside `⇒`. `real` cells for the structure and timing; `--fixed 32.16` for a datapath Yosys synthesises, bit-identical to the fixed-point interpreter: a 16×16 stencil is 401 LUT4 at 75.8 MHz on an iCE40 HX8K, a 48-cell Jacobi loop 825 LUT4 and 5 block RAMs at 52.3 MHz on an ECP5 |
 | Zero-copy binding (`&[0x…]`, `--bind`) | ✅ implemented |
 | `!` constraint check | ✅ interval arithmetic that models binary64 rounding, not ℝ; its claims are held to real runs by the differential test |

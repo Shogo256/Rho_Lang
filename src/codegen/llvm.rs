@@ -258,6 +258,11 @@ impl LlvmCodeGen {
         }
     }
 
+    /// Whether the program has a `⇒` (known once IR has been generated).
+    pub fn iterates(&self) -> bool {
+        self.iterates
+    }
+
     /// Split every sweep across this many threads; 0 means one per CPU.
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.threads = threads.min(MAX_PARTS);

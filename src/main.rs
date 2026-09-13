@@ -4,7 +4,7 @@ use rho_lang::dag::RhoDag;
 use rho_lang::parser::parse_rho_program;
 use rho_lang::solver::{ConstraintSolver, Verdict};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(name = "rhoc")]
@@ -75,6 +75,19 @@ struct Args {
     /// jax arrays, and `rho_jit`), for CPU, GPU and TPU through XLA.
     #[arg(long, value_name = "FILE.py")]
     emit_jax: Option<PathBuf>,
+
+    /// Run the compiled kernel once, with this input space read from a file:
+    /// raw little-endian doubles when the file ends in .bin, numbers
+    /// separated by whitespace otherwise. Repeat for every input. OUTPUT is
+    /// printed as text unless --write names a file for it.
+    #[arg(long, value_name = "SPACE=FILE")]
+    run: Vec<String>,
+
+    /// After --run, write this space to a file (.bin for raw doubles, text
+    /// otherwise, one line per row). Any space a flow writes may be named,
+    /// intermediates included. Repeatable.
+    #[arg(long, value_name = "SPACE=FILE")]
+    write: Vec<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -257,5 +270,158 @@ fn run(args: &Args) -> anyhow::Result<()> {
     );
     println!("=====================================================");
 
+    if !args.run.is_empty() || !args.write.is_empty() {
+        run_kernel(args, &codegen, &out_path, precision)?;
+    }
+
+    Ok(())
+}
+
+/// `NAME=FILE` arguments as pairs.
+fn name_file(items: &[String], flag: &str) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    items
+        .iter()
+        .map(|item| {
+            let (name, file) = item
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("{flag} expects SPACE=FILE, got '{item}'"))?;
+            Ok((name.trim().to_string(), PathBuf::from(file.trim())))
+        })
+        .collect()
+}
+
+/// A space's cells from a file: raw doubles for `.bin`, text otherwise.
+fn read_cells(path: &Path, cells: usize, name: &str) -> anyhow::Result<Vec<f64>> {
+    let values: Vec<f64> = if path.extension().is_some_and(|e| e == "bin") {
+        let bytes = fs::read(path).map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+        if bytes.len() % 8 != 0 {
+            anyhow::bail!("{} holds {} bytes, not a whole number of doubles", path.display(), bytes.len());
+        }
+        bytes.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect()
+    } else {
+        let text = fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+        text.split_whitespace()
+            .map(|w| w.parse::<f64>().map_err(|_| anyhow::anyhow!("{}: '{w}' is not a number", path.display())))
+            .collect::<anyhow::Result<_>>()?
+    };
+    if values.len() != cells {
+        anyhow::bail!(
+            "{} holds {} values, but {name} has {cells} cells",
+            path.display(),
+            values.len()
+        );
+    }
+    Ok(values)
+}
+
+/// A space's cells to a file: raw doubles for `.bin`, else text with one
+/// line per row (the last axis across).
+fn write_cells(path: &Path, shape: &[usize], values: &[f64]) -> anyhow::Result<()> {
+    if path.extension().is_some_and(|e| e == "bin") {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        fs::write(path, bytes)?;
+    } else {
+        fs::write(path, format_rows(shape, values))?;
+    }
+    Ok(())
+}
+
+fn format_rows(shape: &[usize], values: &[f64]) -> String {
+    let row = shape.last().copied().unwrap_or(1).max(1);
+    let mut text = String::new();
+    for line in values.chunks(row) {
+        let words: Vec<String> = line.iter().map(|v| format!("{v:?}")).collect();
+        text.push_str(&words.join(" "));
+        text.push('\n');
+    }
+    text
+}
+
+/// Load the kernel just built and run it once over the files named by
+/// --run, writing the spaces named by --write (OUTPUT to stdout when no
+/// file is named for it). Every input must be given; intermediates the
+/// caller does not ask for are the kernel's own.
+fn run_kernel(
+    args: &Args,
+    codegen: &LlvmCodeGen,
+    so_path: &str,
+    precision: rho_lang::numeric::Precision,
+) -> anyhow::Result<()> {
+    let inputs = name_file(&args.run, "--run")?;
+    let outputs = name_file(&args.write, "--write")?;
+    let shapes = &codegen.space_shapes;
+    for (name, _) in inputs.iter().chain(outputs.iter()) {
+        if !shapes.contains_key(name) {
+            anyhow::bail!("there is no space named {name}; the program declares {}", shapes.keys().cloned().collect::<Vec<_>>().join(", "));
+        }
+    }
+    let print_output = shapes.contains_key("OUTPUT") && !outputs.iter().any(|(n, _)| n == "OUTPUT");
+    // One buffer per space, in the table's order; f32 kernels take floats.
+    let wide = precision == rho_lang::numeric::Precision::F64;
+    let mut f64_bufs: Vec<Vec<f64>> = Vec::new();
+    let mut f32_bufs: Vec<Vec<f32>> = Vec::new();
+    let mut given: Vec<bool> = Vec::new();
+    for (name, shape) in shapes {
+        let cells = shape.iter().product::<usize>().max(1);
+        let role = codegen.role_of(name);
+        let values: Option<Vec<f64>> = match role {
+            "input" => {
+                let (_, path) = inputs.iter().find(|(n, _)| n == name).ok_or_else(|| {
+                    anyhow::anyhow!("--run needs a file for the input {name} (shape {shape:?}): --run {name}=FILE")
+                })?;
+                Some(read_cells(path, cells, name)?)
+            }
+            _ if outputs.iter().any(|(n, _)| n == name) || (name == "OUTPUT" && print_output) => Some(vec![0.0; cells]),
+            _ => None,
+        };
+        given.push(values.is_some());
+        let values = values.unwrap_or_default();
+        if wide {
+            f64_bufs.push(values);
+        } else {
+            f32_bufs.push(values.iter().map(|v| *v as f32).collect());
+        }
+    }
+    let table: Vec<*mut std::ffi::c_void> = (0..shapes.len())
+        .map(|k| {
+            if !given[k] {
+                std::ptr::null_mut()
+            } else if wide {
+                f64_bufs[k].as_mut_ptr() as *mut std::ffi::c_void
+            } else {
+                f32_bufs[k].as_mut_ptr() as *mut std::ffi::c_void
+            }
+        })
+        .collect();
+    // dlopen searches the library path for a bare name; the kernel is a file.
+    let so_file = fs::canonicalize(so_path).unwrap_or_else(|_| PathBuf::from(so_path));
+    let lib = unsafe { libloading::Library::new(&so_file) }
+        .map_err(|e| anyhow::anyhow!("cannot load {}: {e}", so_file.display()))?;
+    unsafe {
+        let exec: libloading::Symbol<unsafe extern "C" fn(*const *mut std::ffi::c_void)> =
+            lib.get(b"rho_kernel_exec_spaces").map_err(|e| anyhow::anyhow!("{e}"))?;
+        exec(table.as_ptr());
+        let sweeps: libloading::Symbol<unsafe extern "C" fn() -> i64> = lib.get(b"rho_kernel_sweeps").map_err(|e| anyhow::anyhow!("{e}"))?;
+        let converged: libloading::Symbol<unsafe extern "C" fn() -> i64> = lib.get(b"rho_kernel_converged").map_err(|e| anyhow::anyhow!("{e}"))?;
+        if codegen.iterates() {
+            eprintln!("sweeps {} converged {}", sweeps(), if converged() != 0 { "yes" } else { "no" });
+        }
+    }
+    let cells_of = |k: usize| -> Vec<f64> {
+        if wide {
+            f64_bufs[k].clone()
+        } else {
+            f32_bufs[k].iter().map(|v| *v as f64).collect()
+        }
+    };
+    for (name, path) in &outputs {
+        let k = shapes.keys().position(|n| n == name).unwrap();
+        write_cells(path, &shapes[name], &cells_of(k))?;
+        eprintln!("{name} -> {}", path.display());
+    }
+    if print_output {
+        let k = shapes.keys().position(|n| n == "OUTPUT").unwrap();
+        print!("{}", format_rows(&shapes["OUTPUT"], &cells_of(k)));
+    }
     Ok(())
 }

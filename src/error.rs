@@ -29,8 +29,8 @@ pub enum HarmonyDisruption {
     },
 
     /// Flow Disruption: Missing equilibrium output point (=)
-    #[error("[Harmony Disruption: Flow Failure] Missing final equilibrium output point (=) in computational universe.")]
-    FlowErr,
+    #[error("[Harmony Disruption: Flow Failure] No flow ends in `=`: the program never names its output. Write the last flow as `expr → =` (Line {line})")]
+    FlowErr { line: usize },
 
     /// Logic Disruption: Static constraint solver (!) failure
     #[error("[Harmony Disruption: Logic Failure] Static constraint expression '{expr}' failed validation. (Line {line})")]
@@ -74,7 +74,7 @@ impl HarmonyDisruption {
             HarmonyDisruption::LoweringErr { line, .. } => *line,
             HarmonyDisruption::IterateErr { line, .. } => *line,
             HarmonyDisruption::InFunction { line, .. } => *line,
-            HarmonyDisruption::FlowErr => 0,
+            HarmonyDisruption::FlowErr { line } => *line,
         };
         (line > 0).then_some(line)
     }

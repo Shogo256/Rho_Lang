@@ -1644,7 +1644,9 @@ pub fn validate_flow_equilibrium(block: &ToposBlock) -> Result<()> {
     });
 
     if !has_eq {
-        return Err(HarmonyDisruption::FlowErr);
+        // The line of the last flow, where the `=` would go.
+        let line = block.lines.last().copied().unwrap_or(1).max(1);
+        return Err(HarmonyDisruption::FlowErr { line });
     }
     Ok(())
 }

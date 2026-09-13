@@ -149,6 +149,8 @@ with what the `!` check could and could not settle.
 | `--emit-sv <DIR>` | Also write the program as a SystemVerilog streaming pipeline, with a Verilator harness |
 | `--fixed <W.F>` | Make the circuit's cells fixed point (e.g. `32.16`), which Yosys synthesises; the interpreter on the same numbers is the reference |
 | `--emit-jax <FILE.py>` | Also write the program as a JAX module (`rho`, `rho_jit`), for CPU, GPU and TPU through XLA |
+| `--run SPACE=FILE` | Run the kernel once with this input read from a file (raw doubles for `.bin`, whitespace-separated numbers otherwise); repeat per input. OUTPUT is printed unless `--write` names a file for it |
+| `--write SPACE=FILE` | After `--run`, write a space to a file (`.bin` raw doubles, text otherwise); intermediates may be named too |
 
 ### 3. Call it from Python
 
@@ -261,6 +263,26 @@ engine.execute_spaces({"A": a, "B": b, "OUTPUT": c})
 ```
 
 ---
+
+### 7. Run it from the command line
+
+No host language is needed to try a program: `--run` feeds an input from a
+file and runs the kernel once, `--write` keeps any space it wrote.
+
+```bash
+printf '1 2 3 4\n5 6 7 8\n' > in.txt
+rhoc examples/matrix_add.rho --run INPUT=in.txt            # prints OUTPUT, one row per line
+rhoc examples/jacobi.rho --tau 1e-12 --max-iter 200 \
+     --run INPUT=field.bin --write OUTPUT=out.bin          # raw doubles in and out; reports the sweeps
+```
+
+### 8. The same program elsewhere
+
+The kernel is one of three things a program becomes. `--emit-jax module.py`
+writes it as a JAX module (`rho`, `rho_jit`) for CPUs, GPUs and TPUs through
+XLA, and `--emit-sv DIR` as a SystemVerilog streaming pipeline, one cell per
+clock, that Verilator simulates and, with `--fixed 32.16`, Yosys synthesises.
+Both are held to the interpreter: see the specification, §7 and §8.
 
 ## C ABI
 

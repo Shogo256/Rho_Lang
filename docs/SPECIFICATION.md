@@ -641,6 +641,14 @@ names alone, so the same table serves every rebuild of the same source.
 `RhoEngine.execute_spaces({"A": a, "B": b, "OUTPUT": c})` builds the table from
 a dictionary and checks each buffer's length against its shape first.
 
+The compiler drives the same entrypoint from the command line: `rhoc p.rho
+--run INPUT=in.txt --write A=a.bin` reads each `--run` input from a file (raw
+little-endian doubles for `.bin`, whitespace-separated numbers otherwise, as
+many as the space has cells), runs the kernel once, writes each `--write`
+space (`.bin` raw, text one row per line otherwise), prints OUTPUT when no
+file is named for it, and reports the sweeps and whether every `⇒` settled.
+Every input must be given; an intermediate not asked for is the kernel's.
+
 ---
 
 ### 3.4.2 From Python, at any shape ✅

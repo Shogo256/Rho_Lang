@@ -65,7 +65,7 @@ fn test_flow_disruption_err() {
     let res = parse_rho_program(source);
     assert!(res.is_err());
     match res.err().unwrap() {
-        HarmonyDisruption::FlowErr => {}
+        HarmonyDisruption::FlowErr { .. } => {}
         err => panic!("Unexpected error: {:?}", err),
     }
 }
@@ -4889,5 +4889,81 @@ fn test_scratch_is_kept_between_calls_and_the_bits_do_not_change() {
         let mut out = vec![0.0f64; 65536];
         unsafe { func(grid.as_ptr(), out.as_mut_ptr()) };
         assert_eq!(bits(&out), bits(&meant), "call {call}");
+    }
+}
+
+#[test]
+fn test_rhoc_run_takes_files_in_and_gives_the_spaces_back() {
+    // `--run SPACE=FILE` feeds an input from text or raw doubles and runs
+    // the kernel; OUTPUT comes back on stdout, `--write` puts any written
+    // space in a file, and a loop reports its sweeps.
+    let dir = std::path::Path::new("target/rhoc_run");
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("p.rho"), "step:{ U\n    (▷U + ▽U) → S\n    (S / 4.0) → =\n}\n{\n    INPUT:◯ □ 2 4\n    (INPUT × 2.0) → A\n    A → X\n    ((INPUT / 4.0) + (step X)) ⇒ X\n    X → =\n}\n").unwrap();
+    std::fs::write(dir.join("in.txt"), "1 2 3 4\n5 6 7 8\n").unwrap();
+    let grid = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let block = parse_rho_program(&std::fs::read_to_string(dir.join("p.rho")).unwrap()).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![2, 4], grid.clone()));
+    let meant = interpret_with(&block, &env, &Options { tau: 1e-9, max_sweeps: 200 }).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rhoc"))
+        .current_dir(dir)
+        .args(["p.rho", "-o", "p.so", "--tau", "1e-9", "--max-iter", "200", "--run", "INPUT=in.txt", "--write", "A=a.bin"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let printed: Vec<f64> = stdout.lines().rev().take(2).collect::<Vec<_>>().into_iter().rev().flat_map(|l| l.split_whitespace().map(|w| w.parse::<f64>().unwrap()).collect::<Vec<_>>()).collect();
+    assert_eq!(bits(&printed), bits(&meant["OUTPUT"].cells), "{stdout}");
+    let a: Vec<f64> = std::fs::read(dir.join("a.bin")).unwrap().chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+    assert_eq!(bits(&a), bits(&meant["A"].cells));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("sweeps ") && stderr.contains("converged yes"), "{stderr}");
+    // A missing input is named, with the flag to give it.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rhoc")).current_dir(dir).args(["p.rho", "-o", "p.so", "--max-iter", "200", "--write", "A=a.bin"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--run INPUT=FILE"));
+}
+
+#[test]
+fn test_every_error_a_program_can_raise_names_its_line() {
+    // Malformed programs of every kind the front end and the lowering can
+    // refuse: each refusal carries the line it points at, never line 0.
+    let cases: [(&str, &str); 14] = [
+        ("unknown glyph", "{\n    INPUT:◯ □ 4\n    (INPUT ⊕ 1.0) → =\n}"),
+        ("undeclared space", "{\n    INPUT:◯ □ 4\n    (INPUT + Y) → =\n}"),
+        ("shape mismatch", "{\n    A:◯ □ 4\n    B:◯ □ 5\n    (A + B) → =\n}"),
+        ("loop without a start", "{\n    INPUT:◯ □ 4\n    (X × 0.5) ⇒ X\n    X → =\n}"),
+        ("loop changes the shape", "{\n    INPUT:◯ □ 4 4\n    INPUT → X\n    (◇+1 X) ⇒ X\n    X → =\n}"),
+        ("unknown function", "{\n    INPUT:◯ □ 4\n    (blur INPUT) → =\n}"),
+        ("wrong arity", "f:{ A B (A + B) }\n{\n    INPUT:◯ □ 4\n    (f INPUT) → =\n}"),
+        ("caller's space inside a body", "f:{ A (A + INPUT) }\n{\n    INPUT:◯ □ 4\n    (f INPUT) → =\n}"),
+        ("gather from a computed value", "{\n    INPUT:◯ □ 4\n    (INPUT ⌷ (INPUT × 2.0)) → =\n}"),
+        ("unbalanced parenthesis", "{\n    INPUT:◯ □ 4\n    ((INPUT + 1.0) → =\n}"),
+        ("no output", "{\n    INPUT:◯ □ 4\n    (INPUT + 1.0) → A\n}"),
+        ("bad number", "{\n    INPUT:◯ □ 4\n    (INPUT + 1.0.0) → =\n}"),
+        ("axis out of range", "{\n    INPUT:◯ □ 4\n    (▷3INPUT) → =\n}"),
+        ("take of a computed value", "{\n    INPUT:◯ □ 4\n    (2 ↑ (INPUT + 1.0)) → =\n}"),
+    ];
+    for (what, source) in cases {
+        let text = match parse_rho_program(source) {
+            Err(e) => e.to_string(),
+            Ok(block) => {
+                let mut codegen = LlvmCodeGen::new("diag").with_max_sweeps(4);
+                match rho_lang::solver::ConstraintSolver::verify_at(&block, 0.0, rho_lang::numeric::Precision::F64)
+                    .map_err(|e| block.attribute(e))
+                    .and_then(|_| codegen.generate_llvm_ir(&block).map_err(|e| block.attribute(e)))
+                {
+                    Err(e) => e.to_string(),
+                    Ok(_) => panic!("{what}: accepted\n{source}"),
+                }
+            }
+        };
+        let line: Option<usize> = text
+            .split("Line ")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse().ok());
+        assert!(line.is_some_and(|l| l > 0), "{what}: no line in: {text}");
     }
 }

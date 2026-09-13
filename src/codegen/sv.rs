@@ -36,8 +36,10 @@
 //! timing, or that broadcasts a smaller space (`□`, a length-1 axis), is a
 //! replay: its sources are captured into memories and the result's cells
 //! are streamed out of them, the broadcast ones read at the mapped place —
-//! which is what makes a matrix product a circuit. Not yet: the turns,
-//! `⌷`, a fold or a broadcast inside `⇒`.
+//! which is what makes a matrix product a circuit. Inside a `⇒` a fold or
+//! a broadcast makes the round two passes: the first streams the grid
+//! through the folds, the second replays it with their results. Not yet:
+//! the turns, `⌷`, and a body of flows inside `⇒`.
 
 use crate::ast::*;
 use crate::error::{HarmonyDisruption, Result};
@@ -187,6 +189,12 @@ struct Replay {
     cells: usize,
     main: Vec<(String, Stream)>,
     broadcast: Vec<(String, Stream)>,
+    /// Inside a `⇒`: the signal that starts a round, at which the captures
+    /// of the round's own streams begin again. A source from outside the
+    /// loop is captured once and kept.
+    round_reset: Option<String>,
+    /// Origins made inside the loop, whose captures restart every round.
+    per_round: BTreeSet<Origin>,
 }
 
 /// A `⇒`: which stage updates, what it reads, and where the result goes.
@@ -319,6 +327,12 @@ fn usage(expr: &Expr, line: usize, lifts: &mut Vec<usize>, out: &mut BTreeMap<St
             usage(operand, line, lifts, out)?;
         }
         Expr::AuditTrace(inner) | Expr::Builtin { operand: inner, .. } => usage(inner, line, lifts, out)?,
+        // A lift around a fold applies to the fold's result, not to what
+        // the fold reads.
+        Expr::Reduce { operand: inner, .. } | Expr::Scan { operand: inner, .. } => {
+            let mut none = Vec::new();
+            usage(inner, line, &mut none, out)?;
+        }
         Expr::BinaryOp { lhs, rhs, .. } => {
             usage(lhs, line, lifts, out)?;
             usage(rhs, line, lifts, out)?;
@@ -589,9 +603,6 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
                 if !prelude.is_empty() {
                     return Err(unsupported("a call with a body of flows inside `⇒`", line));
                 }
-                if has_fold(src) {
-                    return Err(unsupported("a fold inside `⇒`", line));
-                }
                 let cap = cap.ok_or_else(|| HarmonyDisruption::LoweringErr {
                     detail: "this program iterates (⇒); say how many sweeps it may take with --max-iter".to_string(),
                     line,
@@ -601,13 +612,26 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
                     line,
                 })?;
                 let cells = shape.iter().product::<usize>().max(1);
-                let (srcs, _) = sources(src, &shapes, line)?;
+                // Every space the update reads, folds' operands included:
+                // what the round has to stream.
+                let mut srcs: BTreeSet<String> = BTreeSet::new();
+                all_spaces(src, &mut srcs);
+                let mut lifts_of: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+                usage(src, line, &mut Vec::new(), &mut lifts_of)?;
                 let id = loops.len();
-                // The round streams: every source read from its memory,
-                // one cell per clock, all with one timing.
+                let first_stage = stages.len();
+                // The round streams: the sources of the grid's own shape,
+                // read out of their memories one cell per clock each round.
+                // A smaller space stretched against the grid is not streamed;
+                // it is captured once by the replay that reads it by place.
                 let mut captured: Vec<(String, Stream)> = Vec::new();
+                let mut renamed: BTreeMap<String, String> = BTreeMap::new();
                 for s in srcs.iter().chain(std::iter::once(target)) {
-                    if captured.iter().any(|(n, _)| n == s) {
+                    if renamed.contains_key(s) {
+                        continue;
+                    }
+                    let streamed = shapes.get(s) == Some(&shape) && lifts_of.get(s).is_none_or(|l| l.is_empty());
+                    if !streamed && s != target {
                         continue;
                     }
                     let stream = streams.get(s).cloned().ok_or_else(|| HarmonyDisruption::SpaceErr {
@@ -617,25 +641,27 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
                     let alias = format!("{s}⟳{id}");
                     shapes.insert(alias.clone(), shapes[s].clone());
                     streams.insert(
-                        alias,
+                        alias.clone(),
                         Stream {
                             value: format!("rr{id}_{}", ident(s)),
                             valid: format!("rv{id}"),
                             latency: 1,
                             origin: Origin(format!("round{id}")),
-                            cells: shapes[s].iter().product::<usize>().max(1),
+                            cells,
                         },
                     );
                     captured.push((s.clone(), stream));
+                    renamed.insert(s.clone(), alias);
                 }
-                let renamed = rename(src, &|name: &str| format!("{name}⟳{id}"));
-                // Inside a loop every source is streamed by the round; a
-                // source of another shape would need capturing per round.
-                if srcs.iter().any(|s| shapes.get(s) != Some(&shape)) || has_lift(src) {
-                    return Err(unsupported("a broadcast inside `⇒`", line));
-                }
+                let renamed_src = rename(src, &|name: &str| renamed.get(name).cloned().unwrap_or_else(|| name.to_string()));
+                // A fold in the update is a stage on the round stream: the
+                // first pass of the round. The update then replays the grid
+                // with the fold's result, which is the second pass.
+                let renamed_src = extract_folds(
+                    &renamed_src, line, tau, numbers, &mut shapes, &mut streams, &mut stages, &mut folds_made, &mut replays,
+                )?;
                 let mut stage = plan_stage(
-                    &renamed,
+                    &renamed_src,
                     &format!("{target}⟳{id}"),
                     shape.clone(),
                     Kind::Flow,
@@ -647,9 +673,24 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
                     stages.len(),
                     &mut replays,
                 )?;
-                stage.round_reset = Some(format!("rs{id}"));
+                let rs = format!("rs{id}");
+                stage.round_reset = Some(rs.clone());
                 let update = stage.index;
                 stages.push(stage);
+                // Everything made inside the loop starts afresh each round:
+                // the fold stages, the update, and the replays' captures of
+                // the round's own streams.
+                let mut per_round: BTreeSet<Origin> = BTreeSet::new();
+                per_round.insert(Origin(format!("round{id}")));
+                for st in stages.iter_mut().skip(first_stage) {
+                    st.round_reset = Some(rs.clone());
+                    per_round.insert(Origin(format!("fold{}", st.index)));
+                    per_round.insert(Origin(format!("replay{}", st.index)));
+                }
+                for r in replays.iter_mut().filter(|r| r.id >= first_stage) {
+                    r.round_reset = Some(rs.clone());
+                    r.per_round = per_round.clone();
+                }
                 loops.push(Loop {
                     id,
                     target: target.clone(),
@@ -736,7 +777,7 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
         + stages.iter().map(|s| s.reach + 3).sum::<usize>()
         + loops
             .iter()
-            .map(|l| (l.cap + 1) * (l.cells + stages[l.update].reach + 8) + 2 * l.cells)
+            .map(|l| (l.cap + 1) * (3 * l.cells + stages[l.update].reach + 32) + 2 * l.cells)
             .sum::<usize>()
         + 16;
 
@@ -1053,6 +1094,8 @@ fn plan_stage(
             cells,
             main: captured_main,
             broadcast: captured_broadcast,
+            round_reset: None,
+            per_round: BTreeSet::new(),
         });
         let src = rename(src, &|name: &str| renamed.get(name).cloned().unwrap_or_else(|| name.to_string()));
         let chains: Chains = renamed
@@ -1104,6 +1147,16 @@ fn plan_stage(
 fn emit_replay(sv: &mut String, r: &Replay, numbers: Numbers) {
     let k = r.id;
     let ty = numbers.ty();
+    let round = |stream: &Stream| -> String {
+        match &r.round_reset {
+            Some(rs) if r.per_round.contains(&stream.origin) => format!("(rst || {rs})"),
+            _ => "rst".to_string(),
+        }
+    };
+    let restart = match &r.round_reset {
+        Some(rs) => format!("(rst || {rs})"),
+        None => "rst".to_string(),
+    };
     let _ = writeln!(sv);
     let _ = writeln!(sv, "  // ---- replay for stage {k}: {} cells streamed back out of memory", r.cells);
     let all: Vec<&(String, Stream)> = r.main.iter().chain(r.broadcast.iter()).collect();
@@ -1118,21 +1171,25 @@ fn emit_replay(sv: &mut String, r: &Replay, numbers: Numbers) {
     let _ = writeln!(sv, "  logic rv{k};");
     let _ = writeln!(sv, "  logic [1:0] rst{k};  // 0 capture, 1 read, 2 done");
     let _ = writeln!(sv, "  logic [{}:0] ri{k};", bits(r.cells) - 1);
-    let _ = writeln!(sv, "  always_ff @(posedge clk) begin : replay{k}");
-    let _ = writeln!(sv, "    logic all_captured;");
-    let _ = writeln!(sv, "    if (rst) begin");
-    let zero: Vec<String> = all.iter().map(|(n, _)| format!("cap{k}_{} <= 0", ident(n))).collect();
-    let _ = writeln!(sv, "      {}; rv{k} <= 1'b0; rst{k} <= 0; ri{k} <= 0;", zero.join("; "));
-    let _ = writeln!(sv, "    end else begin");
-    let _ = writeln!(sv, "      rv{k} <= 1'b0;");
+    // Each capture restarts on its own terms: a stream of the round's own
+    // making every round, one from outside the loop only on reset.
     for (name, stream) in &all {
         let sid = ident(name);
+        let _ = writeln!(sv, "  always_ff @(posedge clk) begin");
+        let _ = writeln!(sv, "    if ({}) cap{k}_{sid} <= 0;", round(stream));
         let _ = writeln!(
             sv,
-            "      if (rst{k} == 0 && {} && cap{k}_{sid} < {}) begin m{k}_{sid}[cap{k}_{sid}] <= {}; cap{k}_{sid} <= cap{k}_{sid} + 1; end",
+            "    else if (rst{k} == 0 && {} && cap{k}_{sid} < {}) begin m{k}_{sid}[cap{k}_{sid}] <= {}; cap{k}_{sid} <= cap{k}_{sid} + 1; end",
             stream.valid, stream.cells, stream.value
         );
+        let _ = writeln!(sv, "  end");
     }
+    let _ = writeln!(sv, "  always_ff @(posedge clk) begin : replay{k}");
+    let _ = writeln!(sv, "    logic all_captured;");
+    let _ = writeln!(sv, "    if ({restart}) begin");
+    let _ = writeln!(sv, "      rv{k} <= 1'b0; rst{k} <= 0; ri{k} <= 0;");
+    let _ = writeln!(sv, "    end else begin");
+    let _ = writeln!(sv, "      rv{k} <= 1'b0;");
     let done: Vec<String> = all.iter().map(|(n, st)| format!("(cap{k}_{} == {})", ident(n), st.cells)).collect();
     let _ = writeln!(sv, "      all_captured = {};", done.join(" && "));
     let _ = writeln!(sv, "      case (rst{k})");
@@ -1151,34 +1208,37 @@ fn emit_replay(sv: &mut String, r: &Replay, numbers: Numbers) {
     let _ = writeln!(sv, "  end");
 }
 
-/// Whether a fold or scan sits anywhere in the expression.
-fn has_fold(expr: &Expr) -> bool {
+/// Every space named anywhere in the expression, folds and lifts included.
+fn all_spaces(expr: &Expr, out: &mut BTreeSet<String>) {
     match expr {
-        Expr::Reduce { .. } | Expr::Scan { .. } => true,
-        Expr::Number(_) | Expr::Var(_) => false,
+        Expr::Var(name) => {
+            if !is_tau(name) {
+                out.insert(name.clone());
+            }
+        }
+        Expr::Number(_) => {}
         Expr::AuditTrace(inner)
         | Expr::Builtin { operand: inner, .. }
         | Expr::Shift { operand: inner, .. }
         | Expr::Index { operand: inner, .. }
         | Expr::Lift { operand: inner, .. }
+        | Expr::Reduce { operand: inner, .. }
+        | Expr::Scan { operand: inner, .. }
         | Expr::Rotate { operand: inner, .. }
         | Expr::Reverse { operand: inner, .. }
         | Expr::Reshape { operand: inner, .. }
         | Expr::Transpose { operand: inner, .. }
         | Expr::Take { operand: inner, .. }
-        | Expr::Drop { operand: inner, .. } => has_fold(inner),
-        Expr::BinaryOp { lhs, rhs, .. } | Expr::Gather { index: lhs, operand: rhs } => has_fold(lhs) || has_fold(rhs),
-        Expr::Call { args, .. } => args.iter().any(has_fold),
-    }
-}
-
-/// Whether a lift sits anywhere in the expression.
-fn has_lift(expr: &Expr) -> bool {
-    match expr {
-        Expr::Lift { .. } => true,
-        Expr::AuditTrace(inner) | Expr::Builtin { operand: inner, .. } | Expr::Shift { operand: inner, .. } => has_lift(inner),
-        Expr::BinaryOp { lhs, rhs, .. } => has_lift(lhs) || has_lift(rhs),
-        _ => false,
+        | Expr::Drop { operand: inner, .. } => all_spaces(inner, out),
+        Expr::BinaryOp { lhs, rhs, .. } | Expr::Gather { index: lhs, operand: rhs } => {
+            all_spaces(lhs, out);
+            all_spaces(rhs, out);
+        }
+        Expr::Call { args, .. } => {
+            for a in args {
+                all_spaces(a, out);
+            }
+        }
     }
 }
 
@@ -1193,6 +1253,8 @@ fn rename(expr: &Expr, f: &dyn Fn(&str) -> String) -> Expr {
         Expr::Shift { dir, axis, operand } => Expr::Shift { dir: *dir, axis: *axis, operand: sub(operand) },
         Expr::Index { axis, operand } => Expr::Index { axis: *axis, operand: sub(operand) },
         Expr::Lift { axis, operand } => Expr::Lift { axis: *axis, operand: sub(operand) },
+        Expr::Reduce { op, axis, operand } => Expr::Reduce { op: *op, axis: *axis, operand: sub(operand) },
+        Expr::Scan { op, axis, operand } => Expr::Scan { op: *op, axis: *axis, operand: sub(operand) },
         Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp { op: op.clone(), lhs: sub(lhs), rhs: sub(rhs) },
         other => other.clone(),
     }

@@ -4191,10 +4191,78 @@ fn test_a_broadcast_is_a_replay_out_of_memory() {
 }
 
 #[test]
+fn test_a_fold_or_a_broadcast_inside_a_loop_makes_the_round_two_passes() {
+    if !verilator_available() {
+        eprintln!("verilator not found: circuit test skipped");
+        return;
+    }
+    use rho_lang::codegen::sv::Numbers;
+    use rho_lang::numeric::Fixed;
+    type Q = Fixed<32, 16>;
+    // Each round subtracts the row's mean and halves: the fold runs on the
+    // round's stream, its result is captured, and the update replays the
+    // grid against it. The grid contracts to zero.
+    let centring = "{\n    INPUT:◯ □ 4 16\n    INPUT → X\n    ((X - (□1 ((◇+1 X) / 16.0))) × 0.5) ⇒ X\n    X → =\n}";
+    // A space one wide along an axis, from outside the loop, read by place
+    // every round: X settles at twice ROW.
+    let stretched = "{\n    INPUT:◯ □ 4 16\n    ROW:◯ □ 4 1\n    INPUT → X\n    ((X × 0.5) + ROW) ⇒ X\n    X → =\n}";
+    let grid: Vec<f64> = (0..64).map(|i| ((i as f64) * 0.37).sin() * 2.0 + (i % 5) as f64 * 0.25).collect();
+    let row: Vec<f64> = vec![0.5, -1.0, 2.0, 0.25];
+    for (name, source, inputs, tau) in [
+        ("centring", centring, vec![("INPUT", vec![4, 16], grid.clone())], 1e-9),
+        ("stretched", stretched, vec![("INPUT", vec![4, 16], grid.clone()), ("ROW", vec![4, 1], row.clone())], 1e-9),
+    ] {
+        let block = parse_rho_program(source).unwrap();
+        let options = Options { tau, max_sweeps: 100 };
+        for numbers in [Numbers::Real, Numbers::Fixed { width: 32, frac: 16 }] {
+            let meant: Vec<f64> = match numbers {
+                Numbers::Real => {
+                    let mut env: Env<f64> = Env::new();
+                    for (n, shape, data) in &inputs {
+                        env.insert(n.to_string(), Grid::from(shape.clone(), data.clone()));
+                    }
+                    interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone()
+                }
+                Numbers::Fixed { .. } => {
+                    let mut env: Env<Q> = Env::new();
+                    for (n, shape, data) in &inputs {
+                        env.insert(n.to_string(), Grid::from(shape.clone(), data.iter().map(|v| Q::from_f64(*v)).collect()));
+                    }
+                    interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.iter().map(|c| c.to_f64()).collect()
+                }
+            };
+            let circuit = rho_lang::codegen::sv::emit(&block, tau, Some(100), numbers).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let dir = format!("target/sv_loop_{name}_{}", if matches!(numbers, Numbers::Real) { "real" } else { "fixed" });
+            let feed: Vec<Vec<f64>> = circuit.inputs.iter().map(|(n, _)| inputs.iter().find(|(m, _, _)| m == n).unwrap().2.clone()).collect();
+            let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new(&dir), &feed).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(bits(&run.output), bits(&meant), "{name} {numbers:?}: circuit vs interpreter\n{}", circuit.module);
+            assert!(run.converged, "{name} {numbers:?}: {} sweeps", run.sweeps);
+        }
+        // The sweep count is the kernel's.
+        let so = compile_iterating(&format!("sv_loop_{name}_ref"), source, tau, 100, true);
+        let lib = unsafe { libloading::Library::new(&so).unwrap() };
+        let spaces: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> = unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+        let sweeps: libloading::Symbol<unsafe extern "C" fn() -> i64> = unsafe { lib.get(b"rho_kernel_sweeps").unwrap() };
+        let mut bufs: Vec<Vec<f64>> = Vec::new();
+        let order = kernel_spaces(&lib);
+        for (space, cells, _) in &order {
+            let data = inputs.iter().find(|(m, _, _)| m == space).map(|(_, _, d)| d.clone()).unwrap_or_else(|| vec![0.0; *cells]);
+            bufs.push(data);
+        }
+        let ptrs: Vec<*mut f64> = bufs.iter_mut().map(|b| b.as_mut_ptr()).collect();
+        unsafe { spaces(ptrs.as_ptr()) };
+        let kernel_sweeps = unsafe { sweeps() };
+        let circuit = rho_lang::codegen::sv::emit(&block, tau, Some(100), Numbers::Real).unwrap();
+        let feed: Vec<Vec<f64>> = circuit.inputs.iter().map(|(n, _)| inputs.iter().find(|(m, _, _)| m == n).unwrap().2.clone()).collect();
+        let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new(&format!("target/sv_loop_{name}_real")), &feed).unwrap();
+        assert_eq!(run.sweeps as i64, kernel_sweeps, "{name}: sweeps");
+    }
+}
+
+#[test]
 fn test_what_is_not_yet_a_circuit_says_so() {
     for (source, what) in [
-        ("{\n    INPUT:◯ □ 4 4\n    ROW:◯ □ 4 1\n    INPUT → X\n    ((X × 0.5) + ROW) ⇒ X\n    X → =\n}", "broadcast inside"),
-        ("{\n    INPUT:◯ □ 4 4\n    INPUT → X\n    ((X × 0.5) + (□1 (◇+1 X))) ⇒ X\n    X → =\n}", "fold inside"),
+        ("\nstep:{ U\n    (▷U + ▽U) → S\n    (S / 4.0) → =\n}\n{\n    INPUT:◯ □ 4 4\n    INPUT → X\n    (step X) ⇒ X\n    X → =\n}", "body of flows"),
         ("{\n    INPUT:◯ □ 4 4\n    ((1 ⌽ INPUT) + INPUT) → =\n}", "rotation"),
     ] {
         let block = parse_rho_program(source).unwrap();

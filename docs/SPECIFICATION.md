@@ -915,13 +915,21 @@ the kernel's `rho_kernel_sweeps()` and `rho_kernel_converged()` do. Jacobi
 on 64 cells gives the kernel's bits, its sweep count and its settled flag; a
 round costs the cells plus the pipeline's drain.
 
+A fold or a broadcast in the update makes the round two passes. The folds
+are stages on the round's stream — the first pass — and their results,
+with the round's grid, are captured by a replay that the update reads: the
+second pass. What the loop made itself starts afresh every round; a smaller
+space from outside the loop is captured once and read by place each round.
+Subtracting each row's mean and halving, `((X - □1 ((◇+1 X) / 16.0)) × 0.5)
+⇒ X`, settles in the kernel's number of sweeps, in `real` and in Q16.16.
+
 In the subset: `→`, arithmetic, comparisons as masks, `⌈ ⌊ |`, the named
 functions, `?`, `⌊X` `⌈X`, `⍳`, shifts along any axis, folds and scans along
 any axis, lifts and broadcasts, chains of flows, several inputs, `⇒` with
-an expression body, and all of it in `real` or in fixed point. Not yet, and
-said so with a line: the turns, `⌷`, a fold, a broadcast or a body of flows
-inside `⇒`, a shift of a lifted space, and in fixed point the transcendental
-functions.
+an expression body that may fold and broadcast, and all of it in `real` or
+in fixed point. Not yet, and said so with a line: the turns, `⌷`, a body of
+flows inside `⇒`, a shift of a lifted space, and in fixed point the
+transcendental functions.
 
 ## 8. Precision ✅
 

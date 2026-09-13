@@ -297,7 +297,7 @@ fn read_cells(path: &Path, cells: usize, name: &str) -> anyhow::Result<Vec<f64>>
         if bytes.len() % 8 != 0 {
             anyhow::bail!("{} holds {} bytes, not a whole number of doubles", path.display(), bytes.len());
         }
-        bytes.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect()
+        bytes.as_chunks::<8>().0.iter().map(|c| f64::from_le_bytes(*c)).collect()
     } else {
         let text = fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
         text.split_whitespace()

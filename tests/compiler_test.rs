@@ -4915,7 +4915,7 @@ fn test_rhoc_run_takes_files_in_and_gives_the_spaces_back() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let printed: Vec<f64> = stdout.lines().rev().take(2).collect::<Vec<_>>().into_iter().rev().flat_map(|l| l.split_whitespace().map(|w| w.parse::<f64>().unwrap()).collect::<Vec<_>>()).collect();
     assert_eq!(bits(&printed), bits(&meant["OUTPUT"].cells), "{stdout}");
-    let a: Vec<f64> = std::fs::read(dir.join("a.bin")).unwrap().chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+    let a: Vec<f64> = std::fs::read(dir.join("a.bin")).unwrap().as_chunks::<8>().0.iter().map(|c| f64::from_le_bytes(*c)).collect();
     assert_eq!(bits(&a), bits(&meant["A"].cells));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("sweeps ") && stderr.contains("converged yes"), "{stderr}");

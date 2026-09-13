@@ -3929,7 +3929,7 @@ fn test_the_circuit_gives_the_interpreters_bits_one_cell_per_clock() {
     env.insert("INPUT".to_string(), Grid::from(vec![6, 8], input.clone()));
     let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
 
-    let circuit = rho_lang::codegen::sv::emit(&block, 0.0).unwrap();
+    let circuit = rho_lang::codegen::sv::emit(&block, 0.0, None).unwrap();
     assert_eq!(circuit.inputs, vec![("INPUT".to_string(), 48)]);
     assert_eq!(circuit.output_cells, 48);
     assert!(circuit.module.contains("module rho_kernel"), "{}", circuit.module);
@@ -3938,7 +3938,8 @@ fn test_the_circuit_gives_the_interpreters_bits_one_cell_per_clock() {
     assert!(circuit.module.contains("c0_INPUT [0:16]"), "{}", circuit.module);
 
     let dir = std::path::Path::new("target/sv_stencil");
-    let (out, cycles) = rho_lang::codegen::sv::simulate(&circuit, dir, std::slice::from_ref(&input)).unwrap();
+    let run = rho_lang::codegen::sv::simulate(&circuit, dir, std::slice::from_ref(&input)).unwrap();
+    let (out, cycles) = (run.output, run.cycles);
     assert_eq!(out.len(), 48);
     assert_eq!(bits(&out), bits(&meant), "circuit vs interpreter\n{}", circuit.module);
     // One cell per clock: the run is the cells plus the pipeline's latency.
@@ -3958,9 +3959,9 @@ fn test_the_circuit_gives_the_interpreters_bits_one_cell_per_clock() {
     env.insert("A".to_string(), Grid::from(vec![16], a.clone()));
     env.insert("B".to_string(), Grid::from(vec![16], b.clone()));
     let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
-    let circuit = rho_lang::codegen::sv::emit(&block, 0.0).unwrap();
-    let (out, _) = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new("target/sv_mix"), &[a, b]).unwrap();
-    assert_eq!(bits(&out), bits(&meant));
+    let circuit = rho_lang::codegen::sv::emit(&block, 0.0, None).unwrap();
+    let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new("target/sv_mix"), &[a, b]).unwrap();
+    assert_eq!(bits(&run.output), bits(&meant));
 }
 
 #[test]
@@ -3989,11 +3990,12 @@ fn test_folds_and_scans_are_stages_of_the_circuit() {
         let mut env: Env<f64> = Env::new();
         env.insert("INPUT".to_string(), Grid::from(vec![4, 16], grid.clone()));
         let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
-        let circuit = rho_lang::codegen::sv::emit(&block, 0.0).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let circuit = rho_lang::codegen::sv::emit(&block, 0.0, None).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(circuit.output_cells, meant.len(), "{name}");
         let dir_name = format!("target/sv_{name}");
-        let (out, cycles) = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new(&dir_name), std::slice::from_ref(&grid))
+        let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new(&dir_name), std::slice::from_ref(&grid))
             .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let (out, cycles) = (run.output, run.cycles);
         assert_eq!(bits(&out), bits(&meant), "{name}: circuit vs interpreter\n{}", circuit.module);
         // The input is 64 cells and the pipeline shallow: no cell waits long.
         assert!(cycles <= 64 + 40, "{name}: {cycles} cycles");
@@ -4001,14 +4003,66 @@ fn test_folds_and_scans_are_stages_of_the_circuit() {
 }
 
 #[test]
+fn test_a_fixed_point_is_a_loop_in_the_circuit() {
+    if !verilator_available() {
+        eprintln!("verilator not found: circuit test skipped");
+        return;
+    }
+    // Jacobi in one dimension: the loop captures INPUT and X, streams them
+    // out every round through the update, writes the other buffer while
+    // taking the largest move, and stops on the tolerance. The bits, the
+    // sweep count and the settled flag are the kernel's.
+    let source = r#"{
+        INPUT:◯ □ 64
+        INPUT → X
+        ((INPUT - (▷X + ▽X)) / 4.0) ⇒ X
+        X → =
+    }"#;
+    let b: Vec<f64> = (0..64).map(|i| ((i as f64) * 0.3).sin()).collect();
+    let block = parse_rho_program(source).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![64], b.clone()));
+    let options = Options { tau: 1e-12, max_sweeps: 200 };
+    let meant = interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone();
+    let so = compile_iterating("sv_jacobi_ref", source, options.tau, options.max_sweeps, true);
+    let (_, kernel_sweeps, kernel_converged) = run_iterating(&so, &b, 64);
+    let circuit = rho_lang::codegen::sv::emit(&block, options.tau, Some(options.max_sweeps)).unwrap();
+    let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new("target/sv_jacobi"), std::slice::from_ref(&b)).unwrap();
+    assert_eq!(bits(&run.output), bits(&meant), "{}", circuit.module);
+    assert!(run.converged && kernel_converged);
+    assert_eq!(run.sweeps as i64, kernel_sweeps, "sweeps: circuit {} kernel {kernel_sweeps}", run.sweeps);
+    // Each round streams the 64 cells once and drains the pipeline.
+    assert!(run.cycles as i64 <= (kernel_sweeps + 2) * (64 + 12) + 64, "{} cycles for {kernel_sweeps} sweeps", run.cycles);
+
+    // Two dimensions, a cap that is reached: not converged, the cap's count.
+    let source = r#"{
+        INPUT:◯ □ 6 8
+        INPUT → U
+        ((▷0U + ▽0U + ▷1U + ▽1U) / 4.0) ⇒ U
+        (U × 2.0) → =
+    }"#;
+    let grid: Vec<f64> = (0..48).map(|i| ((i as f64) * 0.7).cos()).collect();
+    let block = parse_rho_program(source).unwrap();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![6, 8], grid.clone()));
+    let options = Options { tau: 1e-300, max_sweeps: 5 };
+    let meant = interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone();
+    let circuit = rho_lang::codegen::sv::emit(&block, options.tau, Some(options.max_sweeps)).unwrap();
+    let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new("target/sv_laplace"), std::slice::from_ref(&grid)).unwrap();
+    assert_eq!(bits(&run.output), bits(&meant), "{}", circuit.module);
+    assert_eq!(run.sweeps, 5);
+    assert!(!run.converged);
+}
+
+#[test]
 fn test_what_is_not_yet_a_circuit_says_so() {
     for (source, what) in [
         ("{\n    INPUT:◯ □ 4 4\n    (INPUT - (□1 (◇+1 INPUT))) → =\n}", "lift"),
-        ("{\n    INPUT:◯ □ 4 4\n    INPUT → X\n    (X × 0.5) ⇒ X\n    X → =\n}", "fixed point"),
+        ("{\n    INPUT:◯ □ 4 4\n    INPUT → X\n    ((X × 0.5) + (□1 (◇+1 X))) ⇒ X\n    X → =\n}", "fold inside"),
         ("{\n    INPUT:◯ □ 4 4\n    ((1 ⌽ INPUT) + INPUT) → =\n}", "rotation"),
     ] {
         let block = parse_rho_program(source).unwrap();
-        let err = rho_lang::codegen::sv::emit(&block, 0.0).unwrap_err();
+        let err = rho_lang::codegen::sv::emit(&block, 0.0, Some(8)).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("SystemVerilog subset") && text.contains(what), "{text}");
     }

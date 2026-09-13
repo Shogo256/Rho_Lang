@@ -28,8 +28,12 @@
 //! cores). What is in the subset so far: `→`, arithmetic, comparisons as
 //! masks, the greater and the lesser, the residue, the named functions,
 //! `?`, `⌊` `⌈`, `⍳`, shifts along any axis, chains of flows, folds and
-//! scans along any axis, folds of folds. Not yet: lifts, the turns, `⌷`,
-//! `⇒`, and a flow that mixes a fold's stream with another.
+//! scans along any axis, folds of folds, and `⇒`: the spaces a fixed point
+//! reads are captured into memories, streamed out again every round through
+//! an update stage into a second buffer while the largest move is taken,
+//! until the move is within 𝜏 or the cap is reached, and the result is
+//! streamed out for what follows. Not yet: lifts, the turns, `⌷`, a fold
+//! inside `⇒`, and a flow that mixes a fold's or a loop's stream with another.
 
 use crate::ast::*;
 use crate::error::{HarmonyDisruption, Result};
@@ -50,6 +54,16 @@ pub struct Circuit {
     pub output_cells: usize,
     /// Clocks from a cell entering to its output cell leaving.
     pub latency: usize,
+}
+
+/// What a simulation produced.
+#[derive(Debug)]
+pub struct Run {
+    pub output: Vec<f64>,
+    pub cycles: u64,
+    /// Sweeps the `⇒` loops took, in all, and whether every one settled.
+    pub sweeps: u64,
+    pub converged: bool,
 }
 
 /// What a stage does with the cell it computes.
@@ -78,6 +92,20 @@ struct Stage {
     /// The expression, as SystemVerilog over the chains.
     expr: String,
     kind: Kind,
+    /// For the update stage of a `⇒`: the signal that starts a round afresh.
+    round_reset: Option<String>,
+}
+
+/// A `⇒`: which stage updates, what it reads, and where the result goes.
+struct Loop {
+    id: usize,
+    target: String,
+    /// Sources of the update, with the streams they are captured from.
+    sources: Vec<(String, Stream)>,
+    cells: usize,
+    update: usize,
+    cap: usize,
+    tau: f64,
 }
 
 /// Where a stream's timing comes from: the dense inputs of one shape, or
@@ -284,7 +312,7 @@ fn ident(name: &str) -> String {
 }
 
 /// Emit the circuit for `block`, or say what in it is not yet a circuit.
-pub fn emit(block: &ToposBlock, tau: f64) -> Result<Circuit> {
+pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>) -> Result<Circuit> {
     let mut shapes: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     let mut inputs: Vec<String> = Vec::new();
     for stmt in &block.statements {
@@ -311,6 +339,7 @@ pub fn emit(block: &ToposBlock, tau: f64) -> Result<Circuit> {
         })
         .collect();
     let mut stages: Vec<Stage> = Vec::new();
+    let mut loops: Vec<Loop> = Vec::new();
     let mut written: BTreeSet<String> = BTreeSet::new();
     let mut folds_made = 0usize;
 
@@ -319,7 +348,86 @@ pub fn emit(block: &ToposBlock, tau: f64) -> Result<Circuit> {
         match stmt {
             Statement::SpaceDef(_) | Statement::Constraint(_) | Statement::AuditTrace(_) => {}
             Statement::ExtBind(_) => return Err(unsupported("a bound address", line)),
-            Statement::Iterate { .. } => return Err(unsupported("a fixed point (`⇒`)", line)),
+            Statement::Iterate { prelude, src, target } => {
+                if !prelude.is_empty() {
+                    return Err(unsupported("a call with a body of flows inside `⇒`", line));
+                }
+                if has_fold(src) {
+                    return Err(unsupported("a fold inside `⇒`", line));
+                }
+                let cap = cap.ok_or_else(|| HarmonyDisruption::LoweringErr {
+                    detail: "this program iterates (⇒); say how many sweeps it may take with --max-iter".to_string(),
+                    line,
+                })?;
+                let shape = shapes.get(target).cloned().ok_or_else(|| HarmonyDisruption::SpaceErr {
+                    space_name: target.clone(),
+                    line,
+                })?;
+                let cells = shape.iter().product::<usize>().max(1);
+                let (srcs, _) = sources(src, &shapes, line)?;
+                let id = loops.len();
+                // The round streams: every source read from its memory,
+                // one cell per clock, all with one timing.
+                let mut captured: Vec<(String, Stream)> = Vec::new();
+                for s in srcs.iter().chain(std::iter::once(target)) {
+                    if captured.iter().any(|(n, _)| n == s) {
+                        continue;
+                    }
+                    let stream = streams.get(s).cloned().ok_or_else(|| HarmonyDisruption::SpaceErr {
+                        space_name: s.clone(),
+                        line,
+                    })?;
+                    let alias = format!("{s}⟳{id}");
+                    shapes.insert(alias.clone(), shapes[s].clone());
+                    streams.insert(
+                        alias,
+                        Stream {
+                            value: format!("rr{id}_{}", ident(s)),
+                            valid: format!("rv{id}"),
+                            latency: 1,
+                            origin: Origin(format!("round{id}")),
+                            cells: shapes[s].iter().product::<usize>().max(1),
+                        },
+                    );
+                    captured.push((s.clone(), stream));
+                }
+                let renamed = rename(src, &|name: &str| format!("{name}⟳{id}"));
+                let mut stage = plan_stage(
+                    &renamed,
+                    &format!("{target}⟳{id}"),
+                    shape.clone(),
+                    Kind::Flow,
+                    line,
+                    tau,
+                    &shapes,
+                    &streams,
+                    stages.len(),
+                )?;
+                stage.round_reset = Some(format!("rs{id}"));
+                let update = stage.index;
+                stages.push(stage);
+                loops.push(Loop {
+                    id,
+                    target: target.clone(),
+                    sources: captured,
+                    cells,
+                    update,
+                    cap,
+                    tau,
+                });
+                // After the loop, the target is streamed out of its memory.
+                streams.insert(
+                    target.clone(),
+                    Stream {
+                        value: format!("px{id}"),
+                        valid: format!("pv{id}"),
+                        latency: 1,
+                        origin: Origin(format!("after{id}")),
+                        cells,
+                    },
+                );
+                written.insert(target.clone());
+            }
             Statement::Flow { src, target } => {
                 let target = match target {
                     FlowTarget::Var(n) => n.clone(),
@@ -380,6 +488,10 @@ pub fn emit(block: &ToposBlock, tau: f64) -> Result<Circuit> {
     let budget: usize = inputs.iter().map(|(_, c)| *c).max().unwrap_or(0)
         + out_cells
         + stages.iter().map(|s| s.reach + 3).sum::<usize>()
+        + loops
+            .iter()
+            .map(|l| (l.cap + 1) * (l.cells + stages[l.update].reach + 8) + 2 * l.cells)
+            .sum::<usize>()
         + 16;
 
     // ------------------------------------------------------------ module
@@ -397,7 +509,9 @@ pub fn emit(block: &ToposBlock, tau: f64) -> Result<Circuit> {
         let _ = writeln!(sv, "  input  real  in_{},", ident(name));
     }
     let _ = writeln!(sv, "  output logic out_valid,");
-    let _ = writeln!(sv, "  output real  out_OUTPUT");
+    let _ = writeln!(sv, "  output real  out_OUTPUT,");
+    let _ = writeln!(sv, "  output longint out_sweeps,");
+    let _ = writeln!(sv, "  output logic out_converged");
     let _ = writeln!(sv, ");");
     sv.push_str(FUNCTIONS);
     for (name, cells) in &inputs {
@@ -416,11 +530,26 @@ pub fn emit(block: &ToposBlock, tau: f64) -> Result<Circuit> {
         let _ = writeln!(sv, "  end");
     }
     for stage in &stages {
+        if let Some(l) = loops.iter().find(|l| l.update == stage.index) {
+            emit_loop_declarations(&mut sv, l);
+        }
         emit_stage(&mut sv, stage, &streams, &shapes);
+        if let Some(l) = loops.iter().find(|l| l.update == stage.index) {
+            emit_loop_logic(&mut sv, l, stage);
+        }
     }
     let _ = writeln!(sv);
     let _ = writeln!(sv, "  assign out_OUTPUT = {};", out_stream.value);
     let _ = writeln!(sv, "  assign out_valid = {};", out_stream.valid);
+    if loops.is_empty() {
+        let _ = writeln!(sv, "  assign out_sweeps = 0;");
+        let _ = writeln!(sv, "  assign out_converged = 1'b1;");
+    } else {
+        let sw: Vec<String> = loops.iter().map(|l| format!("sw{}", l.id)).collect();
+        let cv: Vec<String> = loops.iter().map(|l| format!("cv{}", l.id)).collect();
+        let _ = writeln!(sv, "  assign out_sweeps = {};", sw.join(" + "));
+        let _ = writeln!(sv, "  assign out_converged = {};", cv.join(" && "));
+    }
     let _ = writeln!(sv, "endmodule");
 
     // ------------------------------------------------------------ harness
@@ -457,7 +586,7 @@ pub fn emit(block: &ToposBlock, tau: f64) -> Result<Circuit> {
     let _ = writeln!(h, "  m.final();");
     let _ = writeln!(h, "  FILE* o = std::fopen(argv[2], \"wb\"); if (!o) return 4;");
     let _ = writeln!(h, "  std::fwrite(out.data(), sizeof(double), out.size(), o); std::fclose(o);");
-    let _ = writeln!(h, "  std::printf(\"cells %zu cycles %ld latency {out_latency}\\n\", out.size(), cycles);");
+    let _ = writeln!(h, "  std::printf(\"cells %zu cycles %ld latency {out_latency} sweeps %ld converged %d\\n\", out.size(), cycles, (long)m.out_sweeps, (int)m.out_converged);");
     let _ = writeln!(h, "  return out.size() == {out_cells} ? 0 : 5;");
     let _ = writeln!(h, "}}");
 
@@ -629,7 +758,149 @@ fn plan_stage(
         chains,
         expr,
         kind,
+        round_reset: None,
     })
+}
+
+/// Whether a fold or scan sits anywhere in the expression.
+fn has_fold(expr: &Expr) -> bool {
+    match expr {
+        Expr::Reduce { .. } | Expr::Scan { .. } => true,
+        Expr::Number(_) | Expr::Var(_) => false,
+        Expr::AuditTrace(inner)
+        | Expr::Builtin { operand: inner, .. }
+        | Expr::Shift { operand: inner, .. }
+        | Expr::Index { operand: inner, .. }
+        | Expr::Lift { operand: inner, .. }
+        | Expr::Rotate { operand: inner, .. }
+        | Expr::Reverse { operand: inner, .. }
+        | Expr::Reshape { operand: inner, .. }
+        | Expr::Transpose { operand: inner, .. }
+        | Expr::Take { operand: inner, .. }
+        | Expr::Drop { operand: inner, .. } => has_fold(inner),
+        Expr::BinaryOp { lhs, rhs, .. } | Expr::Gather { index: lhs, operand: rhs } => has_fold(lhs) || has_fold(rhs),
+        Expr::Call { args, .. } => args.iter().any(has_fold),
+    }
+}
+
+/// The expression with every space name mapped through `f`.
+fn rename(expr: &Expr, f: &dyn Fn(&str) -> String) -> Expr {
+    let sub = |e: &Expr| Box::new(rename(e, f));
+    match expr {
+        Expr::Var(name) if !is_tau(name) => Expr::Var(f(name)),
+        Expr::Var(_) | Expr::Number(_) => expr.clone(),
+        Expr::AuditTrace(inner) => Expr::AuditTrace(sub(inner)),
+        Expr::Builtin { op, operand } => Expr::Builtin { op: *op, operand: sub(operand) },
+        Expr::Shift { dir, axis, operand } => Expr::Shift { dir: *dir, axis: *axis, operand: sub(operand) },
+        Expr::Index { axis, operand } => Expr::Index { axis: *axis, operand: sub(operand) },
+        Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp { op: op.clone(), lhs: sub(lhs), rhs: sub(rhs) },
+        other => other.clone(),
+    }
+}
+
+/// A loop's memories and the signals its update stage reads, declared ahead
+/// of the stage.
+fn emit_loop_declarations(sv: &mut String, l: &Loop) {
+    let k = l.id;
+    let n = l.cells;
+    let _ = writeln!(sv);
+    let _ = writeln!(sv, "  // ---- loop {k}: ... ⇒ {} ({n} cells, at most {} sweeps)", l.target, l.cap);
+    for (name, _) in &l.sources {
+        let sid = ident(name);
+        if *name == l.target {
+            let _ = writeln!(sv, "  real m{k}_{sid}_a [0:{}];  // {name}: the round's grid", n - 1);
+            let _ = writeln!(sv, "  real m{k}_{sid}_b [0:{}];  // {name}: the grid being written", n - 1);
+        } else {
+            let _ = writeln!(sv, "  real m{k}_{sid} [0:{}];  // {name}, captured", n - 1);
+        }
+        let _ = writeln!(sv, "  longint cap{k}_{sid};  // cells captured");
+        let _ = writeln!(sv, "  real  rr{k}_{sid};  // the round stream of {name}");
+    }
+    let _ = writeln!(sv, "  logic rv{k};  // the round streams' valid");
+    let _ = writeln!(sv, "  logic rs{k};  // a round starts: the update stage begins afresh");
+    let _ = writeln!(sv, "  logic cur{k};  // which buffer of {} the round reads", l.target);
+    let _ = writeln!(sv, "  longint i{k}, w{k}, round{k}, sw{k};");
+    let _ = writeln!(sv, "  logic cv{k};");
+    let _ = writeln!(sv, "  real  d{k};  // the largest move this round");
+    let _ = writeln!(sv, "  int   ls{k};  // 0 capture, 1 read, 2 drain, 3 emit, 4 done");
+    let _ = writeln!(sv, "  real  px{k};  // {} after the loop, streamed out", l.target);
+    let _ = writeln!(sv, "  logic pv{k};");
+}
+
+/// The loop's controller: capture, rounds, the decision, the read-out.
+fn emit_loop_logic(sv: &mut String, l: &Loop, update: &Stage) {
+    let k = l.id;
+    let n = l.cells;
+    let tid = ident(&l.target);
+    let upd_value = format!("st{}_{}", update.index, ident(&update.target));
+    let upd_valid = format!("v{}_out", update.index);
+    let _ = writeln!(sv, "  always_ff @(posedge clk) begin : loop{k}");
+    let _ = writeln!(sv, "    real old, diff;");
+    let _ = writeln!(sv, "    logic all_captured, settled, capped;");
+    let _ = writeln!(sv, "    if (rst) begin");
+    for (name, _) in &l.sources {
+        let _ = writeln!(sv, "      cap{k}_{} <= 0;", ident(name));
+    }
+    let _ = writeln!(
+        sv,
+        "      rv{k} <= 1'b0; rs{k} <= 1'b0; cur{k} <= 1'b0; i{k} <= 0; w{k} <= 0; round{k} <= 0; sw{k} <= 0; cv{k} <= 1'b1; d{k} <= {}; ls{k} <= 0; pv{k} <= 1'b0;",
+        real_literal(0.0)
+    );
+    let _ = writeln!(sv, "    end else begin");
+    let _ = writeln!(sv, "      rv{k} <= 1'b0; rs{k} <= 1'b0; pv{k} <= 1'b0;");
+    // Capture, always on: a source's cells land in its memory as they come.
+    for (name, stream) in &l.sources {
+        let sid = ident(name);
+        let mem = if *name == l.target { format!("m{k}_{sid}_a") } else { format!("m{k}_{sid}") };
+        let _ = writeln!(sv, "      if (ls{k} == 0 && {} && cap{k}_{sid} < {n}) begin {mem}[cap{k}_{sid}] <= {}; cap{k}_{sid} <= cap{k}_{sid} + 1; end", stream.valid, stream.value);
+    }
+    let all: Vec<String> = l.sources.iter().map(|(name, _)| format!("(cap{k}_{} == {n})", ident(name))).collect();
+    let _ = writeln!(sv, "      all_captured = {};", all.join(" && "));
+    let _ = writeln!(sv, "      case (ls{k})");
+    let _ = writeln!(sv, "        0: if (all_captured) begin ls{k} <= 1; i{k} <= 0; w{k} <= 0; d{k} <= {}; rs{k} <= 1'b1; end", real_literal(0.0));
+    // Read: one cell per clock from every source's memory.
+    let _ = writeln!(sv, "        1: begin");
+    for (name, _) in &l.sources {
+        let sid = ident(name);
+        if *name == l.target {
+            let _ = writeln!(sv, "          rr{k}_{sid} <= cur{k} ? m{k}_{sid}_b[i{k}] : m{k}_{sid}_a[i{k}];");
+        } else {
+            let _ = writeln!(sv, "          rr{k}_{sid} <= m{k}_{sid}[i{k}];");
+        }
+    }
+    let _ = writeln!(sv, "          rv{k} <= 1'b1;");
+    let _ = writeln!(sv, "          if (i{k} == {}) ls{k} <= 2; else i{k} <= i{k} + 1;", n - 1);
+    let _ = writeln!(sv, "        end");
+    // Drain: the update stage finishes; when every cell is written, decide.
+    let _ = writeln!(sv, "        2: if (w{k} == {n}) begin");
+    let _ = writeln!(sv, "          settled = (d{k} <= {});", real_literal(l.tau));
+    let _ = writeln!(sv, "          capped = (round{k} + 1 >= {});", l.cap);
+    let _ = writeln!(sv, "          sw{k} <= sw{k} + 1;");
+    let _ = writeln!(sv, "          if (settled || capped) begin");
+    let _ = writeln!(sv, "            if (capped) cv{k} <= 1'b0;");
+    let _ = writeln!(sv, "            cur{k} <= ~cur{k}; ls{k} <= 3; i{k} <= 0;");
+    let _ = writeln!(sv, "          end else begin");
+    let _ = writeln!(sv, "            cur{k} <= ~cur{k}; round{k} <= round{k} + 1; i{k} <= 0; w{k} <= 0; d{k} <= {}; rs{k} <= 1'b1; ls{k} <= 1;", real_literal(0.0));
+    let _ = writeln!(sv, "          end");
+    let _ = writeln!(sv, "        end");
+    // Emit: the settled grid streamed out for what follows.
+    let _ = writeln!(sv, "        3: begin");
+    let _ = writeln!(sv, "          px{k} <= cur{k} ? m{k}_{tid}_b[i{k}] : m{k}_{tid}_a[i{k}];");
+    let _ = writeln!(sv, "          pv{k} <= 1'b1;");
+    let _ = writeln!(sv, "          if (i{k} == {}) ls{k} <= 4; else i{k} <= i{k} + 1;", n - 1);
+    let _ = writeln!(sv, "        end");
+    let _ = writeln!(sv, "        default: ;");
+    let _ = writeln!(sv, "      endcase");
+    // The writer: the update's cells into the other buffer, measuring the move.
+    let _ = writeln!(sv, "      if ((ls{k} == 1 || ls{k} == 2) && {upd_valid}) begin");
+    let _ = writeln!(sv, "        old = cur{k} ? m{k}_{tid}_b[w{k}] : m{k}_{tid}_a[w{k}];");
+    let _ = writeln!(sv, "        if (cur{k}) m{k}_{tid}_a[w{k}] <= {upd_value}; else m{k}_{tid}_b[w{k}] <= {upd_value};");
+    let _ = writeln!(sv, "        diff = rho_abs({upd_value} - old);");
+    let _ = writeln!(sv, "        if (diff > d{k}) d{k} <= diff;");
+    let _ = writeln!(sv, "        w{k} <= w{k} + 1;");
+    let _ = writeln!(sv, "      end");
+    let _ = writeln!(sv, "    end");
+    let _ = writeln!(sv, "  end");
 }
 
 /// The SystemVerilog of one stage: alignment, lines, counters, flush, the
@@ -640,6 +911,12 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
     let r = stage.reach;
     let cells = stage.shape.iter().product::<usize>().max(1);
     let base = stage.chains.values().map(|c| c.2).max().unwrap_or(1);
+    // What starts the stage afresh: reset, and for a loop's update stage
+    // every round.
+    let clear = match &stage.round_reset {
+        Some(rs) => format!("(rst || {rs})"),
+        None => "rst".to_string(),
+    };
     let _ = writeln!(sv);
     let _ = writeln!(
         sv,
@@ -663,8 +940,8 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
             let _ = writeln!(sv, "  real  ad{k}_{sid} [0:{}];", delay - 1);
             let _ = writeln!(sv, "  logic adv{k}_{sid} [0:{}];", delay - 1);
             let _ = writeln!(sv, "  always_ff @(posedge clk) begin");
-            let _ = writeln!(sv, "    ad{k}_{sid}[0] <= {value}; adv{k}_{sid}[0] <= rst ? 1'b0 : {valid};");
-            let _ = writeln!(sv, "    for (int i = 1; i < {delay}; i++) begin ad{k}_{sid}[i] <= ad{k}_{sid}[i - 1]; adv{k}_{sid}[i] <= rst ? 1'b0 : adv{k}_{sid}[i - 1]; end");
+            let _ = writeln!(sv, "    ad{k}_{sid}[0] <= {value}; adv{k}_{sid}[0] <= {clear} ? 1'b0 : {valid};");
+            let _ = writeln!(sv, "    for (int i = 1; i < {delay}; i++) begin ad{k}_{sid}[i] <= ad{k}_{sid}[i - 1]; adv{k}_{sid}[i] <= {clear} ? 1'b0 : adv{k}_{sid}[i - 1]; end");
             let _ = writeln!(sv, "  end");
             let _ = writeln!(sv, "  real  a{k}_{sid};  always_comb a{k}_{sid} = ad{k}_{sid}[{}];", delay - 1);
             let _ = writeln!(sv, "  logic av{k}_{sid}; assign av{k}_{sid} = adv{k}_{sid}[{}];", delay - 1);
@@ -702,7 +979,7 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
     let _ = writeln!(sv, "    longint here;");
     let _ = writeln!(sv, "    longint pos [0:{}];", rank.max(1) - 1);
     let _ = writeln!(sv, "    real x;");
-    let _ = writeln!(sv, "    if (rst) begin");
+    let _ = writeln!(sv, "    if ({clear}) begin");
     let _ = writeln!(sv, "      n{k}_in <= 0; n{k}_real <= 0; n{k}_flushed <= 0; v{k}_out <= 1'b0; st{k}_{tid} <= {};", real_literal(0.0));
     let _ = writeln!(sv, "    end else begin");
     let _ = writeln!(sv, "      v{k}_out <= 1'b0;");
@@ -814,7 +1091,7 @@ pub fn verilator() -> String {
 /// port order). Returns OUTPUT's cells and the clocks the run took.
 /// Contraction is off in the generated C++ as it is in the kernel, so a
 /// multiply-add rounds twice here too.
-pub fn simulate(circuit: &Circuit, dir: &Path, inputs: &[Vec<f64>]) -> std::io::Result<(Vec<f64>, u64)> {
+pub fn simulate(circuit: &Circuit, dir: &Path, inputs: &[Vec<f64>]) -> std::io::Result<Run> {
     write(circuit, dir)?;
     let obj = dir.join("obj");
     let status = Command::new(verilator())
@@ -850,16 +1127,23 @@ pub fn simulate(circuit: &Circuit, dir: &Path, inputs: &[Vec<f64>]) -> std::io::
         )));
     }
     let stdout = String::from_utf8_lossy(&run.stdout);
-    let cycles = stdout
-        .split_whitespace()
-        .skip_while(|w| *w != "cycles")
-        .nth(1)
-        .and_then(|w| w.parse().ok())
-        .unwrap_or(0);
+    let field = |name: &str| -> u64 {
+        stdout
+            .split_whitespace()
+            .skip_while(|w| *w != name)
+            .nth(1)
+            .and_then(|w| w.parse().ok())
+            .unwrap_or(0)
+    };
     let raw = std::fs::read(&out_path)?;
-    let out = raw
+    let output = raw
         .chunks_exact(8)
         .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    Ok((out, cycles))
+    Ok(Run {
+        output,
+        cycles: field("cycles"),
+        sweeps: field("sweeps"),
+        converged: field("converged") != 0,
+    })
 }

@@ -202,7 +202,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
     println!("  └─ Compilation Successful: Binary emitted to -> {}", out_path);
 
     if let Some(dir) = &args.emit_sv {
-        let circuit = rho_lang::codegen::sv::emit(&block, args.tau).map_err(|e| block.attribute(e))?;
+        let circuit = rho_lang::codegen::sv::emit(&block, args.tau, args.max_iter).map_err(|e| block.attribute(e))?;
         rho_lang::codegen::sv::write(&circuit, dir)?;
         println!(
             "  └─ Circuit emitted to -> {}/rho_kernel.sv (one cell per clock, latency {} clocks)",

@@ -373,7 +373,7 @@ smooth input drives it to zero and the kernel returns infinities.
 | Mixed precision, integer types | 📋 not planned — see the specification |
 | Explicit `<4 x double>` vector lowering | ✅ implemented — see the note below |
 | Sweeps split across threads | ✅ implemented — every `→`, `⇒` round, fold and comparison; 3–4x on cache-resident grids, bit-identical to one thread |
-| The program as a circuit (`--emit-sv`) | ✅ a SystemVerilog streaming pipeline, one cell per clock, simulated with Verilator and bit-identical to the interpreter; `real` cells, so the structure and timing, not yet a synthesisable datapath; flows, shifts, `⍳`, folds and scans with an accumulator per line, the arithmetic and the named functions — `⇒` and broadcasts not yet |
+| The program as a circuit (`--emit-sv`) | ✅ a SystemVerilog streaming pipeline, one cell per clock, simulated with Verilator and bit-identical to the interpreter; `real` cells, so the structure and timing, not yet a synthesisable datapath; flows, shifts, `⍳`, folds and scans with an accumulator per line, `⇒` as a loop over a grid in memory with the kernel's sweep count, the arithmetic and the named functions — broadcasts not yet |
 | Zero-copy binding (`&[0x…]`, `--bind`) | ✅ implemented |
 | `!` constraint check | ✅ interval arithmetic that models binary64 rounding, not ℝ; its claims are held to real runs by the differential test |
 | Diagnostics with source lines | ✅ implemented |

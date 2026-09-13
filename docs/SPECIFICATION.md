@@ -860,12 +860,24 @@ synthesise: what this is, is the structure and the timing of the circuit,
 one cell per clock, with the arithmetic units left to a later step — fixed
 point in the language, or floating-point cores.
 
+A `⇒` is a loop around a stage. The spaces the update reads are captured
+into memories as their streams arrive — the target into one of two buffers
+— and once all are there, each round streams every source out of its memory
+one cell per clock through the update stage, writes the cells into the other
+buffer while taking the largest move against the old, and at the end of the
+round decides: within 𝜏 it stops, at the cap it stops unsettled, otherwise it
+swaps the buffers and streams again. What it settled on is then streamed out
+for the flows that follow, and `out_sweeps` and `out_converged` report what
+the kernel's `rho_kernel_sweeps()` and `rho_kernel_converged()` do. Jacobi
+on 64 cells gives the kernel's bits, its sweep count and its settled flag; a
+round costs the cells plus the pipeline's drain.
+
 In the subset: `→`, arithmetic, comparisons as masks, `⌈ ⌊ |`, the named
 functions, `?`, `⌊X` `⌈X`, `⍳`, shifts along any axis, folds and scans along
-any axis, chains of flows, several inputs. Not yet, and said so with a line:
-`⇒` (an outer loop with a settled flag), lifts and any broadcast, the turns,
-`⌷`, and a flow that reads two streams of different timing (a fold's and a
-dense one).
+any axis, chains of flows, several inputs, `⇒` with an expression body. Not
+yet, and said so with a line: lifts and any broadcast, the turns, `⌷`, a
+fold or a body of flows inside `⇒`, and a flow that reads two streams of
+different timing (a fold's or a loop's and a dense one).
 
 ## 8. Precision ✅
 

@@ -821,18 +821,18 @@ fn main() {
             stepping += 1;
         }
         if circuit_leg {
-            if let Ok(circuit) = rho_lang::codegen::sv::emit(&block, RUN.tau) {
+            if let Ok(circuit) = rho_lang::codegen::sv::emit(&block, RUN.tau, Some(SWEEPS)) {
                 let feed: Vec<Vec<f64>> = circuit.inputs.iter().map(|(n, _)| inputs[n].clone()).collect();
                 let dir = std::path::PathBuf::from(format!("target/diffsv{round}"));
                 match rho_lang::codegen::sv::simulate(&circuit, &dir, &feed) {
-                    Ok((out, _)) => {
+                    Ok(run) => {
                         circuit_compared += 1;
-                        if let Some(cell) = first_gap(&expected.cells, &out) {
+                        if let Some(cell) = first_gap(&expected.cells, &run.output) {
                             circuit_mismatches += 1;
                             println!("CIRCUIT MISMATCH at cell {cell} (round {round}, shape {shape:?})");
                             println!("{source}");
                             println!("  interpreted {:?}", expected.cells[cell]);
-                            println!("  circuit     {:?}\n", out.get(cell));
+                            println!("  circuit     {:?}\n", run.output.get(cell));
                         }
                     }
                     Err(e) => {

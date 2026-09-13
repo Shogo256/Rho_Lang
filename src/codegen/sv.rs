@@ -206,6 +206,8 @@ struct Loop {
     /// Sources of the update, with the streams they are captured from.
     sources: Vec<(String, Stream)>,
     cells: usize,
+    /// The stages of a round: the body's, the folds', the update's (last).
+    first_stage: usize,
     update: usize,
     cap: usize,
     tau: f64,
@@ -717,9 +719,18 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
     let mut shapes: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     let mut inputs: Vec<String> = Vec::new();
     for stmt in &block.statements {
-        if let Statement::SpaceDef(decl) = stmt {
-            shapes.insert(decl.name.clone(), decl.dimensions.clone());
-            inputs.push(decl.name.clone());
+        match stmt {
+            Statement::SpaceDef(decl) => {
+                shapes.insert(decl.name.clone(), decl.dimensions.clone());
+                inputs.push(decl.name.clone());
+            }
+            // A bound address is the kernel's; the circuit streams the
+            // space in like any input.
+            Statement::ExtBind(binding) => {
+                shapes.insert(binding.space.name.clone(), binding.space.dimensions.clone());
+                inputs.push(binding.space.name.clone());
+            }
+            _ => {}
         }
     }
     // The stream each space is on right now.
@@ -748,12 +759,8 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
     for (index, stmt) in block.statements.iter().enumerate() {
         let line = block.line_of(index);
         match stmt {
-            Statement::SpaceDef(_) | Statement::Constraint(_) | Statement::AuditTrace(_) => {}
-            Statement::ExtBind(_) => return Err(unsupported("a bound address", line)),
+            Statement::SpaceDef(_) | Statement::Constraint(_) | Statement::AuditTrace(_) | Statement::ExtBind(_) => {}
             Statement::Iterate { prelude, src, target } => {
-                if !prelude.is_empty() {
-                    return Err(unsupported("a call with a body of flows inside `⇒`", line));
-                }
                 let cap = cap.ok_or_else(|| HarmonyDisruption::LoweringErr {
                     detail: "this program iterates (⇒); say how many sweeps it may take with --max-iter".to_string(),
                     line,
@@ -763,12 +770,70 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
                     line,
                 })?;
                 let cells = shape.iter().product::<usize>().max(1);
-                // Every space the update reads, folds' operands included:
-                // what the round has to stream.
+                // The flows a call's body expands into, run on every round
+                // before the update. One that reads nothing the loop
+                // changes is the same every round: a stage before the loop,
+                // once, like any flow, or a name for an outside space when
+                // it only binds an argument. The rest are stages of the
+                // round, and a fold in them or in the update over what the
+                // loop leaves alone is a stage before the loop as well —
+                // its stream comes once, so a stage of the round could not
+                // read it twice.
+                let mut variant: BTreeSet<String> = BTreeSet::new();
+                variant.insert(target.clone());
+                let mut outside: BTreeMap<String, String> = BTreeMap::new();
+                let mut body: Vec<(Expr, String)> = Vec::new();
+                for stmt in prelude {
+                    let Statement::Flow {
+                        src: e,
+                        target: FlowTarget::Var(t),
+                    } = stmt
+                    else {
+                        continue;
+                    };
+                    let e = rename(e, &|name: &str| outside.get(name).cloned().unwrap_or_else(|| name.to_string()));
+                    let mut read: BTreeSet<String> = BTreeSet::new();
+                    all_spaces(&e, &mut read);
+                    if read.iter().any(|n| variant.contains(n)) {
+                        variant.insert(t.clone());
+                        body.push((e, t.clone()));
+                    } else if let Expr::Var(v) = &e {
+                        if !shapes.contains_key(v) {
+                            return Err(HarmonyDisruption::SpaceErr {
+                                space_name: v.clone(),
+                                line,
+                            });
+                        }
+                        outside.insert(t.clone(), v.clone());
+                    } else {
+                        flow_stage(&e, t, line, tau, numbers, &mut shapes, &mut streams, &mut stages, &mut folds_made, &mut replays)?;
+                    }
+                }
+                let src = rename(src, &|name: &str| outside.get(name).cloned().unwrap_or_else(|| name.to_string()));
+                let src = hoist_folds(&src, &variant, line, tau, numbers, &mut shapes, &mut streams, &mut stages, &mut folds_made, &mut replays)?;
+                let body: Vec<(Expr, String)> = body
+                    .into_iter()
+                    .map(|(e, t)| {
+                        hoist_folds(&e, &variant, line, tau, numbers, &mut shapes, &mut streams, &mut stages, &mut folds_made, &mut replays)
+                            .map(|e| (e, t))
+                    })
+                    .collect::<Result<_>>()?;
+                let src = &src;
+                let made_inside: BTreeSet<String> = body.iter().map(|(_, t)| t.clone()).collect();
+                // Every space the round reads, the body's and the update's,
+                // folds' operands included, less what the body writes: what
+                // the round has to stream.
                 let mut srcs: BTreeSet<String> = BTreeSet::new();
                 all_spaces(src, &mut srcs);
+                for (e, _) in &body {
+                    all_spaces(e, &mut srcs);
+                }
+                srcs.retain(|s| !made_inside.contains(s));
                 let mut lifts_of: BTreeMap<String, Vec<usize>> = BTreeMap::new();
                 usage(src, line, &mut Vec::new(), &mut lifts_of)?;
+                for (e, _) in &body {
+                    usage(e, line, &mut Vec::new(), &mut lifts_of)?;
+                }
                 let id = loops.len();
                 let first_stage = stages.len();
                 // The round streams: the sources of the grid's own shape,
@@ -803,6 +868,21 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
                     );
                     captured.push((s.clone(), stream));
                     renamed.insert(s.clone(), alias);
+                }
+                // The round's flows, in order, on the round's streams. One
+                // that only copies a space is a name for it; any other is a
+                // stage, its target a stream of the round that what follows
+                // reads.
+                for (e, t) in &body {
+                    let e = rename(e, &|name: &str| renamed.get(name).cloned().unwrap_or_else(|| name.to_string()));
+                    if let Expr::Var(v) = &e {
+                        if !is_tau(v) {
+                            shapes.insert(t.clone(), shapes[v].clone());
+                            renamed.insert(t.clone(), v.clone());
+                            continue;
+                        }
+                    }
+                    flow_stage(&e, t, line, tau, numbers, &mut shapes, &mut streams, &mut stages, &mut folds_made, &mut replays)?;
                 }
                 let renamed_src = rename(src, &|name: &str| renamed.get(name).cloned().unwrap_or_else(|| name.to_string()));
                 // A fold in the update is a stage on the round stream: the
@@ -847,6 +927,7 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
                     target: target.clone(),
                     sources: captured,
                     cells,
+                    first_stage,
                     update,
                     cap,
                     tau,
@@ -869,40 +950,8 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
                     FlowTarget::Var(n) => n.clone(),
                     FlowTarget::Equilibrium => "OUTPUT".to_string(),
                 };
-                // Every fold or scan in the expression becomes a stage first,
-                // innermost first, and its name stands in the expression.
-                let src = extract_folds(src, line, tau, numbers, &mut shapes, &mut streams, &mut stages, &mut folds_made, &mut replays)?;
-                let shape = expr_shape(&src, &shapes)
-                    .or_else(|| shapes.get(&target).cloned())
-                    .ok_or_else(|| unsupported("a flow with no shape", line))?;
-                let stage = plan_stage(
-                    &src,
-                    &target,
-                    shape.clone(),
-                    Kind::Flow,
-                    line,
-                    tau,
-                    numbers,
-                    &mut shapes,
-                    &mut streams,
-                    stages.len(),
-                    &mut replays,
-                )?;
-                let cells = shape.iter().product::<usize>().max(1);
-                let origin = stage_origin(&stage, &streams);
-                streams.insert(
-                    target.clone(),
-                    Stream {
-                        value: format!("st{}_{}", stage.index, ident(&target)),
-                        valid: format!("v{}_out", stage.index),
-                        latency: stage.latency,
-                        origin,
-                        cells,
-                    },
-                );
-                shapes.insert(target.clone(), shape);
+                flow_stage(src, &target, line, tau, numbers, &mut shapes, &mut streams, &mut stages, &mut folds_made, &mut replays)?;
                 written.insert(target.clone());
-                stages.push(stage);
                 if matches!(stmt, Statement::Flow { target: FlowTarget::Equilibrium, .. }) {
                     break;
                 }
@@ -931,7 +980,11 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
         + replays.iter().map(|r| 2 * r.cells + 8).sum::<usize>()
         + loops
             .iter()
-            .map(|l| (l.cap + 1) * (3 * l.cells + stages[l.update].reach + 32) + 2 * l.cells)
+            .map(|l| {
+                let round: usize = stages[l.first_stage..=l.update].iter().map(|s| s.reach + 3).sum::<usize>()
+                    + replays.iter().filter(|r| (l.first_stage..=l.update).contains(&r.id)).map(|r| 2 * r.cells + 8).sum::<usize>();
+                (l.cap + 1) * (3 * l.cells + round + 32) + 2 * l.cells
+            })
             .sum::<usize>()
         + 16;
 
@@ -1065,6 +1118,102 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
     })
 }
 
+/// One flow as a stage: every fold or scan in the expression becomes a
+/// stage first, innermost first, and its name stands in the expression;
+/// then the flow's own stage, whose stream the target is on from here.
+#[allow(clippy::too_many_arguments)]
+fn flow_stage(
+    src: &Expr,
+    target: &str,
+    line: usize,
+    tau: f64,
+    numbers: Numbers,
+    shapes: &mut BTreeMap<String, Vec<usize>>,
+    streams: &mut BTreeMap<String, Stream>,
+    stages: &mut Vec<Stage>,
+    made: &mut usize,
+    replays: &mut Vec<Replay>,
+) -> Result<()> {
+    let src = extract_folds(src, line, tau, numbers, shapes, streams, stages, made, replays)?;
+    let shape = expr_shape(&src, shapes)
+        .or_else(|| shapes.get(target).cloned())
+        .ok_or_else(|| unsupported("a flow with no shape", line))?;
+    let stage = plan_stage(&src, target, shape.clone(), Kind::Flow, line, tau, numbers, shapes, streams, stages.len(), replays)?;
+    let cells = shape.iter().product::<usize>().max(1);
+    let origin = stage_origin(&stage, streams);
+    streams.insert(
+        target.to_string(),
+        Stream {
+            value: format!("st{}_{}", stage.index, ident(target)),
+            valid: format!("v{}_out", stage.index),
+            latency: stage.latency,
+            origin,
+            cells,
+        },
+    );
+    shapes.insert(target.to_string(), shape);
+    stages.push(stage);
+    Ok(())
+}
+
+/// Inside a `⇒`: every fold or scan over spaces the loop does not change
+/// becomes a stage before the loop, once, and its name stands in the
+/// expression; a fold over what changes stays for the round.
+#[allow(clippy::too_many_arguments)]
+fn hoist_folds(
+    expr: &Expr,
+    variant: &BTreeSet<String>,
+    line: usize,
+    tau: f64,
+    numbers: Numbers,
+    shapes: &mut BTreeMap<String, Vec<usize>>,
+    streams: &mut BTreeMap<String, Stream>,
+    stages: &mut Vec<Stage>,
+    made: &mut usize,
+    replays: &mut Vec<Replay>,
+) -> Result<Expr> {
+    let sub = |e: &Expr, shapes: &mut BTreeMap<String, Vec<usize>>, streams: &mut BTreeMap<String, Stream>, stages: &mut Vec<Stage>, made: &mut usize, replays: &mut Vec<Replay>| -> Result<Box<Expr>> {
+        Ok(Box::new(hoist_folds(e, variant, line, tau, numbers, shapes, streams, stages, made, replays)?))
+    };
+    Ok(match expr {
+        Expr::Reduce { op, axis, operand } | Expr::Scan { op, axis, operand } => {
+            let mut read: BTreeSet<String> = BTreeSet::new();
+            all_spaces(operand, &mut read);
+            if read.iter().any(|n| variant.contains(n)) {
+                let operand = sub(operand, shapes, streams, stages, made, replays)?;
+                if matches!(expr, Expr::Scan { .. }) {
+                    Expr::Scan { op: *op, axis: *axis, operand }
+                } else {
+                    Expr::Reduce { op: *op, axis: *axis, operand }
+                }
+            } else {
+                extract_folds(expr, line, tau, numbers, shapes, streams, stages, made, replays)?
+            }
+        }
+        Expr::Number(_) | Expr::Var(_) | Expr::Call { .. } => expr.clone(),
+        Expr::AuditTrace(inner) => Expr::AuditTrace(sub(inner, shapes, streams, stages, made, replays)?),
+        Expr::Builtin { op, operand } => Expr::Builtin { op: *op, operand: sub(operand, shapes, streams, stages, made, replays)? },
+        Expr::Shift { dir, axis, operand } => Expr::Shift { dir: *dir, axis: *axis, operand: sub(operand, shapes, streams, stages, made, replays)? },
+        Expr::Index { axis, operand } => Expr::Index { axis: *axis, operand: sub(operand, shapes, streams, stages, made, replays)? },
+        Expr::Lift { axis, operand } => Expr::Lift { axis: *axis, operand: sub(operand, shapes, streams, stages, made, replays)? },
+        Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp {
+            op: op.clone(),
+            lhs: sub(lhs, shapes, streams, stages, made, replays)?,
+            rhs: sub(rhs, shapes, streams, stages, made, replays)?,
+        },
+        Expr::Rotate { by, axis, operand } => Expr::Rotate { by: *by, axis: *axis, operand: sub(operand, shapes, streams, stages, made, replays)? },
+        Expr::Reverse { axis, operand } => Expr::Reverse { axis: *axis, operand: sub(operand, shapes, streams, stages, made, replays)? },
+        Expr::Reshape { shape, operand } => Expr::Reshape { shape: shape.clone(), operand: sub(operand, shapes, streams, stages, made, replays)? },
+        Expr::Transpose { axes, operand } => Expr::Transpose { axes: axes.clone(), operand: sub(operand, shapes, streams, stages, made, replays)? },
+        Expr::Take { count, axis, operand } => Expr::Take { count: *count, axis: *axis, operand: sub(operand, shapes, streams, stages, made, replays)? },
+        Expr::Drop { count, axis, operand } => Expr::Drop { count: *count, axis: *axis, operand: sub(operand, shapes, streams, stages, made, replays)? },
+        Expr::Gather { index, operand } => Expr::Gather {
+            index: sub(index, shapes, streams, stages, made, replays)?,
+            operand: sub(operand, shapes, streams, stages, made, replays)?,
+        },
+    })
+}
+
 /// Replace every fold and scan in `expr` by a name, making a stage for each,
 /// innermost first.
 #[allow(clippy::too_many_arguments)]
@@ -1141,14 +1290,16 @@ fn extract_folds(
     })
 }
 
-/// The origin a stage's cells have: its sources' (they share one).
+/// The origin a stage's cells have: its sources' (they share one), or its
+/// replay's when nothing is streamed and the replay paces it — inside a
+/// `⇒` that origin is the round's, so what captures the stage's cells
+/// takes them afresh each round.
 fn stage_origin(stage: &Stage, streams: &BTreeMap<String, Stream>) -> Origin {
-    stage
-        .chains
-        .keys()
-        .next()
-        .map(|s| streams[s].origin.clone())
-        .unwrap_or_else(|| Origin("constant".to_string()))
+    match stage.chains.keys().next() {
+        Some(s) => streams[s].origin.clone(),
+        None if stage.timing.is_some() => Origin(format!("replay{}", stage.index)),
+        None => Origin("constant".to_string()),
+    }
 }
 
 /// Lay out one stage: which streams it reads, how deep its lines are, what

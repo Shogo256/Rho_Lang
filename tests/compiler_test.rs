@@ -4416,10 +4416,92 @@ fn test_the_jax_module_gives_the_interpreters_cells() {
 }
 
 #[test]
+fn test_a_body_of_flows_inside_a_loop_is_stages_of_the_round() {
+    if !verilator_available() {
+        eprintln!("verilator not found: circuit test skipped");
+        return;
+    }
+    use rho_lang::codegen::sv::Numbers;
+    use rho_lang::numeric::Fixed;
+    type Q = Fixed<32, 16>;
+    // A call whose body is flows expands into a prelude the loop runs every
+    // round; in the circuit each of its flows is a stage on the round's
+    // streams, the update reads them, and everything restarts each round.
+    // Jacobi through a body with a shift, reading INPUT from outside.
+    let stencil = "\nstep:{ U\n    (▷U + ▽U) → S\n    (S / 4.0) → =\n}\n{\n    INPUT:◯ □ 48\n    INPUT → X\n    ((INPUT / 4.0) + (step X)) ⇒ X\n    X → =\n}";
+    // A body with a fold and a broadcast: two passes a round, made inside.
+    let centring = "\ncentre:{ U\n    (◇+1 U) → S\n    ((U - (□1 (S / 16.0))) × 0.5) → =\n}\n{\n    INPUT:◯ □ 3 16\n    INPUT → X\n    (centre X) ⇒ X\n    X → =\n}";
+    // A body of two called between its arguments, one bound to the grid and
+    // one to an input: X settles at twice INPUT.
+    let mixed = "\nmix:{ A B\n    (A × 0.5) → H\n    (H + B) → =\n}\n{\n    INPUT:◯ □ 4 12\n    INPUT → X\n    (X mix INPUT) ⇒ X\n    X → =\n}";
+    // A body whose value is a turn of the grid (a replay-paced stage the
+    // update captures afresh each round), an unused flow in the body, and
+    // a fold over INPUT from outside the loop, which is a stage before it,
+    // once: the grid grows by that fold every round into the cap.
+    let turned = "\nstepB:{ U V\n    ((◈+ U) > (-9.0 | U)) → S\n    (⍉U) → =\n}\n{\n    INPUT:◯ □ 4 12\n    (◇>0 INPUT) → X\n    ((◇>0 INPUT) + (X stepB X)) ⇒ X\n    X → =\n}";
+    let grid: Vec<f64> = (0..48).map(|i| ((i as f64) * 0.37).sin() * 2.0 + (i % 5) as f64 * 0.25).collect();
+    for (name, source, shape) in [("stencil", stencil, vec![48]), ("centring", centring, vec![3, 16]), ("mixed", mixed, vec![4, 12]), ("turned", turned, vec![4, 12])] {
+        let inputs = vec![("INPUT", shape, grid.clone())];
+        let block = parse_rho_program(source).unwrap();
+        let tau = 1e-9;
+        let options = Options { tau, max_sweeps: 100 };
+        for numbers in [Numbers::Real, Numbers::Fixed { width: 32, frac: 16 }] {
+            let meant: Vec<f64> = match numbers {
+                Numbers::Real => {
+                    let mut env: Env<f64> = Env::new();
+                    for (n, shape, data) in &inputs {
+                        env.insert(n.to_string(), Grid::from(shape.clone(), data.clone()));
+                    }
+                    interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.clone()
+                }
+                Numbers::Fixed { .. } => {
+                    let mut env: Env<Q> = Env::new();
+                    for (n, shape, data) in &inputs {
+                        env.insert(n.to_string(), Grid::from(shape.clone(), data.iter().map(|v| Q::from_f64(*v)).collect()));
+                    }
+                    interpret_with(&block, &env, &options).unwrap()["OUTPUT"].cells.iter().map(|c| c.to_f64()).collect()
+                }
+            };
+            let circuit = rho_lang::codegen::sv::emit(&block, tau, Some(100), numbers).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let dir = format!("target/sv_body_{name}_{}", if matches!(numbers, Numbers::Real) { "real" } else { "fixed" });
+            let feed: Vec<Vec<f64>> = circuit.inputs.iter().map(|(n, _)| inputs.iter().find(|(m, _, _)| m == n).unwrap().2.clone()).collect();
+            let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new(&dir), &feed).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(bits(&run.output), bits(&meant), "{name} {numbers:?}: circuit vs interpreter\n{}", circuit.module);
+            assert_eq!(run.converged, name != "turned", "{name} {numbers:?}: {} sweeps", run.sweeps);
+            assert!(run.sweeps > 1, "{name} {numbers:?}: {} sweeps", run.sweeps);
+        }
+        // The sweep count is the kernel's.
+        let so = compile_iterating(&format!("sv_body_{name}_ref"), source, tau, 100, true);
+        let (_, kernel_sweeps, _) = run_iterating(&so, &grid, if name == "turned" { 12 } else { 48 });
+        let circuit = rho_lang::codegen::sv::emit(&block, tau, Some(100), Numbers::Real).unwrap();
+        let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new(&format!("target/sv_body_{name}_real")), std::slice::from_ref(&grid)).unwrap();
+        assert_eq!(run.sweeps as i64, kernel_sweeps, "{name}: sweeps");
+    }
+}
+
+#[test]
+fn test_a_bound_space_streams_into_the_circuit_like_any_input() {
+    if !verilator_available() {
+        eprintln!("verilator not found: circuit test skipped");
+        return;
+    }
+    let source = "{\n    &[0x7A4F]:INPUT:◯ □ 4 4\n    (▷INPUT + INPUT) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let grid: Vec<f64> = (0..16).map(|i| (i as f64) * 0.5 - 3.0).collect();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![4, 4], grid.clone()));
+    let meant = interpret_with(&block, &env, &Options { tau: 0.0, max_sweeps: 1 }).unwrap()["OUTPUT"].cells.clone();
+    let circuit = rho_lang::codegen::sv::emit(&block, 0.0, None, rho_lang::codegen::sv::Numbers::Real).unwrap();
+    assert_eq!(circuit.inputs, vec![("INPUT".to_string(), 16)]);
+    let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new("target/sv_bound"), &[grid]).unwrap();
+    assert_eq!(bits(&run.output), bits(&meant));
+}
+
+#[test]
 fn test_what_is_not_yet_a_circuit_says_so() {
     for (source, what) in [
-        ("\nstep:{ U\n    (▷U + ▽U) → S\n    (S / 4.0) → =\n}\n{\n    INPUT:◯ □ 4 4\n    INPUT → X\n    (step X) ⇒ X\n    X → =\n}", "body of flows"),
         ("{\n    INPUT:◯ □ 4 4\n    (1.0 + 2.0) → OUTPUT\n    OUTPUT → =\n}", "no shape"),
+        ("{\n    INPUT:◯ □ 4 4\n    (▷1 (□1 INPUT)) → =\n}", "computed value"),
     ] {
         let block = parse_rho_program(source).unwrap();
         let err = rho_lang::codegen::sv::emit(&block, 0.0, Some(8), rho_lang::codegen::sv::Numbers::Real).unwrap_err();

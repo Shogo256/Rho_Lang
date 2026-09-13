@@ -931,13 +931,32 @@ space from outside the loop is captured once and read by place each round.
 Subtracting each row's mean and halving, `((X - □1 ((◇+1 X) / 16.0)) × 0.5)
 ⇒ X`, settles in the kernel's number of sweeps, in `real` and in Q16.16.
 
+A call with a body of flows inside `⇒` expands into a prelude the loop runs
+every round (§3.11); in the circuit each of its flows is a stage on the
+round's streams, in order, and the update reads their streams like the
+grid's. A flow that only names an argument makes no stage. Whatever the
+body folds or broadcasts makes the round two passes as above. What the
+loop does not change is not made every round: a flow of the body that
+reads nothing the loop writes is a stage before the loop, once, like any
+flow, and so is a fold or a scan over such spaces wherever it sits in the
+body or the update — a stream from outside the loop passes once, and a
+stage of the round could not read it twice. Jacobi through
+`step:{ U (▷U + ▽U) → S (S / 4.0) → = }`, a row-centring body, a body of
+two called between its arguments, and a body whose value is a turn of the
+grid next to a fold of INPUT from outside all give the interpreter's bits
+and the kernel's number of sweeps, in `real` and in Q16.16.
+
+A bound address (`&[…]:`) is the compiled kernel's; the circuit streams
+that space in like any input.
+
 In the subset: `→`, arithmetic, comparisons as masks, `⌈ ⌊ |`, the named
 functions, `?`, `⌊X` `⌈X`, `⍳`, shifts along any axis, folds and scans along
 any axis, lifts and broadcasts, the turns `⌽ ⍉ ⍴ ↑ ↓` and `⌷`, chains of
-flows, several inputs, `⇒` with an expression body that may fold, broadcast
-and turn, and all of it in `real` or in fixed point. Not yet, and said so
-with a line: a body of flows inside `⇒`, a shift of a lifted space, a flow
-with no space in it, and in fixed point the transcendental functions.
+flows, several inputs, `⇒` with an expression body or a body of flows that
+may fold, broadcast and turn, and all of it in `real` or in fixed point:
+the whole language. Not a circuit, and said so with a line: a shift of a
+lifted value, a flow with no space in it, and in fixed point the
+transcendental functions.
 
 ## 8. As JAX (`--emit-jax`) ✅
 

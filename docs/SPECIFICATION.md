@@ -872,19 +872,23 @@ scan, a Jacobi loop. exp, log, sqrt, sin, cos and a fractional power are
 refused in fixed point with a line; the roll hashes the cell's bits and
 takes the top F bits as the fraction.
 
-First numbers, unoptimised, Q16.16, from Yosys 0.67 and nextpnr 0.11:
+Numbers, Q16.16, from Yosys 0.67 and nextpnr 0.11. The first column of
+each pair is the first emitter, which took the coordinates by dividing a
+64-bit index and made `/ 4.0` a 64-bit divider; the second is after the
+coordinates became counters with a carry, every counter as wide as its
+count, and a multiplication or division by a power of two a shift (biased
+for a quotient, so it still truncates toward zero as the reference does):
 
-| Circuit | Target | Cells | Clock |
+| Circuit | Target | Cells, before → after | Clock, before → after |
 |---|---|---|---|
-| 16 × 16 five-point stencil and a blend, two stages | iCE40 HX8K | 928 LUT4, 2239 FF | 28.9 MHz |
-| Jacobi `⇒` on 48 cells, two buffers and INPUT in memory | ECP5 85K | 1020 LUT4, 2078 carry, 1553 FF, 5 BRAM | 5.5 MHz |
+| 16 × 16 five-point stencil and a blend, two stages | iCE40 HX8K | 928 → 401 LUT4, 2239 → 1876 FF | 28.9 → 75.8 MHz |
+| Jacobi `⇒` on 48 cells, two buffers and INPUT in memory | ECP5 85K | 1020 → 825 LUT4, 2078 → 177 carry, 1553 → 649 FF, 5 BRAM | 5.5 → 52.3 MHz |
 
-The flip-flops are the line buffers (a 16-wide line, 32 bits a cell, twice
-over per source); the memories of the loop became block RAM on their own.
-The low clock of the loop is the 64-bit divider a `/ 4.0` becomes and the
-64-bit counters the coordinates are taken from: a division by a constant
-should be a multiplication or a shift, and a counter should be as wide as
-its count. Those are the next steps, not the language's.
+The flip-flops that remain are the line buffers (a 16-wide line, 32 bits a
+cell, twice over per source); the memories of the loop are block RAM. What
+is left on the critical path is the 32-bit adder chain of a stage and the
+accumulator of a fold; a division by a constant that is not a power of two
+is still a divider.
 
 A `⇒` is a loop around a stage. The spaces the update reads are captured
 into memories as their streams arrive — the target into one of two buffers

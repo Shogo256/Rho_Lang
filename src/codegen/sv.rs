@@ -78,6 +78,11 @@ impl Numbers {
     }
 }
 
+/// Bits enough to count from 0 to `n`.
+fn bits(n: usize) -> usize {
+    (usize::BITS - n.leading_zeros()).max(1) as usize
+}
+
 fn mask(width: u32) -> u64 {
     if width >= 64 {
         u64::MAX
@@ -347,11 +352,32 @@ impl Lowering<'_> {
                         format!("({a} {sym} {b})")
                     }
                 };
+                // In fixed point a constant that is a power of two is a shift,
+                // not a multiplier or a divider: the same bits, since a
+                // product floors as an arithmetic shift does, and a quotient
+                // truncates toward zero, which `fx_div_pow2` biases for.
+                let pow2 = |e: &Expr| -> Option<(u32, bool)> {
+                    let Numbers::Fixed { width, frac } = self.numbers else { return None };
+                    let Expr::Number(v) = e else { return None };
+                    let raw = fixed_raw(*v, width, frac);
+                    (raw > 0 && (raw as u64).is_power_of_two()).then(|| {
+                        let m = raw.trailing_zeros();
+                        if m >= frac { (m - frac, true) } else { (frac - m, false) }
+                    })
+                };
                 match op {
                     BinaryOpKind::Add => bin("fx_add", "+", &l, &r),
                     BinaryOpKind::Sub => bin("fx_sub", "-", &l, &r),
-                    BinaryOpKind::Mul => bin("fx_mul", "*", &l, &r),
-                    BinaryOpKind::Div => bin("fx_div", "/", &l, &r),
+                    BinaryOpKind::Mul => match (pow2(rhs), pow2(lhs)) {
+                        (Some((k, up)), _) => format!("{}({l}, {k})", if up { "fx_shl" } else { "fx_shr" }),
+                        (None, Some((k, up))) => format!("{}({r}, {k})", if up { "fx_shl" } else { "fx_shr" }),
+                        _ => bin("fx_mul", "*", &l, &r),
+                    },
+                    BinaryOpKind::Div => match pow2(rhs) {
+                        Some((k, true)) => format!("fx_div_pow2({l}, {k})"),
+                        Some((k, false)) => format!("fx_shl({l}, {k})"),
+                        None => bin("fx_div", "/", &l, &r),
+                    },
                     BinaryOpKind::Pow => match whole_exponent(rhs) {
                         // Repeated multiplication, as the kernel and the
                         // interpreter do it, from the same rule.
@@ -610,7 +636,7 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
         let _ = writeln!(sv, "  // the stream of {name}: {cells} cells, latency 1");
         let _ = writeln!(sv, "  {ty} s_in_{id};");
         let _ = writeln!(sv, "  logic v_in_{id};");
-        let _ = writeln!(sv, "  longint n_in_{id};");
+        let _ = writeln!(sv, "  logic [{}:0] n_in_{id};", bits(*cells) - 1);
         let _ = writeln!(sv, "  always_ff @(posedge clk) begin");
         let _ = writeln!(sv, "    if (rst) begin n_in_{id} <= 0; v_in_{id} <= 1'b0; s_in_{id} <= {}; end", numbers.lit(0.0));
         let _ = writeln!(sv, "    else begin");
@@ -931,16 +957,17 @@ fn emit_loop_declarations(sv: &mut String, l: &Loop, numbers: Numbers) {
         } else {
             let _ = writeln!(sv, "  {ty} m{k}_{sid} [0:{}];  // {name}, captured", n - 1);
         }
-        let _ = writeln!(sv, "  longint cap{k}_{sid};  // cells captured");
+        let _ = writeln!(sv, "  logic [{}:0] cap{k}_{sid};  // cells captured", bits(n) - 1);
         let _ = writeln!(sv, "  {ty} rr{k}_{sid};  // the round stream of {name}");
     }
     let _ = writeln!(sv, "  logic rv{k};  // the round streams' valid");
     let _ = writeln!(sv, "  logic rs{k};  // a round starts: the update stage begins afresh");
     let _ = writeln!(sv, "  logic cur{k};  // which buffer of {} the round reads", l.target);
-    let _ = writeln!(sv, "  longint i{k}, w{k}, round{k}, sw{k};");
+    let _ = writeln!(sv, "  logic [{}:0] i{k}, w{k};", bits(n) - 1);
+    let _ = writeln!(sv, "  logic [{}:0] round{k}, sw{k};", bits(l.cap + 1) - 1);
     let _ = writeln!(sv, "  logic cv{k};");
     let _ = writeln!(sv, "  {ty} d{k};  // the largest move this round");
-    let _ = writeln!(sv, "  int   ls{k};  // 0 capture, 1 read, 2 drain, 3 emit, 4 done");
+    let _ = writeln!(sv, "  logic [2:0] ls{k};  // 0 capture, 1 read, 2 drain, 3 emit, 4 done");
     let _ = writeln!(sv, "  {ty} px{k};  // {} after the loop, streamed out", l.target);
     let _ = writeln!(sv, "  logic pv{k};");
 }
@@ -1076,8 +1103,12 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
     }
     let src_cells = streams[&first_src].cells;
     let fsid = ident(&first_src);
-    let _ = writeln!(sv, "  // cells entered, real cells entered, zeros pushed through after the last");
-    let _ = writeln!(sv, "  longint n{k}_in, n{k}_real, n{k}_flushed;");
+    // Counters as wide as what they count, and the cell's coordinates kept
+    // as counters with a carry rather than divided out of an index: what
+    // sets the clock rate once the arithmetic is narrow.
+    let cw = bits(src_cells + r + 3);
+    let _ = writeln!(sv, "  // cells entered, real cells entered, zeros pushed through after the last, cells computed");
+    let _ = writeln!(sv, "  logic [{}:0] n{k}_in, n{k}_real, n{k}_flushed, nc{k};", cw - 1);
     let _ = writeln!(sv, "  logic v{k}_src, fl{k}, en{k};");
     let _ = writeln!(sv, "  assign v{k}_src = av{k}_{fsid};");
     let _ = writeln!(
@@ -1096,30 +1127,48 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
         let _ = writeln!(sv, "  end");
     }
     let rank = stage.shape.len();
+    let geometry: Vec<(usize, usize)> = (0..rank)
+        .map(|a| axis_geometry(&stage.shape, Some(a)).unwrap_or((1, 1)))
+        .collect();
+    for (a, (_, extent)) in geometry.iter().enumerate() {
+        let _ = writeln!(sv, "  logic [{}:0] pc{k}_{a};  // coordinate along axis {a}, 0..{}", bits(extent.max(&1) - 1) - 1, extent - 1);
+    }
     let _ = writeln!(sv, "  {ty} st{k}_{tid};");
     let _ = writeln!(sv, "  logic v{k}_out;");
     if let Kind::Fold { axis, .. } = stage.kind {
-        let (stride, _) = axis_geometry(&stage.shape, Some(axis)).unwrap_or((1, 1));
+        let (stride, _) = geometry[axis];
         let _ = writeln!(sv, "  {ty} acc{k} [0:{}];  // one accumulator per line across axis {axis}", stride - 1);
+        let _ = writeln!(sv, "  logic [{}:0] tc{k};  // which line, 0..{}", bits(stride.max(1) - 1) - 1, stride - 1);
     }
     let _ = writeln!(sv, "  always_ff @(posedge clk) begin : stage{k}");
-    let _ = writeln!(sv, "    longint here;");
     let _ = writeln!(sv, "    longint pos [0:{}];", rank.max(1) - 1);
     let _ = writeln!(sv, "    {ty} x;");
     let _ = writeln!(sv, "    if ({clear}) begin");
-    let _ = writeln!(sv, "      n{k}_in <= 0; n{k}_real <= 0; n{k}_flushed <= 0; v{k}_out <= 1'b0; st{k}_{tid} <= {};", numbers.lit(0.0));
+    let mut zeroed: Vec<String> = vec![
+        format!("n{k}_in <= 0"),
+        format!("n{k}_real <= 0"),
+        format!("n{k}_flushed <= 0"),
+        format!("nc{k} <= 0"),
+        format!("v{k}_out <= 1'b0"),
+        format!("st{k}_{tid} <= {}", numbers.lit(0.0)),
+    ];
+    for a in 0..rank {
+        zeroed.push(format!("pc{k}_{a} <= 0"));
+    }
+    if matches!(stage.kind, Kind::Fold { .. }) {
+        zeroed.push(format!("tc{k} <= 0"));
+    }
+    let _ = writeln!(sv, "      {};", zeroed.join("; "));
     let _ = writeln!(sv, "    end else begin");
     let _ = writeln!(sv, "      v{k}_out <= 1'b0;");
     let _ = writeln!(sv, "      if (v{k}_src) n{k}_real <= n{k}_real + 1;");
     let _ = writeln!(sv, "      if (fl{k}) n{k}_flushed <= n{k}_flushed + 1;");
     let _ = writeln!(sv, "      if (en{k}) begin");
     let _ = writeln!(sv, "        n{k}_in <= n{k}_in + 1;");
-    let _ = writeln!(sv, "        here = n{k}_in - {};", r + 1);
     for a in 0..rank {
-        let (stride, extent) = axis_geometry(&stage.shape, Some(a)).unwrap_or((1, 1));
-        let _ = writeln!(sv, "        pos[{a}] = (here < 0) ? 0 : ((here / {stride}) % {extent});");
+        let _ = writeln!(sv, "        pos[{a}] = pc{k}_{a};");
     }
-    let _ = writeln!(sv, "        if (here >= 0 && here < {cells}) begin");
+    let _ = writeln!(sv, "        if (n{k}_in >= {} && nc{k} < {cells}) begin", r + 1);
     let _ = writeln!(sv, "          x = {};", stage.expr);
     match stage.kind {
         Kind::Flow => {
@@ -1127,7 +1176,7 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
             let _ = writeln!(sv, "          v{k}_out <= 1'b1;");
         }
         Kind::Fold { op, axis, running } => {
-            let (stride, extent) = axis_geometry(&stage.shape, Some(axis)).unwrap_or((1, 1));
+            let (stride, extent) = geometry[axis];
             let fixed = matches!(numbers, Numbers::Fixed { .. });
             let step = match (op, fixed) {
                 (FoldOp::Sum, false) => "(a + x)",
@@ -1139,20 +1188,36 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
             };
             let _ = writeln!(sv, "          begin : accumulate");
             let _ = writeln!(sv, "            {ty} a, next;");
-            let _ = writeln!(sv, "            longint t, m;");
-            let _ = writeln!(sv, "            t = here % {stride};");
-            let _ = writeln!(sv, "            m = (here / {stride}) % {extent};");
-            let _ = writeln!(sv, "            a = (m == 0) ? {} : acc{k}[t];", numbers.lit(op.identity()));
+            let _ = writeln!(sv, "            a = (pc{k}_{axis} == 0) ? {} : acc{k}[tc{k}];", numbers.lit(op.identity()));
             let _ = writeln!(sv, "            next = {step};");
-            let _ = writeln!(sv, "            acc{k}[t] <= next;");
+            let _ = writeln!(sv, "            acc{k}[tc{k}] <= next;");
             if running {
                 let _ = writeln!(sv, "            st{k}_{tid} <= next;");
                 let _ = writeln!(sv, "            v{k}_out <= 1'b1;");
             } else {
-                let _ = writeln!(sv, "            if (m == {}) begin st{k}_{tid} <= next; v{k}_out <= 1'b1; end", extent - 1);
+                let _ = writeln!(sv, "            if (pc{k}_{axis} == {}) begin st{k}_{tid} <= next; v{k}_out <= 1'b1; end", extent - 1);
             }
+            let _ = writeln!(sv, "            tc{k} <= (tc{k} == {}) ? 0 : tc{k} + 1;", stride - 1);
             let _ = writeln!(sv, "          end");
         }
+    }
+    let _ = writeln!(sv, "          nc{k} <= nc{k} + 1;");
+    // The coordinates advance with a carry from the innermost axis out.
+    if rank > 0 {
+        let mut text = String::new();
+        let mut indent = "          ".to_string();
+        for a in (0..rank).rev() {
+            let extent = geometry[a].1;
+            let _ = writeln!(text, "{indent}if (pc{k}_{a} != {}) pc{k}_{a} <= pc{k}_{a} + 1;", extent.max(1) - 1);
+            let _ = writeln!(text, "{indent}else begin");
+            let _ = writeln!(text, "{indent}  pc{k}_{a} <= 0;");
+            indent.push_str("  ");
+        }
+        for _ in 0..rank {
+            indent.truncate(indent.len() - 2);
+            let _ = writeln!(text, "{indent}end");
+        }
+        sv.push_str(&text);
     }
     let _ = writeln!(sv, "        end");
     let _ = writeln!(sv, "      end");
@@ -1203,6 +1268,19 @@ fn functions(numbers: Numbers) -> String {
       q = n / d;
       fx_div = q;
     end
+  endfunction
+  function automatic cell_t fx_shl(input cell_t a, input integer k);
+    fx_shl = a <<< k;
+  endfunction
+  function automatic cell_t fx_shr(input cell_t a, input integer k);
+    fx_shr = a >>> k;
+  endfunction
+  // a / 2^k truncated toward zero: a negative value is biased up first.
+  function automatic cell_t fx_div_pow2(input cell_t a, input integer k);
+    cell_t bias, biased;
+    bias = ({w}'sh1 <<< k) - {w}'sh1;
+    biased = (a < {zero}) ? a + bias : a;
+    fx_div_pow2 = biased >>> k;
   endfunction
   function automatic cell_t fx_floor(input cell_t a);
     fx_floor = a & ~{step_mask};

@@ -4480,6 +4480,42 @@ fn test_a_body_of_flows_inside_a_loop_is_stages_of_the_round() {
 }
 
 #[test]
+fn test_a_fixed_point_division_by_a_constant_is_a_multiplier_with_the_references_bits() {
+    if !verilator_available() {
+        eprintln!("verilator not found: circuit test skipped");
+        return;
+    }
+    use rho_lang::codegen::sv::Numbers;
+    use rho_lang::numeric::Fixed;
+    // Constants that are no power of two, positive and negative, large and
+    // small, over cells that run up to the format's edges: the quotient
+    // truncated toward zero, cell for cell, in two formats.
+    let source = "{\n    INPUT:◯ □ 4 8\n    ((INPUT / 3.0) + (INPUT / -7.0) + (INPUT / 0.1) + (INPUT / 1000.5) + (INPUT / 0.03) + (INPUT / 2.5) + (INPUT / -0.02)) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let grid: Vec<f64> = (0..32).map(|i| ((i as f64) * 0.61).sin() * 120.0 + (i % 3) as f64 * 0.37 - 20.0).collect();
+    let circuit_for = |numbers: Numbers| rho_lang::codegen::sv::emit(&block, 0.0, None, numbers).unwrap();
+    for (format, width, frac) in [("32.16", 32u32, 16u32), ("16.8", 16, 8)] {
+        let numbers = Numbers::Fixed { width, frac };
+        let circuit = circuit_for(numbers);
+        assert!(circuit.module.contains("fx_div_const("), "{format}: no magic multiplier\n{}", circuit.module);
+        assert!(circuit.module.lines().filter(|l| l.contains(" x = ")).all(|l| !l.contains("fx_div(")), "{format}: a divider remains\n{}", circuit.module);
+        let meant: Vec<f64> = if width == 32 {
+            type Q = Fixed<32, 16>;
+            let mut env: Env<Q> = Env::new();
+            env.insert("INPUT".to_string(), Grid::from(vec![4, 8], grid.iter().map(|v| Q::from_f64(*v)).collect()));
+            interpret_with(&block, &env, &Options { tau: 0.0, max_sweeps: 1 }).unwrap()["OUTPUT"].cells.iter().map(|c| c.to_f64()).collect()
+        } else {
+            type Q = Fixed<16, 8>;
+            let mut env: Env<Q> = Env::new();
+            env.insert("INPUT".to_string(), Grid::from(vec![4, 8], grid.iter().map(|v| Q::from_f64(*v)).collect()));
+            interpret_with(&block, &env, &Options { tau: 0.0, max_sweeps: 1 }).unwrap()["OUTPUT"].cells.iter().map(|c| c.to_f64()).collect()
+        };
+        let run = rho_lang::codegen::sv::simulate(&circuit, std::path::Path::new(&format!("target/sv_divconst_{width}")), std::slice::from_ref(&grid)).unwrap();
+        assert_eq!(bits(&run.output), bits(&meant), "{format}: circuit vs fixed-point interpreter\n{}", circuit.module);
+    }
+}
+
+#[test]
 fn test_a_bound_space_streams_into_the_circuit_like_any_input() {
     if !verilator_available() {
         eprintln!("verilator not found: circuit test skipped");

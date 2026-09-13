@@ -664,7 +664,12 @@ impl Lowering<'_> {
                     BinaryOpKind::Div => match pow2(rhs) {
                         Some((k, true)) => format!("fx_div_pow2({l}, {k})"),
                         Some((k, false)) => format!("fx_shl({l}, {k})"),
-                        None => bin("fx_div", "/", &l, &r),
+                        None => match constant_divisor(rhs, self.numbers) {
+                            Some((m, shift, pre, negative, mbits)) => {
+                                format!("fx_div_const({l}, {mbits}'h{m:x}, {shift}, {pre}, 1'b{})", u8::from(negative))
+                            }
+                            None => bin("fx_div", "/", &l, &r),
+                        },
                     },
                     BinaryOpKind::Pow => match whole_exponent(rhs) {
                         // Repeated multiplication, as the kernel and the
@@ -1532,6 +1537,43 @@ fn emit_replay(sv: &mut String, r: &Replay, numbers: Numbers) {
     let _ = writeln!(sv, "  end");
 }
 
+/// For an unsigned dividend of `n` bits and a divisor `d`: the multiplier
+/// `m` of `n + 1` bits and the shift such that `(x * m) >> shift` is
+/// `x / d` for every `x` below `2^n` (Granlund and Montgomery: `m` is
+/// `2^(n + l) / d + 1` with `l = ceil(log2 d)`, so `m * d` lies within
+/// `2^l` above `2^(n + l)`). None when the powers do not fit in 128 bits.
+fn magic(d: u128, n: u32) -> Option<(u128, u32)> {
+    if d == 0 {
+        return None;
+    }
+    let l = 128 - (d - 1).leading_zeros();
+    let shift = n + l;
+    if shift >= 128 {
+        return None;
+    }
+    Some(((1u128 << shift) / d + 1, shift))
+}
+
+/// A fixed-point division by a constant that is not a power of two: the
+/// constant's even part comes off the dividend as a shift (a quotient by
+/// `2^t` then by the odd part is the quotient by the product), and the odd
+/// part is a magic multiplier over what is left of the `w + f`-bit
+/// dividend. Returns the multiplier, its shift, the pre-shift `t`, whether
+/// the constant is negative, and the multiplier's width in bits.
+fn constant_divisor(e: &Expr, numbers: Numbers) -> Option<(u128, u32, u32, bool, u32)> {
+    let Numbers::Fixed { width, frac } = numbers else { return None };
+    let Expr::Number(v) = e else { return None };
+    let raw = fixed_raw(*v, width, frac);
+    if raw == 0 {
+        return None;
+    }
+    let d = raw.unsigned_abs() as u128;
+    let t = d.trailing_zeros();
+    let n = width + frac - t;
+    let (m, shift) = magic(d >> t, n)?;
+    Some((m, shift, t, raw < 0, n + 1))
+}
+
 /// Every space named anywhere in the expression, folds and lifts included.
 fn all_spaces(expr: &Expr, out: &mut BTreeSet<String>) {
     match expr {
@@ -1922,6 +1964,25 @@ fn functions(numbers: Numbers) -> String {
       fx_div = q;
     end
   endfunction
+  // a / d for a constant d that is no power of two: the magnitude of a << f,
+  // less the constant's even part as a shift by t, times m, shifted down,
+  // is its quotient by |d| exactly for every a (m is 2^(n + l) / odd + 1 in
+  // n + 1 bits for the n-bit dividend left, l = ceil(log2 odd)); the sign
+  // goes back on after. The reference's quotient, truncated toward zero,
+  // as a multiplier by a constant rather than a divider.
+  function automatic cell_t fx_div_const(input cell_t a, input logic [{n}:0] m, input integer sh, input integer t, input logic dneg);
+    logic signed [{nm}:0] num, qs;
+    logic [{nm}:0] mag, q;
+    logic [{n2}:0] prod;
+    num = a;
+    num = num <<< {f};
+    mag = (num < 0) ? -num : num;
+    mag = mag >> t;
+    prod = mag * m;
+    q = prod >> sh;
+    qs = q;
+    fx_div_const = ((a < {zero}) != dneg) ? -qs : qs;
+  endfunction
   function automatic cell_t fx_shl(input cell_t a, input integer k);
     fx_shl = a <<< k;
   endfunction
@@ -1987,6 +2048,9 @@ fn functions(numbers: Numbers) -> String {
 "#,
                 wm = w - 1,
                 w2m = 2 * w - 1,
+                n = w + f,
+                nm = w + f - 1,
+                n2 = 2 * (w + f),
                 shift = 64 - f
             )
         }
@@ -2177,4 +2241,32 @@ pub fn simulate(circuit: &Circuit, dir: &Path, inputs: &[Vec<f64>]) -> std::io::
         sweeps: field("sweeps"),
         converged: field("converged") != 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::magic;
+
+    #[test]
+    fn the_magic_multiplier_divides_every_dividend_of_the_width() {
+        // Every dividend of 12 bits by every divisor up to 2^12, and the
+        // edges of 48 bits (Q32.16's dividend) by divisors around powers
+        // of two and primes.
+        for d in 1u128..=4096 {
+            let (m, shift) = magic(d, 12).unwrap();
+            assert!(m < (1u128 << 13));
+            for x in 0u128..4096 {
+                assert_eq!((x * m) >> shift, x / d, "{x} / {d}");
+            }
+        }
+        let edges: Vec<u128> = (0..48).flat_map(|b| [(1u128 << b) - 1, 1u128 << b, (1u128 << b) + 1]).collect();
+        for d in [3u128, 5, 7, 10, 100, 65535, 65537, 1_000_003, (1 << 31) - 1, (1 << 31) + 1, (1 << 47) - 1, (1 << 47) + 5] {
+            let (m, shift) = magic(d, 48).unwrap();
+            assert!(m < (1u128 << 49));
+            for &x in &edges {
+                let x = x & ((1u128 << 48) - 1);
+                assert_eq!((x * m) >> shift, x / d, "{x} / {d}");
+            }
+        }
+    }
 }

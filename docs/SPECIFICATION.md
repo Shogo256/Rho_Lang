@@ -887,8 +887,26 @@ for a quotient, so it still truncates toward zero as the reference does):
 The flip-flops that remain are the line buffers (a 16-wide line, 32 bits a
 cell, twice over per source); the memories of the loop are block RAM. What
 is left on the critical path is the 32-bit adder chain of a stage and the
-accumulator of a fold; a division by a constant that is not a power of two
-is still a divider.
+accumulator of a fold.
+
+A division by a constant that is not a power of two is a multiplier, not a
+divider: the constant's even part comes off the dividend as a shift, and
+the odd part divides by the magic-number method (Granlund and Montgomery)
+— the dividend's magnitude times `2^(n+l)/d + 1`, shifted down by `n + l`,
+is exactly its quotient for every value of the `n` bits left, the sign put
+back after, so the bits are the reference's truncated quotient (held to it
+in Q16.16 and Q8.8 over seven constants, positive, negative, large and
+small). Measured on `INPUT / 3.0` over 16 × 16 cells, Q16.16:
+
+| Target | Divider | Multiplier |
+|---|---|---|
+| ECP5 85K | 163 LUT4, 605 carry, 10.8 MHz | 77 LUT4, 126 carry, 4 DSP, 53.4 MHz |
+| iCE40 HX8K (no DSP) | 241 LUT4, 186 carry, 10.8 MHz | 1441 LUT4, 170 carry, 34.1 MHz |
+
+A streaming pipeline is paid in its clock — one cell per clock, and the
+slowest stage sets it for all — so the multiplier is the default on both;
+on a part without DSP slices it costs the LUTs above. A division by a
+value that is not a constant is still a divider.
 
 A flow whose sources do not share one timing — a fold's sparse stream and
 the dense input it came from, say — or that stretches a smaller space

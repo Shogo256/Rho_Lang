@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Flow fusion for the compiled kernel.
 //!
 //! Each `→` is a sweep that writes its whole space, and the next flow reads

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Symbolic expansion of a ρ program, shared by every constraint backend.
 //!
 //! A constraint talks about one cell, but that cell's value is defined by the

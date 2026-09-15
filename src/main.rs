@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use clap::Parser;
 use rho_lang::codegen::LlvmCodeGen;
 use rho_lang::dag::RhoDag;

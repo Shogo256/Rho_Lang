@@ -4,6 +4,7 @@ version = "1.0.0"
 edition = "2021"
 description = "Compiler for ρ (RHO) Language: Time-eliminated topological dataflow language"
 license = "Apache-2.0"
+authors = ["Shogo Toda"]
 repository = "https://github.com/Escoffier1156/Rho_Lang"
 readme = "README.md"
 

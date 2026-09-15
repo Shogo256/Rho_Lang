@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A program as a JAX function: the same static-shape, no-branch dataflow
 //! that XLA compiles for CPU, GPU and TPU, written out as `jax.numpy`.
 //!

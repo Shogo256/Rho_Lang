@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A reference interpreter for ρ, written from the semantics rather than from
 //! the code generator.
 //!

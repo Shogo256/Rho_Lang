@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use thiserror::Error;
 
 /// Computational disruption error states in ρ (RHO) Language

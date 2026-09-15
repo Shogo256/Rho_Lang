@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Differential testing of the compiler against the reference interpreter.
 //!
 //! Random programs, random shapes, random inputs. The compiler and the

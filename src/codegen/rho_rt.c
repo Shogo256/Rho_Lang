@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /* The runtime a ρ kernel is linked with: a pool of threads that a sweep is
  * split across. One cell is one expression, so a sweep has no order and any
  * part of it can run on any thread; the only decision is how many parts.

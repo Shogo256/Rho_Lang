@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Python side of ρ (Rho): compile a .rho file with rhoc and call the kernel.
 
 The compiler is found in this order: the RHOC environment variable, `cargo run`

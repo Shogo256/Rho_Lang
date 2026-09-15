@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Static checking of `!` constraints.
 //!
 //! The expanded program is evaluated in interval arithmetic, which needs no

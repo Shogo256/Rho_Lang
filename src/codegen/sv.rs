@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A program as a circuit: SystemVerilog for a streaming pipeline that takes
 //! one cell per clock, in row-major order, and gives one cell per clock back.
 //!

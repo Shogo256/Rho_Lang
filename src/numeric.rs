@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The value a program is evaluated over.
 //!
 //! The reference interpreter is written against this trait rather than against

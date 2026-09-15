@@ -33,6 +33,63 @@ rhoc jacobi.rho --tau 1e-12 --max-iter 200 --run INPUT=field.bin --write OUTPUT=
 | A JAX module for CPU, GPU, TPU | `rhoc program.rho --emit-jax m.py` | bit for bit where XLA allows; within one ulp at the scale of the space where XLA reorders a fold or uses its own `exp` |
 | A SystemVerilog pipeline, one cell per clock | `rhoc program.rho --emit-sv dir --fixed 32.16` | bit for bit, in `real` and in fixed point; Yosys and nextpnr synthesise it |
 
+## What ρ can do
+
+**Grids.** A program declares spaces with shapes of any rank and writes flows
+over them, whole. Several inputs, several intermediates; a caller may read any
+intermediate or leave it to the kernel. Shapes are fixed at compile time, so
+every read has a known place and every buffer a known size.
+
+**Neighbourhoods.** `▷` and `▽` read the cell before and after along any axis,
+zero at the edge; `⌽` rotates, so a periodic boundary is one glyph; `↑` `↓`
+take a window or a tail; `⍳` is each cell's coordinate, so masks, windows,
+distances from a centre and Vandermonde matrices are one expression.
+
+**Reductions.** `◇+ ◇× ◇> ◇<` collapse an axis, `◈` runs along it. Any fold
+over any operation is an inner product: `◇+1 (A × B)` is a matrix product,
+`◇<1 (D + E)` a min-plus product (one step of shortest paths). `□` lifts an
+array against another: outer products, broadcasting, row and column
+normalisation.
+
+**Reads the data decides.** `I ⌷ X` reads X at the positions the cells of I
+name: lookup tables, colour maps, resampling, permutations. `?X` hashes each
+cell to a number in [0, 1) with no state, so a coordinate is a seed and a
+Monte Carlo run gives the same numbers on any thread count.
+
+**Iteration.** `expr ⇒ X` sweeps until no cell moves by more than `𝜏` or the
+cap is reached, and the kernel reports which: Jacobi relaxation, diffusion,
+distance fields, cellular automata, power iteration. Every round reads a
+finished grid.
+
+**Functions.** `name:{ params body }` with an expression or a body of flows,
+called prefix (`smooth INPUT`) or, for two arguments, infix (`A mix B`).
+Expanded at compile time and usable at any shape; a body inside `⇒` runs
+every round.
+
+**Numbers.** f64, f32, and fixed point `W.F` for circuits. Integers below
+2^53 are exact in f64, so modular arithmetic (`q | X`) and counting are exact.
+
+**Checks before running.** Undeclared spaces, shape mismatches and a missing
+output are refused with a line. `! (expr)` is checked by interval arithmetic
+that models binary64 rounding, so a claim that only holds over the reals is
+not accepted.
+
+**Three targets from one source.** A native shared library with a C ABI
+(SIMD, threads, fused flows), a JAX module (`jit` and `vmap`; `grad` over
+programs without `⇒`, which is a `while_loop`), and a SystemVerilog streaming pipeline
+(one cell per clock, fixed point, synthesised by Yosys).
+
+**Programs people write in it.** Image filters and morphology, stencil PDE
+relaxation and diffusion, reaction–diffusion and cellular automata, Monte
+Carlo and procedural noise, small linear algebra (products, norms, softmax,
+layer normalisation), lookup and colour maps, FIR filtering and pulse
+shaping, distance fields for path planning — and the same programs as FPGA
+datapaths.
+
+**Not in the language, by decision.** Scatter, sort and grade, strings,
+nested arrays, data-dependent branching beyond `⇒`, an integer type, FFT.
+The roadmap says why.
+
 ## Quick start
 
 ### Install
@@ -190,14 +247,60 @@ numbers are in the specification (§6, §7, §8).
 Two caveats: past the cache the memory bus is the limit, and the `!` check
 models round-to-nearest without infinities, subnormals or NaN.
 
-## How it stays right
+## What ρ claims — and how each claim is checked
 
-A reference interpreter, written from the specification and generic over the
-number type, is the meaning of a program. On every push the differential test
-compiles random programs at f64 and f32 with every sweep split across
-threads, runs them through both entrypoints, and compares them with the
-interpreter bit for bit; whatever the `!` check claimed about them is held to
-what the kernel produced; the circuit leg does the same through Verilator.
+1. **One meaning, three targets.** The compiled kernel gives the reference
+   interpreter's bits, at f64 and f32, through both entrypoints, with every
+   sweep split across threads. The circuit gives them too, in `real` and in
+   fixed point. The JAX module gives them where XLA allows, and stays within
+   one ulp at the scale of the space where XLA reorders a fold or uses its own
+   `exp`. *Checked by:* a differential test that compiles random programs on
+   every push and compares them with the interpreter bit for bit; a circuit
+   leg through Verilator; a JAX test with measured tolerances.
+
+2. **Determinism.** The result does not depend on the number of threads, the
+   grain or the run, nor — with `--portable` and the same C library, whose
+   `exp`, `log`, `sin` and `cos` the kernel calls — on the machine. The roll is
+   a hash of the cell's value, so randomness is reproducible. The same source produces
+   byte-identical IR. *Checked by:* the threads test (1, 4, 7 and all threads
+   give the same bits), the determinism step in CI, the differential test's
+   split sweeps.
+
+3. **No data-dependent control flow.** Every cell evaluates the same
+   expression; there are no branches, so no instruction sequence depends on
+   the values. What still can: the address a `⌷` reads (a memory access), the
+   number of rounds a `⇒` takes, and the latency of division and square root
+   on processors where it varies. A program that must hide its data keeps
+   `⌷`'s indices constant, runs `⇒` to its cap, and avoids `/` and `sqrt` on
+   secrets. *Checked by:* the language itself; there is no branch to test.
+
+4. **No out-of-bounds access.** Shapes are static, shifts pad zero, `⌷` reads
+   zero past the end, and the metadata states every buffer's size — given
+   buffers of those sizes, no read or write leaves them. *Checked
+   by:* the shape checks at compile time and the differential test at run
+   time.
+
+5. **The `!` check does not lie about rounding.** Its intervals model
+   round-to-nearest binary64 (or binary32 under `--f32`), so it refuses
+   claims that hold only over the reals. It assumes no overflow, subnormals or
+   NaN. *Checked by:* the differential test, which holds every claim to what
+   the kernel produced (refutation, not proof).
+
+6. **Termination.** A flow is a finite sweep; a `⇒` stops on the tolerance
+   or the cap, and the kernel says which. *Checked by:* the cap is required
+   at compile time.
+
+7. **Performance is the memory bus.** On grids past the cache a sweep runs at
+   the machine's bandwidth; a chain of flows is one sweep, a `⇒` round is one
+   sweep, threads give 3–4x in cache. *Checked by:* the numbers above,
+   measured with a C harness.
+
+**What it does not claim.** It is not faster than hand-tuned BLAS or cuDNN
+and does not try to be; the JAX module is not bit-identical; the checks are
+tests and interval arithmetic, not machine-checked proofs; a circuit's clock
+on parts without DSP slices is set by combinational multipliers (34 MHz for
+a Q16.16 constant division on an iCE40); and the language leaves out what
+the list above says it leaves out.
 
 ## Read on
 

@@ -2,8 +2,8 @@
 
 ## 1.0.0 — 2026-09-14
 
-The first release: the language as specified in `docs/SPECIFICATION.md`, and
-three things a program becomes, each held to the reference interpreter.
+The first release: the language, three things a program becomes, each held
+to the reference interpreter, and the wiki that describes them.
 
 - **Language.** Spaces and shapes, flows, zero-padded shifts along any axis,
   folds and scans, lifts and broadcasts (outer products, matrix products), the
@@ -27,5 +27,4 @@ three things a program becomes, each held to the reference interpreter.
   sweep split, and compares them bit for bit — and holds the interval check's
   claims to the runs; a circuit leg through Verilator; 158 tests.
 
-Numbers are in the specification (§6, §7, §8) and were measured, not
-estimated.
+Numbers are in the README and the wiki and were measured, not estimated.

@@ -87,8 +87,9 @@ shaping, distance fields for path planning — and the same programs as FPGA
 datapaths.
 
 **Not in the language, by decision.** Scatter, sort and grade, strings,
-nested arrays, data-dependent branching beyond `⇒`, an integer type, FFT.
-The roadmap says why.
+nested arrays, data-dependent branching beyond `⇒`, an integer type, FFT —
+each would break the one property everything rests on, that a cell is one
+expression of other cells with a shape known in advance.
 
 ## Quick start
 
@@ -216,8 +217,8 @@ The glyphs: shifts `▷ ▽`, folds `◇+ ◇× ◇> ◇<`, scans `◈`, lift `�
 point `⇒`, coordinates `⍳`, the greater, lesser and residue `⌈ ⌊ |`, rotate
 `⌽`, reshape `⍴`, transpose `⍉`, take and drop `↑ ↓`, index by value `⌷`,
 roll `?`, `exp log sqrt sin cos abs ind`, and functions `name:{ params body }`
-called prefix or, for two, infix (`A mix B`). Every glyph has an ASCII alias.
-The specification has the dictionary.
+called prefix or, for two, infix (`A mix B`). Every glyph has an ASCII alias;
+the wiki's Syntax Reference lists them all.
 
 ## C ABI
 
@@ -233,8 +234,8 @@ The specification has the dictionary.
 
 ## Numbers
 
-Measured on an i7-8550U, best of 20, one thread; details and the circuit
-numbers are in the specification (§6, §7, §8).
+Measured on an i7-8550U, best of 20, one thread, with a C harness calling
+the kernel; the circuit numbers come from Yosys 0.67 and nextpnr 0.11.
 
 | | |
 |---|---|
@@ -304,8 +305,8 @@ the list above says it leaves out.
 
 ## Read on
 
-- [docs/SPECIFICATION.md](docs/SPECIFICATION.md) — the language, the entrypoints, the numbers
-- [docs/ROADMAP.md](docs/ROADMAP.md) — what 1.0 is, what was decided out, what could follow
+- [Wiki](https://github.com/Escoffier1156/Rho_Lang/wiki) — getting started, the syntax reference, how it is verified
 - [CHANGELOG.md](CHANGELOG.md)
+- Bugs go to Issues, with the `.rho` that shows them
 
 Apache 2.0.

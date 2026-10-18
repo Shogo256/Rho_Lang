@@ -46,6 +46,7 @@
 
 use crate::ast::*;
 use crate::error::{HarmonyDisruption, Result};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -171,6 +172,9 @@ struct Stage {
     chains: BTreeMap<String, (String, String, usize, usize, usize)>,
     /// The expression, as SystemVerilog over the chains.
     expr: String,
+    /// The expression as lowered, with marks where its `parts` go.
+    marked: String,
+    parts: Vec<String>,
     kind: Kind,
     /// For the update stage of a `⇒`: the signal that starts a round afresh.
     round_reset: Option<String>,
@@ -436,11 +440,37 @@ struct Lowering<'a> {
     numbers: Numbers,
     /// Spaces read by place out of a memory rather than from a stream.
     broadcast: &'a BTreeMap<String, BroadcastRead>,
+    /// The parts that compute something, in the order lowered, each once,
+    /// and where each is in that list.
+    parts: RefCell<Vec<String>>,
+    seen: RefCell<BTreeMap<String, usize>>,
 }
 
 impl Lowering<'_> {
     fn lower(&self, expr: &Expr) -> Result<String> {
         self.lower_with(expr, &[])
+    }
+
+    /// A part that computes something is set aside, and a mark stands for
+    /// it in the text that reads it; the same part met again (the same
+    /// text, so the same value at this cell) is the same mark. Parts are
+    /// lowered children first, so a part's marks are of parts before it.
+    /// `locals` puts the parts back.
+    fn share(&self, text: String) -> String {
+        if !text.contains('(') {
+            return text;
+        }
+        let mut seen = self.seen.borrow_mut();
+        let at = match seen.get(&text) {
+            Some(&at) => at,
+            None => {
+                let mut parts = self.parts.borrow_mut();
+                parts.push(text.clone());
+                seen.insert(text, parts.len() - 1);
+                parts.len() - 1
+            }
+        };
+        format!("{MARK}{at}{MARK_END}")
     }
 
     /// The place in a broadcast source's memory that this cell reads: its
@@ -472,6 +502,11 @@ impl Lowering<'_> {
     }
 
     fn lower_with(&self, expr: &Expr, lifts: &[usize]) -> Result<String> {
+        let text = self.lower_part(expr, lifts)?;
+        Ok(self.share(text))
+    }
+
+    fn lower_part(&self, expr: &Expr, lifts: &[usize]) -> Result<String> {
         Ok(match expr {
             Expr::Number(v) => self.numbers.lit(*v),
             Expr::Var(name) if is_tau(name) => self.numbers.lit(self.tau),
@@ -719,6 +754,63 @@ impl Lowering<'_> {
             }
         })
     }
+}
+
+/// Around the number of a part in a lowered text, until `locals`.
+const MARK: char = '\u{1}';
+const MARK_END: char = '\u{2}';
+
+/// `text` with each mark replaced by what `fill` gives for its part.
+fn unmark(text: &str, fill: &mut dyn FnMut(usize) -> String) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(MARK) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + MARK.len_utf8()..];
+        let end = after.find(MARK_END).expect("a mark is closed");
+        out.push_str(&fill(after[..end].parse().expect("a mark holds a number")));
+        rest = &after[end + MARK_END.len_utf8()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Put the parts set aside by `Lowering::share` back. With `share`, a part
+/// read more than once (by two terms, or twice by one, as a gather reads
+/// its place) becomes a local of stage `k`, computed once per cell; every
+/// other part goes back where it is read, so without `share`, or in a
+/// stage that repeats nothing, the expression is written whole as it
+/// always was. Gives the locals in order and the expression.
+fn locals(parts: &[String], expr: &str, k: usize, share: bool) -> (Vec<(String, String)>, String) {
+    let mut reads = vec![0usize; parts.len()];
+    let count = |text: &str, reads: &mut Vec<usize>| {
+        unmark(text, &mut |j| {
+            reads[j] += 1;
+            String::new()
+        });
+    };
+    count(expr, &mut reads);
+    // A part's readers come after it, so its reads are all known when it
+    // is reached from the end; a part nothing reads is not written.
+    for i in (0..parts.len()).rev() {
+        if reads[i] > 0 {
+            count(&parts[i], &mut reads);
+        }
+    }
+    let mut text: Vec<String> = Vec::with_capacity(parts.len());
+    let mut lets = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let filled = if reads[i] > 0 { unmark(part, &mut |j| text[j].clone()) } else { String::new() };
+        if share && reads[i] > 1 {
+            let local = format!("e{k}_{}", lets.len());
+            lets.push((local.clone(), filled));
+            text.push(local);
+        } else {
+            text.push(filled);
+        }
+    }
+    let expr = unmark(expr, &mut |j| text[j].clone());
+    (lets, expr)
 }
 
 fn ident(name: &str) -> String {
@@ -977,6 +1069,9 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
             }
         }
     }
+    for stage in &mut stages {
+        stage.expr = locals(&stage.parts, &stage.marked, stage.index, false).1;
+    }
     let out_stream = streams
         .get("OUTPUT")
         .cloned()
@@ -1202,25 +1297,34 @@ fn one_bit(arg: &str) -> bool {
     }
 }
 
-fn arithmetic(expr: &str) -> Arithmetic {
+/// A stage's products and quotients, each part of its expression counted
+/// once however often the text repeats it (a gather writes its place three
+/// times, and Yosys merges the copies).
+fn arithmetic(stage: &Stage) -> Arithmetic {
+    let (lets, expr) = locals(&stage.parts, &stage.marked, stage.index, true);
+    let named: BTreeMap<&str, &str> = lets.iter().map(|(n, e)| (n.as_str(), e.as_str())).collect();
+    let bit = |arg: &str| one_bit(arg) || named.get(arg).is_some_and(|e| one_bit(e));
     let mut a = Arithmetic::default();
-    let mut at = 0;
-    while let Some(off) = expr[at..].find("fx_mul(") {
-        let start = at + off + "fx_mul(".len();
-        let args = call_args(&expr[start..]);
-        if args.len() == 2 {
-            if args.iter().any(|x| literal(x)) {
-                a.by_constant += 1;
-            } else if args.iter().any(|x| one_bit(x)) {
-                a.by_bit += 1;
-            } else {
-                a.multipliers += 1;
+    let parts = lets.iter().map(|(_, e)| e.as_str()).chain(std::iter::once(expr.as_str()));
+    for expr in parts {
+        let mut at = 0;
+        while let Some(off) = expr[at..].find("fx_mul(") {
+            let start = at + off + "fx_mul(".len();
+            let args = call_args(&expr[start..]);
+            if args.len() == 2 {
+                if args.iter().any(|x| literal(x)) {
+                    a.by_constant += 1;
+                } else if args.iter().any(|x| bit(x)) {
+                    a.by_bit += 1;
+                } else {
+                    a.multipliers += 1;
+                }
             }
+            at = start;
         }
-        at = start;
+        a.constant_divisions += expr.matches("fx_div_const(").count();
+        a.divisions += expr.matches("fx_div(").count();
     }
-    a.constant_divisions = expr.matches("fx_div_const(").count();
-    a.divisions = expr.matches("fx_div(").count();
     a
 }
 
@@ -1241,7 +1345,7 @@ fn explain_circuit(stages: &[Stage], replays: &[Replay], loops: &[Loop], numbers
             Kind::Fold { running: true, .. } => "scan; ",
         };
         let arith = if fixed {
-            let a = arithmetic(&stage.expr);
+            let a = arithmetic(stage);
             let mut parts = Vec::new();
             for (n, name) in [
                 (a.multipliers, "variable × variable"),
@@ -1634,8 +1738,11 @@ fn plan_stage(
         line,
         numbers,
         broadcast: &broadcast,
+        parts: RefCell::new(Vec::new()),
+        seen: RefCell::new(BTreeMap::new()),
     };
-    let expr = lowering.lower(&src)?;
+    let marked = lowering.lower(&src)?;
+    let parts = lowering.parts.into_inner();
     Ok(Stage {
         index,
         target: target.to_string(),
@@ -1643,7 +1750,9 @@ fn plan_stage(
         latency: stage_latency,
         reach,
         chains,
-        expr,
+        expr: String::new(),
+        marked,
+        parts,
         kind,
         round_reset: None,
         timing,

@@ -40,6 +40,10 @@ needs.
 - **A part's loads come in slot order.** The pointers an outlined sweep loads
   at its entry followed the addresses of the fold nodes they came from, so a
   build that allocated differently could emit other IR for the same source.
+- **`--explain` counts a part a circuit's text repeats once.** A gather
+  writes its place three times and Yosys merges the copies (a gather at
+  `X × 3` maps to two DSP blocks, one product); a matrix-vector product's
+  circuit had been said to have 35 products by a constant, where it has 33.
 
 ## 1.0.0 — 2026-09-14
 

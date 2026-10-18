@@ -907,13 +907,15 @@ impl LlvmCodeGen {
                 .get(sym)
                 .copied()
                 .unwrap_or_else(|| panic!("pointer {sym} was never shared"));
-            let inside = format!("%c{slot}");
-            if loaded.insert(slot) {
-                f.push_str(&format!(
-                    "  {inside} = load ptr, ptr getelementptr (ptr, ptr @rho_ctx, i64 {slot})\n"
-                ));
-            }
-            translated.insert(sym.to_string(), inside);
+            loaded.insert(slot);
+            translated.insert(sym.to_string(), format!("%c{slot}"));
+        }
+        // In slot order: the folds are keyed by their node's address, so
+        // the order they come in follows the allocator, and the IR must not.
+        for slot in &loaded {
+            f.push_str(&format!(
+                "  %c{slot} = load ptr, ptr getelementptr (ptr, ptr @rho_ctx, i64 {slot})\n"
+            ));
         }
         let inner = Buffers {
             map: bufs.map.iter().map(|(k, v)| (k.clone(), translated[v].clone())).collect(),

@@ -5185,3 +5185,26 @@ fn test_constant_time_refuses_what_could_follow_a_secret() {
         assert!(!found[0].starts_with("0:"), "a breach names its line: {found:?}");
     }
 }
+
+#[test]
+fn test_a_parts_loads_come_in_slot_order() {
+    // A part loads the pointers it needs from @rho_ctx at its entry. The
+    // folds among them were keyed by their node's address, so their order
+    // followed the allocator: the same program could give other IR from a
+    // build that allocated differently. The loads now come in slot order.
+    let source = "{\n    INPUT:◯ □ 6 8\n    (exp INPUT) → E\n    (E / (□1 (◇+1 E))) → N\n    (N + (□0 (◈+0 N)) + (□1 (◇>1 N))) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let ir = LlvmCodeGen::new("slot_order").generate_llvm_ir(&block).unwrap();
+    let mut parts = 0;
+    for part in ir.split("define internal void @rho_part").skip(1) {
+        let slots: Vec<usize> = part
+            .lines()
+            .skip(2)
+            .take_while(|l| l.contains("= load ptr, ptr getelementptr (ptr, ptr @rho_ctx"))
+            .map(|l| l.rsplit("i64 ").next().unwrap().trim_end_matches(')').parse().unwrap())
+            .collect();
+        assert!(slots.windows(2).all(|w| w[0] < w[1]), "{slots:?}\n{part}");
+        parts += 1;
+    }
+    assert!(parts >= 3, "{ir}");
+}

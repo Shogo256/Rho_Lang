@@ -31,6 +31,9 @@ needs.
   the interpreter, 32-bit fixed point against binary64, the constant-time
   rules, and with `DIFFTEST_SV=1` the circuit at `--fixed 32.0`.
 - A fixed-point circuit's header says its cells are fixed point.
+- **A part's loads come in slot order.** The pointers an outlined sweep loads
+  at its entry followed the addresses of the fold nodes they came from, so a
+  build that allocated differently could emit other IR for the same source.
 
 ## 1.0.0 — 2026-09-14
 

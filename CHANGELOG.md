@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+Found while writing the arithmetic of ML-KEM in ρ (the Rhodium project):
+seven NTT layers, a matrix-vector product mod q, and the tools that work
+needs.
+
+- **The analysis no longer expands a deep chain whole.** A definition whose
+  expansion passes 2^14 nodes is read as a free value named for it and the
+  cell; seven NTT layers had run `rhoc` out of memory.
+- **A row stretched over rows keeps the vector path.** A stretched read
+  whose shared innermost axes span a multiple of the vector width now gets
+  vector loads, the body aligned to the width; such flows had run one cell
+  at a time (an NTT layer's arithmetic: 9.3 → 2.4 us).
+- **A fold is not copied into a reader that names it twice.** Each copy had
+  run the fold again as a pass of its own (a matrix-vector product: 4.7 ms
+  → 82 us, 60 s → 3 s to compile).
+- **`ind` of a comparison is its truth in the circuit and in JAX**, as it
+  was in the interpreter and the kernel; both had read the comparison's
+  mask, which is 0 where it passed a zero. A formal proof of an ML-KEM
+  butterfly found it; the integer mode of the differential test now makes
+  such comparisons often.
+- **`rho_kernel_zeroize`** overwrites the scratch kept between calls and the
+  stack an entrypoint's frame used.
+- **`rhoc --constant-time`** (with `--public` for tables) refuses division
+  and residue by a non-constant, `sqrt` `exp` `log` `sin` `cos` and
+  fractional powers, `⇒`, and `⌷` at positions not made of `⍳`, constants
+  and public spaces.
+- **`DIFFTEST_MODQ=1`**: random integer programs mod q, the kernel against
+  the interpreter, 32-bit fixed point against binary64, the constant-time
+  rules, and with `DIFFTEST_SV=1` the circuit at `--fixed 32.0`.
+- A fixed-point circuit's header says its cells are fixed point.
+
 ## 1.0.0 — 2026-09-14
 
 The first release: the language, three things a program becomes, each held

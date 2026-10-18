@@ -4631,6 +4631,70 @@ fn test_a_sweep_split_across_threads_gives_the_same_bits() {
 }
 
 #[test]
+fn test_a_row_stretched_over_rows_keeps_the_vector_path() {
+    // A table of one row against seven rows, and a block lifted against
+    // five: each chunk of four result cells reads four consecutive source
+    // cells, so the sweep is vectorised. The shift in P pushes the vector
+    // body off zero; it must start at the next multiple of four, or a chunk
+    // straddles a row and reads past the table. The bits must not depend on
+    // the threads either. A column stretched along a row stays scalar.
+    let source = r#"{
+        X:◯ □ 7 12
+        T:◯ □ 1 12
+        C:◯ □ 7 1
+        Y:◯ □ 5 3 4
+        B:◯ □ 3 4
+        (((X × T) + (X / (T + 2.0))) + ((⍳0 X) + ▷X)) → P
+        (Y - (□0 B)) → R
+        (P + (X × C)) → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    // No zero among the cells: a read past a table must not land on the
+    // value it should have read.
+    let ramp = |n: usize, k: f64| -> Vec<f64> { (0..n).map(|i| 2.0 + ((i as f64) * k).sin()).collect() };
+    let inputs = [
+        ("X", vec![7, 12], ramp(84, 0.37)),
+        ("T", vec![1, 12], ramp(12, 1.3)),
+        ("C", vec![7, 1], ramp(7, 0.9)),
+        ("Y", vec![5, 3, 4], ramp(60, 0.11)),
+        ("B", vec![3, 4], ramp(12, 2.1)),
+    ];
+    let mut env: Env<f64> = Env::new();
+    for (name, shape, cells) in &inputs {
+        env.insert(name.to_string(), Grid::from(shape.clone(), cells.clone()));
+    }
+    let meant = interpret(&block, &env, 0.0).unwrap();
+    for (threads, grain) in [(1, 16384), (3, 1), (5, 1), (7, 1)] {
+        let name = format!("stretch_{threads}_{grain}");
+        let mut codegen = LlvmCodeGen::new(&name).with_threads(threads).with_grain(grain);
+        let ir = codegen.generate_llvm_ir(&block).unwrap();
+        let so_path = format!("target/{name}.so");
+        codegen.compile_to_so(&ir, &so_path).unwrap();
+        let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
+        let spaces = kernel_spaces(&lib);
+        let mut buffers: std::collections::BTreeMap<String, Vec<f64>> = spaces
+            .iter()
+            .map(|(n, cells, _)| {
+                let given = inputs.iter().find(|(i, _, _)| i == n).map(|(_, _, c)| c.clone());
+                (n.clone(), given.unwrap_or_else(|| vec![0.0; (*cells).max(1)]))
+            })
+            .collect();
+        let table: Vec<*mut f64> = spaces.iter().map(|(n, _, _)| buffers.get_mut(n).unwrap().as_mut_ptr()).collect();
+        let exec: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> =
+            unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+        unsafe { exec(table.as_ptr()) };
+        for space in ["P", "R", "OUTPUT"] {
+            assert_eq!(bits(&buffers[space]), bits(&meant[space].cells), "{name}: {space}");
+        }
+    }
+    let ir = LlvmCodeGen::new("stretch_plan").generate_llvm_ir(&block).unwrap();
+    assert!(ir.contains("; Flow 1: sweep 84 cells (scalar 0..4, 4-wide vector 4..80"), "{ir}");
+    assert!(ir.contains("; Flow 2: sweep 60 cells (scalar 0..0, 4-wide vector 0..56"), "{ir}");
+    // The output stretches a column of seven along rows of twelve: scalar.
+    assert!(ir.contains("; Flow 3: sweep 84 cells (scalar)\n"), "{ir}");
+}
+
+#[test]
 fn test_a_function_of_two_can_be_written_between_its_arguments() {
     // `A mix B` is `mix A B`, bit for bit.
     let input: Vec<f64> = (0..8).map(|i| (i as f64 * 0.9).sin()).collect();

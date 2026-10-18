@@ -124,6 +124,9 @@ enum Sweep {
         vector_end: u64,
         width: usize,
         total: u64,
+        /// The vector body starts each chunk at a multiple of the width,
+        /// which a stretched read needs (see `stretched_contiguously`).
+        aligned: bool,
     },
 }
 
@@ -1156,12 +1159,19 @@ impl LlvmCodeGen {
 
         let sweep = self.sweep_length(src, target, bufs);
         let result_shape = self.sweep_shape(src, target);
-        // A stretched read is not contiguous, so it cannot be vector loaded;
-        // neither is a read that wraps at the end of an axis.
-        let plan = if self.needs_broadcast(src, &result_shape, &[]) || self.turns(src) {
+        // A read that wraps at the end of an axis is not contiguous, so it
+        // cannot be vector loaded; nor is a stretched read, unless every
+        // lane of a chunk still lands on the next cell of its source.
+        let plan = if self.turns(src) {
             Sweep::AllScalar
+        } else if self.needs_broadcast(src, &result_shape, &[]) {
+            if self.stretched_contiguously(src, &result_shape, &[], VECTOR_WIDTH, false) {
+                self.plan_sweep(src, &sweep, true)?
+            } else {
+                Sweep::AllScalar
+            }
         } else {
-            self.plan_sweep(src, &sweep)?
+            self.plan_sweep(src, &sweep, false)?
         };
         ir.push_str(&format!(
             "  ; {what}: sweep {sweep} cells{}\n",
@@ -1217,14 +1227,27 @@ impl LlvmCodeGen {
                     vector_start,
                     vector_end,
                     width,
+                    aligned,
                     ..
                 } => {
                     // The static split, clipped to this part: the head is
                     // what lies below the vector range, the body a whole
-                    // number of lanes from there, the tail the rest.
-                    f.push_str(&format!(
-                        "  %{label}.vs = call i64 @llvm.umax.i64(i64 %lo, i64 {vector_start})\n"
-                    ));
+                    // number of lanes from there, the tail the rest. An
+                    // aligned body starts at the next multiple of the width.
+                    if aligned {
+                        f.push_str(&format!(
+                            "  %{label}.vs0 = call i64 @llvm.umax.i64(i64 %lo, i64 {vector_start})\n"
+                        ));
+                        f.push_str(&format!("  %{label}.vs1 = add i64 %{label}.vs0, {}\n", width - 1));
+                        f.push_str(&format!(
+                            "  %{label}.vs = and i64 %{label}.vs1, {}\n",
+                            !((width as u64) - 1)
+                        ));
+                    } else {
+                        f.push_str(&format!(
+                            "  %{label}.vs = call i64 @llvm.umax.i64(i64 %lo, i64 {vector_start})\n"
+                        ));
+                    }
                     f.push_str(&format!(
                         "  %{label}.hh = call i64 @llvm.umin.i64(i64 %hi, i64 %{label}.vs)\n"
                     ));
@@ -1342,6 +1365,7 @@ impl LlvmCodeGen {
                 vector_end,
                 width,
                 total,
+                ..
             } => {
                 pred = self.emit_range_loop(
                     ir,
@@ -2235,8 +2259,9 @@ impl LlvmCodeGen {
         }
     }
 
-    /// Decide how to split one flow's sweep.
-    fn plan_sweep(&self, src: &Expr, bound: &str) -> Result<Sweep> {
+    /// Decide how to split one flow's sweep. An aligned split starts its
+    /// vector body at a multiple of the width.
+    fn plan_sweep(&self, src: &Expr, bound: &str, aligned: bool) -> Result<Sweep> {
         // Vector loads read a fixed window, so the length has to be known here.
         let Ok(total) = bound.parse::<u64>() else {
             return Ok(Sweep::AllScalar);
@@ -2249,7 +2274,7 @@ impl LlvmCodeGen {
         let reach = self.max_shift_stride(src)?;
 
         // The body may touch [idx - reach, idx + reach + width - 1].
-        let start = reach;
+        let start = if aligned { reach.div_ceil(width) * width } else { reach };
         let Some(limit) = total.checked_sub(reach + width - 1) else {
             return Ok(Sweep::AllScalar);
         };
@@ -2262,6 +2287,7 @@ impl LlvmCodeGen {
             vector_end: start + chunks * width,
             width: width as usize,
             total,
+            aligned,
         })
     }
 
@@ -2480,6 +2506,76 @@ impl LlvmCodeGen {
 
     /// Whether any read in this expression is stretched, which rules out the
     /// contiguous vector loads the sweep would otherwise use.
+    /// Whether every stretched read in the expression still reads `width`
+    /// consecutive cells of its source for `width` consecutive cells of the
+    /// result, given a chunk that starts at a multiple of `width`. That holds
+    /// when the axes the source shares with the result, counted in from the
+    /// innermost, span a multiple of the width: a chunk then stays inside one
+    /// run of them, and a stretched axis outside the run is the same for all
+    /// its lanes. A table of one row stretched over k rows qualifies; a
+    /// column stretched along a row does not, nor does a stretched read
+    /// under a shift, whose edge is worked out for the unstretched shape.
+    fn stretched_contiguously(
+        &self,
+        expr: &Expr,
+        result_shape: &[usize],
+        lifts: &[usize],
+        width: usize,
+        shifted: bool,
+    ) -> bool {
+        let fits = |view: Vec<usize>| -> bool {
+            if view == result_shape {
+                return true;
+            }
+            if shifted || view.len() != result_shape.len() {
+                return false;
+            }
+            let mut run = 1usize;
+            for (v, r) in view.iter().zip(result_shape).rev() {
+                if v != r {
+                    break;
+                }
+                run *= v;
+            }
+            run.is_multiple_of(width)
+        };
+        match expr {
+            Expr::Number(_) => true,
+            Expr::Var(name) => fits(Self::lifted_shape(&self.shape_for(name), lifts)),
+            Expr::AuditTrace(inner) | Expr::Builtin { operand: inner, .. } => {
+                self.stretched_contiguously(inner, result_shape, lifts, width, shifted)
+            }
+            Expr::Shift { operand, .. } => {
+                self.stretched_contiguously(operand, result_shape, lifts, width, true)
+            }
+            Expr::Lift { axis, operand } => {
+                let mut nested = lifts.to_vec();
+                nested.push(*axis);
+                self.stretched_contiguously(operand, result_shape, &nested, width, shifted)
+            }
+            Expr::Reduce { .. } | Expr::Scan { .. } => {
+                fits(Self::lifted_shape(&self.precomputed_shape(expr), lifts))
+            }
+            Expr::Index { operand, .. } => match Self::expr_shape(operand, &self.space_shapes) {
+                Some(shape) => fits(Self::lifted_shape(&shape, lifts)),
+                None => true,
+            },
+            Expr::Reshape { shape, .. } => fits(Self::lifted_shape(shape, lifts)),
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                self.stretched_contiguously(lhs, result_shape, lifts, width, shifted)
+                    && self.stretched_contiguously(rhs, result_shape, lifts, width, shifted)
+            }
+            // Turns keep the sweep scalar on their own; a call is expanded.
+            Expr::Rotate { .. }
+            | Expr::Reverse { .. }
+            | Expr::Transpose { .. }
+            | Expr::Take { .. }
+            | Expr::Drop { .. }
+            | Expr::Gather { .. }
+            | Expr::Call { .. } => false,
+        }
+    }
+
     fn needs_broadcast(&self, expr: &Expr, result_shape: &[usize], lifts: &[usize]) -> bool {
         match expr {
             Expr::Number(_) => false,

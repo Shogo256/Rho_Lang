@@ -108,6 +108,17 @@ impl Emitter {
                     BinaryOpKind::Residue => format!("_residue({l}, {r})"),
                 }
             }
+            // `ind` of a comparison is that comparison's truth, as in the
+            // interpreter: the mask it would otherwise read gives 0 for a
+            // cell that passed a zero through.
+            Expr::Builtin {
+                op: BuiltinOp::Indicator,
+                operand,
+            } if comparison(operand).is_some() => {
+                let (sym, lhs, rhs) = comparison(operand).unwrap();
+                let (l, r) = (self.lower(lhs, line, shapes)?, self.lower(rhs, line, shapes)?);
+                format!("jnp.where({l} {sym} {r}, _c(1.0), _c(0.0))")
+            }
             Expr::Builtin { op, operand } => {
                 let x = self.lower(operand, line, shapes)?;
                 match op {
@@ -527,4 +538,18 @@ print('sweeps', int(out['rho_sweeps']), 'converged', int(bool(out['rho_converged
         sweeps: field("sweeps"),
         converged: field("converged") != 0,
     })
+}
+
+/// A comparison's operator, as Python writes it, and its operands.
+fn comparison(expr: &Expr) -> Option<(&'static str, &Expr, &Expr)> {
+    let Expr::BinaryOp { op, lhs, rhs } = expr else { return None };
+    let sym = match op {
+        BinaryOpKind::Gt => ">",
+        BinaryOpKind::Lt => "<",
+        BinaryOpKind::Gte => ">=",
+        BinaryOpKind::Lte => "<=",
+        BinaryOpKind::Eq => "==",
+        _ => return None,
+    };
+    Some((sym, lhs, rhs))
 }

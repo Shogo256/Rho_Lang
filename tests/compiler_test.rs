@@ -3929,6 +3929,30 @@ fn verilator_available() -> bool {
 }
 
 #[test]
+fn test_the_circuit_takes_a_comparisons_truth_for_ind() {
+    if !verilator_available() {
+        eprintln!("verilator not found: circuit test skipped");
+        return;
+    }
+    // A comparison that holds where its left side is 0: its mask is 0 there,
+    // its truth 1. `ind` must give the truth, in `real` and in fixed point.
+    let source = "{\n    INPUT:◯ □ 3 4\n    ((ind (INPUT < 1.0)) + (ind (INPUT <= 0.0)) + (ind (INPUT == 0.0)) + (ind (INPUT >= 0.0)) + (ind (INPUT > 1.0))) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let input: Vec<f64> = (0..12).map(|i| (i % 3) as f64).collect();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![3, 4], input.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    assert_eq!(meant[0], 4.0, "a zero: < 1, <= 0, == 0 and >= 0 hold");
+    use rho_lang::codegen::sv::{emit, simulate, Numbers};
+    for (name, numbers) in [("real", Numbers::Real), ("fixed", Numbers::Fixed { width: 32, frac: 16 })] {
+        let circuit = emit(&block, 0.0, None, numbers).unwrap();
+        let dir = format!("target/sv_truth_{name}");
+        let run = simulate(&circuit, std::path::Path::new(&dir), std::slice::from_ref(&input)).unwrap();
+        assert_eq!(bits(&run.output), bits(&meant), "{name}");
+    }
+}
+
+#[test]
 fn test_the_circuit_gives_the_interpreters_bits_one_cell_per_clock() {
     if !verilator_available() {
         eprintln!("verilator not found: circuit test skipped");
@@ -4397,7 +4421,10 @@ fn test_the_jax_module_gives_the_interpreters_cells() {
     // are bit-identical; a fold's order and XLA's own transcendentals
     // differ in the last place, which a cancelled cell magnifies against
     // itself (the mixed case: one ulp of 1.0 on a cell near 0.003).
-    let cases: [(&str, &str, Spaces, Option<usize>, u64); 11] = [
+    let small: Vec<f64> = (0..48).map(|i| (i % 3) as f64).collect();
+    let cases: [(&str, &str, Spaces, Option<usize>, u64); 12] = [
+        // `ind` of a comparison is its truth, also where the left side is 0.
+        ("truth", "{\n    INPUT:◯ □ 6 8\n    ((ind (INPUT < 1.0)) + (ind (INPUT <= 0.0)) + (ind (INPUT == 0.0)) + (ind (INPUT >= 0.0)) + (ind (INPUT > 1.0))) → =\n}", vec![("INPUT", vec![6, 8], small.clone())], None, 0),
         ("stencil", "{\n    INPUT:◯ □ 6 8\n    ((▷0INPUT + ▽0INPUT + ▷1INPUT + ▽1INPUT) / 4.0) → M\n    (((M - INPUT) ^ 2) + (M > 0.25) + ((⍳1 INPUT) ⌈ (3.0 | (⍳0 INPUT))) + (⌊((?INPUT) × 4.0)) + (abs M) + (ind (M < INPUT))) → =\n}", vec![("INPUT", vec![6, 8], grid.clone())], None, 0),
         ("turns", "{\n    INPUT:◯ □ 6 8\n    ((1 ⌽1 INPUT) + (-1 ⌽0 INPUT) + (⌽INPUT)) → T\n    (⍉T) → U\n    (6 8 ⍴ U) → V\n    (10 ↑1 V) → W\n    ((2 ↓1 W) - (-8 ↑1 W)) → =\n}", vec![("INPUT", vec![6, 8], grid.clone())], None, 0),
         ("bound", "{\n    &[0x7A4F]:INPUT:◯ □ 6 8\n    (INPUT + INPUT) → =\n}", vec![("INPUT", vec![6, 8], grid.clone())], None, 0),

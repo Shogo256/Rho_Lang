@@ -609,6 +609,17 @@ impl Lowering<'_> {
                     Numbers::Fixed { .. } => format!("fx_int(pos[{a}])"),
                 }
             }
+            // `ind` of a comparison is that comparison's truth, as in the
+            // interpreter: the mask it would otherwise read gives 0 for a
+            // cell that passed a zero through.
+            Expr::Builtin {
+                op: BuiltinOp::Indicator,
+                operand,
+            } if comparison(operand).is_some() => {
+                let (sym, lhs, rhs) = comparison(operand).unwrap();
+                let (l, r) = (self.lower(lhs)?, self.lower(rhs)?);
+                format!("(({l} {sym} {r}) ? {} : {})", self.numbers.lit(1.0), self.numbers.lit(0.0))
+            }
             Expr::Builtin { op, operand } => {
                 let x = self.lower(operand)?;
                 let fixed = matches!(self.numbers, Numbers::Fixed { .. });
@@ -2253,6 +2264,20 @@ pub fn simulate(circuit: &Circuit, dir: &Path, inputs: &[Vec<f64>]) -> std::io::
         sweeps: field("sweeps"),
         converged: field("converged") != 0,
     })
+}
+
+/// A comparison's operator, as SystemVerilog writes it, and its operands.
+fn comparison(expr: &Expr) -> Option<(&'static str, &Expr, &Expr)> {
+    let Expr::BinaryOp { op, lhs, rhs } = expr else { return None };
+    let sym = match op {
+        BinaryOpKind::Gt => ">",
+        BinaryOpKind::Lt => "<",
+        BinaryOpKind::Gte => ">=",
+        BinaryOpKind::Lte => "<=",
+        BinaryOpKind::Eq => "==",
+        _ => return None,
+    };
+    Some((sym, lhs, rhs))
 }
 
 #[cfg(test)]

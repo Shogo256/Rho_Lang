@@ -104,6 +104,18 @@ struct Args {
     /// intermediates included. Repeatable.
     #[arg(long, value_name = "SPACE=FILE")]
     write: Vec<String>,
+
+    /// Refuse the program unless it keeps the rules for secret cells: no
+    /// division or residue by a non-constant, no sqrt, exp, log, sin, cos or
+    /// fractional power, no `⇒`, and `⌷` only at positions made of `⍳`,
+    /// constants and --public spaces.
+    #[arg(long)]
+    constant_time: bool,
+
+    /// Spaces that hold no secret, such as tables, for --constant-time.
+    /// Repeat, or separate with commas.
+    #[arg(long, value_name = "NAME,...", value_delimiter = ',')]
+    public: Vec<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -152,6 +164,18 @@ fn run(args: &Args) -> anyhow::Result<()> {
     println!("[Phase 1] Parsing & 20-Symbol Strict Tokenizer...");
     let block = parse_rho_program(&source_code)?;
     println!("  └─ Parsing completed successfully (OK)");
+
+    if args.constant_time {
+        let public: std::collections::BTreeSet<String> = args.public.iter().cloned().collect();
+        let breaches = rho_lang::consttime::check(&block, &public);
+        if !breaches.is_empty() {
+            for b in &breaches {
+                eprintln!("  line {}: {}", b.line, b.detail);
+            }
+            anyhow::bail!("not constant time: {} place(s) above", breaches.len());
+        }
+        println!("  └─ Constant time: no data-dependent latency, rounds or addresses (OK)");
+    }
 
     // 2. DAG Construction & Audit Tracer
     println!("[Phase 2] DAG Transformation...");

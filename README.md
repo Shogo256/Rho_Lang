@@ -139,6 +139,7 @@ rhoc examples/matrix_add.rho --run INPUT=in.txt    # runs it: prints OUTPUT, one
 | `--emit-jax <FILE.py>` | Also write the program as a JAX module (`rho`, `rho_jit`) |
 | `--emit-sv <DIR>` | Also write the program as a SystemVerilog pipeline with a Verilator harness |
 | `--fixed <W.F>` | Make the circuit's cells fixed point, e.g. `32.16` |
+| `--constant-time`, `--public NAME,…` | Refuse the program unless its cells may be secrets: no division or residue by a non-constant, no `sqrt` `exp` `log` `sin` `cos` or fractional power, no `⇒`, and `⌷` only at positions made of `⍳`, constants and the `--public` spaces |
 | `--dump-llvm`, `--dump-dag`, `--no-simd` | Print the IR, print the dataflow, emit scalar loops only |
 
 ### From Python
@@ -281,8 +282,11 @@ models round-to-nearest without infinities, subnormals or NaN.
    the values. What still can: the address a `⌷` reads (a memory access), the
    number of rounds a `⇒` takes, and the latency of division and square root
    on processors where it varies. A program that must hide its data keeps
-   `⌷`'s indices constant, runs `⇒` to its cap, and avoids `/` and `sqrt` on
-   secrets. *Checked by:* the language itself; there is no branch to test.
+   `⌷`'s positions public, has no `⇒`, and divides only by constants.
+   *Checked by:* the language itself, which has no branch to test, and
+   `rhoc --constant-time`, which refuses a program that does any of the three
+   (`--public` names the tables a position may come from).
+   `rho_kernel_zeroize` overwrites what a call leaves in memory.
 
 4. **No out-of-bounds access.** Shapes are static, shifts pad zero, `⌷` reads
    zero past the end, and the metadata states every buffer's size — given

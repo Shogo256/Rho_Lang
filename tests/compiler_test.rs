@@ -5122,3 +5122,39 @@ fn test_zeroize_overwrites_what_a_call_left_on_the_stack() {
     assert_eq!(after, 0, "zeroize left {after} of them");
     assert_eq!(bits(&out), first);
 }
+
+#[test]
+fn test_constant_time_refuses_what_could_follow_a_secret() {
+    use rho_lang::consttime::check;
+    let public: std::collections::BTreeSet<String> = ["T".to_string()].into_iter().collect();
+    let breaches = |body: &str| -> Vec<String> {
+        let block = parse_rho_program(&format!("{{\n    X:◯ □ 8\n    T:◯ □ 8\n{body}\n}}")).unwrap();
+        check(&block, &public).into_iter().map(|b| format!("{}: {}", b.line, b.detail)).collect()
+    };
+    // Fine: positions from ⍳ and a public table, through an intermediate;
+    // division and residue by constants; shifts, masks, a whole power.
+    let fine = breaches(
+        "    ((⍳0 X) + T) → P\n    (P ⌷ X) → Q\n    ((Q / 4.0) + (3.0 | Q) + ▷Q + (ind (Q > 1.0)) + (Q ^ 2)) → =",
+    );
+    assert!(fine.is_empty(), "{fine:?}");
+    // A function's parameter bound to the table stays public through it.
+    let block = parse_rho_program(
+        "pick:{ F P ((((⍳0 F) × 8.0) + P) ⌷ F) }\n{\n    X:◯ □ 8\n    T:◯ □ 8\n    (pick X T) → =\n}",
+    )
+    .unwrap();
+    assert!(check(&block, &public).is_empty());
+    for (body, rule) in [
+        ("    (X / (T + X)) → =", "`/`"),
+        ("    (X | 3.0) → =", "`|`"),
+        ("    (sqrt X) → =", "`sqrt`"),
+        ("    (exp X) → =", "`exp`"),
+        ("    (X ^ 0.5) → =", "`^`"),
+        ("    (X ⌷ T) → =", "`⌷`"),
+        ("    ((⍳0 X) + X) → P\n    (P ⌷ T) → =", "`⌷`"),
+        ("    X → Y\n    (Y × 0.5) ⇒ Y\n    Y → =", "`⇒`"),
+    ] {
+        let found = breaches(body);
+        assert!(found.len() == 1 && found[0].contains(rule), "{body}: {found:?}");
+        assert!(!found[0].starts_with("0:"), "a breach names its line: {found:?}");
+    }
+}

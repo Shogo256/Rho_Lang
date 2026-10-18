@@ -572,10 +572,226 @@ fn short(e: &rho_lang::error::HarmonyDisruption) -> String {
     text.split(']').nth(1).unwrap_or(&text).trim().chars().take(48).collect()
 }
 
+/// q, the modulus of ML-KEM, for the integer mode.
+const Q: u64 = 3329;
+
+/// No value the integer mode writes reaches this: a 32-bit two's complement
+/// cell holds it, and binary64 holds it exactly.
+const INTEGER_LIMIT: u64 = 1 << 31;
+
+/// A random term over integers below `INTEGER_LIMIT`, made of what an ML-KEM
+/// kernel is made of, with the largest value it can take. An operation
+/// whose bound would pass the limit is not taken. The bounds are this
+/// generator's belief; where a run breaks one, fixed point and binary64
+/// part ways and the comparison says so.
+fn integer_term(rng: &mut Rng, depth: usize, spaces: &[(String, u64)]) -> (String, u64) {
+    if depth == 0 || rng.below(4) == 0 {
+        if rng.below(3) == 0 {
+            let c = rng.below(Q as usize) as u64;
+            return (format!("{c}.0"), c);
+        }
+        return spaces[rng.below(spaces.len())].clone();
+    }
+    let (a, ba) = integer_term(rng, depth - 1, spaces);
+    let fits = |b: u64| b < INTEGER_LIMIT;
+    match rng.below(9) {
+        0..=2 => {
+            let (b, bb) = integer_term(rng, depth - 1, spaces);
+            match rng.below(3) {
+                0 if fits(ba + bb) => (format!("({a} + {b})"), ba + bb),
+                1 if ba.checked_mul(bb).is_some_and(fits) => (format!("({a} × {b})"), ba * bb),
+                // A difference lifted by the subtrahend's bound stays whole.
+                2 if fits(ba + bb) => (format!("(({a} - {b}) + {bb}.0)"), ba + bb),
+                _ => (a, ba),
+            }
+        }
+        3 => {
+            let k = 1 + rng.below(16) as u32;
+            (format!("(⌊({a} / {}.0))", 1u64 << k), ba >> k)
+        }
+        4 => (format!("(⌊({a} / 3329.0))"), ba / Q),
+        // 2^16 ≡ 2285 (mod q): fold the high half down.
+        5 if ba < (1 << 24) => (
+            format!("(((⌊({a} / 65536.0)) × 2285.0) + ({a} - ((⌊({a} / 65536.0)) × 65536.0)))"),
+            (ba >> 16) * 2285 + ba.min(65535),
+        ),
+        6 if ba < 2 * Q => (format!("({a} - (3329.0 × (ind ({a} >= 3329.0))))"), ba.min(Q - 1)),
+        // A mask from a comparison's truth. Small constants and `<`, `<=`,
+        // `==` make a comparison that holds on a zero common: `ind` must give
+        // its truth there, not the zero the mask passed through.
+        7 => {
+            let (b, _) = integer_term(rng, depth - 1, spaces);
+            // Half the time a high part of b, zero on most cells.
+            let b = if rng.below(2) == 0 { format!("(⌊({b} / {}.0))", 1u64 << (10 + rng.below(7))) } else { b };
+            let c = if rng.below(2) == 0 { rng.below(2) } else { rng.below(Q as usize) };
+            let cmp = [">=", ">", "<", "<=", "=="][rng.below(5)];
+            (format!("({a} × (ind ({b} {cmp} {c}.0)))"), ba)
+        }
+        _ => (a, ba),
+    }
+}
+
+/// A program over integers mod q: INPUT and AUX hold coefficients, PERM a
+/// permutation of the cells (a public table) that a `⌷` reads by, and two
+/// to four flows of terms.
+fn integer_program(rng: &mut Rng, dims: &str) -> String {
+    let mut lines = vec![
+        format!("    INPUT:◯ □ {dims}"),
+        format!("    AUX:◯ □ {dims}"),
+        format!("    PERM:◯ □ {dims}"),
+        "    (PERM ⌷ INPUT) → G".to_string(),
+    ];
+    let mut spaces = vec![("INPUT".to_string(), Q - 1), ("AUX".to_string(), Q - 1), ("G".to_string(), Q - 1)];
+    let flows = 2 + rng.below(3);
+    for f in 0..flows {
+        let (mut term, bound) = integer_term(rng, 3, &spaces);
+        // A flow of constants alone has no shape; give it G's.
+        if !term.chars().any(|c| c.is_ascii_uppercase()) {
+            term = format!("({term} + (G × 0.0))");
+        }
+        if f + 1 == flows {
+            lines.push(format!("    {term} → ="));
+        } else {
+            lines.push(format!("    {term} → F{f}"));
+            spaces.push((format!("F{f}"), bound));
+        }
+    }
+    format!("{{\n{}\n}}\n", lines.join("\n"))
+}
+
+/// DIFFTEST_MODQ=1: the integer mode the ML-KEM core needs (its spec, §8).
+/// Each program is compiled and run at binary64 against the interpreter,
+/// the interpreter in 32-bit fixed point is held to the one in binary64 (a
+/// value past 2^31 would wrap in one and not the other), the constant-time
+/// rules are checked with PERM public, and with DIFFTEST_SV the circuit at
+/// `--fixed 32.0` is simulated against the fixed-point interpreter.
+fn integer_main(seed: u64, rounds: usize) -> ! {
+    use rho_lang::numeric::Fixed;
+    type Q32 = Fixed<32, 0>;
+    let shapes: [(&str, Vec<usize>); 5] =
+        [("1 8", vec![1, 8]), ("2 8", vec![2, 8]), ("3 16", vec![3, 16]), ("4 4", vec![4, 4]), ("2 3 8", vec![2, 3, 8])];
+    let circuit_leg = std::env::var("DIFFTEST_SV").is_ok();
+    let mut rng = Rng(seed);
+    let (mut compared, mut skipped, mut mismatches, mut wrapped, mut lint) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut circuit_compared, mut circuit_mismatches, mut circuit_failed) = (0usize, 0usize, 0usize);
+    let public: std::collections::BTreeSet<String> = ["PERM".to_string()].into_iter().collect();
+    for round in 0..rounds {
+        let (dims, shape) = &shapes[rng.below(shapes.len())];
+        let cells: usize = shape.iter().product();
+        let source = integer_program(&mut rng, dims);
+        let block = match parse_rho_program(&source) {
+            Ok(b) => b,
+            Err(e) => {
+                skipped += 1;
+                if std::env::var("DIFFTEST_VERBOSE").is_ok() {
+                    println!("skipped (parse: {}):\n{source}", short(&e));
+                }
+                continue;
+            }
+        };
+        if !rho_lang::consttime::check(&block, &public).is_empty() {
+            lint += 1;
+            println!("CONSTANT-TIME REFUSAL (round {round})\n{source}");
+        }
+        let mut perm: Vec<usize> = (0..cells).collect();
+        for i in (1..cells).rev() {
+            perm.swap(i, rng.below(i + 1));
+        }
+        let mut inputs: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        inputs.insert("INPUT".to_string(), (0..cells).map(|_| rng.below(Q as usize) as f64).collect());
+        inputs.insert("AUX".to_string(), (0..cells).map(|_| rng.below(Q as usize) as f64).collect());
+        inputs.insert("PERM".to_string(), perm.iter().map(|&p| p as f64).collect());
+        let mut env: Env<f64> = Env::new();
+        let mut fenv: Env<Q32> = Env::new();
+        for (name, values) in &inputs {
+            env.insert(name.clone(), Grid::from(shape.clone(), values.clone()));
+            fenv.insert(name.clone(), Grid::from(shape.clone(), values.iter().map(|&v| Q32::from_f64(v)).collect()));
+        }
+        let (meant, fixed) = match (interpret_with(&block, &env, &RUN), interpret_with(&block, &fenv, &RUN)) {
+            (Ok(m), Ok(f)) => (m, f),
+            (Err(e), _) | (_, Err(e)) => {
+                skipped += 1;
+                if std::env::var("DIFFTEST_VERBOSE").is_ok() {
+                    println!("skipped (interp: {}):\n{source}", short(&e));
+                }
+                continue;
+            }
+        };
+        let expected = meant["OUTPUT"].cells.clone();
+        let fixed: Vec<f64> = fixed["OUTPUT"].cells.iter().map(|q| q.to_f64()).collect();
+        if first_gap(&expected, &fixed).is_some() {
+            wrapped += 1;
+            println!("FIXED POINT PARTS FROM BINARY64 (round {round})\n{source}");
+        }
+        let mut codegen = LlvmCodeGen::new(&format!("diffq{round}")).with_threads(3).with_grain(1);
+        let ir = match codegen.generate_llvm_ir(&block) {
+            Ok(ir) => ir,
+            Err(e) => {
+                skipped += 1;
+                if std::env::var("DIFFTEST_VERBOSE").is_ok() {
+                    println!("skipped (codegen: {}):\n{source}", short(&e));
+                }
+                continue;
+            }
+        };
+        let order: Vec<String> = codegen.space_shapes.keys().cloned().collect();
+        let so = format!("target/diffq{round}.so");
+        if codegen.compile_to_so(&ir, &so).is_err() {
+            skipped += 1;
+            continue;
+        }
+        let (output, _) = run_so(&so, &order, &inputs, cells, false);
+        let _ = std::fs::remove_file(&so);
+        compared += 1;
+        if let Some(cell) = first_gap(&expected, &output[..expected.len()]) {
+            mismatches += 1;
+            println!("MISMATCH at cell {cell} (round {round})\n{source}  interpreted {} compiled {}", expected[cell], output[cell]);
+        }
+        if circuit_leg {
+            match rho_lang::codegen::sv::emit(&block, 0.0, None, rho_lang::codegen::sv::Numbers::Fixed { width: 32, frac: 0 }) {
+                Ok(circuit) => {
+                    let feed: Vec<Vec<f64>> = circuit.inputs.iter().map(|(n, _)| inputs[n].clone()).collect();
+                    let dir = std::path::PathBuf::from(format!("target/diffqsv{round}"));
+                    match rho_lang::codegen::sv::simulate(&circuit, &dir, &feed) {
+                        Ok(run) => {
+                            circuit_compared += 1;
+                            if let Some(cell) = first_gap(&fixed, &run.output) {
+                                circuit_mismatches += 1;
+                                println!("CIRCUIT MISMATCH at cell {cell} (round {round})\n{source}");
+                            }
+                        }
+                        Err(e) => {
+                            circuit_failed += 1;
+                            println!("CIRCUIT BUILD FAILED (round {round})\n{source}\n{e}");
+                        }
+                    }
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+                Err(e) => {
+                    circuit_failed += 1;
+                    println!("CIRCUIT REFUSED (round {round})\n{source}\n{e}");
+                }
+            }
+        }
+    }
+    println!(
+        "seed {seed} (integers mod q): compared {compared}, skipped {skipped}, mismatches {mismatches}, \
+         fixed point parted from binary64 {wrapped}, constant-time refusals {lint}"
+    );
+    if circuit_leg {
+        println!("  circuit at 32.0: {circuit_compared} compared, {circuit_mismatches} mismatches, {circuit_failed} failed");
+    }
+    let bad = mismatches + wrapped + lint + circuit_mismatches + circuit_failed;
+    std::process::exit(if bad > 0 { 1 } else { 0 })
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let seed = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20260909u64);
     let rounds: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(300);
+    if std::env::var("DIFFTEST_MODQ").is_ok() {
+        integer_main(seed, rounds);
+    }
 
     let shapes: [(&str, Vec<usize>); 9] = [
         ("8 1", vec![8, 1]),

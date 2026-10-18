@@ -57,6 +57,16 @@ jobs:
     - name: Hold The Circuit To The Interpreter
       run: DIFFTEST_SV=1 ./target/release/difftest 20260909 40
 
+    # Integer programs mod q = 3329, shaped like an ML-KEM kernel: the kernel
+    # against the interpreter, 32-bit fixed point against binary64, the
+    # constant-time rules, and the circuit at --fixed 32.0.
+    - name: Hold Integer Programs To The Interpreter
+      run: |
+        for seed in 20260909 7 424242; do
+          DIFFTEST_MODQ=1 ./target/release/difftest $seed 300
+        done
+        DIFFTEST_MODQ=1 DIFFTEST_SV=1 ./target/release/difftest 20260909 20
+
     - name: Run Sample Compilation (`teichmuller.rho`)
       run: cargo run --bin rhoc -- examples/teichmuller.rho --dump-dag --dump-llvm
 

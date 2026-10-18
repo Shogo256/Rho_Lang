@@ -5187,6 +5187,68 @@ fn test_constant_time_refuses_what_could_follow_a_secret() {
 }
 
 #[test]
+fn test_explain_says_what_each_flow_became() {
+    // A gather (one cell at a time), a table row stretched over rows
+    // (vector), a column stretched along rows (one cell at a time), an
+    // intermediate fused into its reader, a fold computed first, a `⇒`.
+    let source = r#"{
+        X:◯ □ 4 8
+        T:◯ □ 1 8
+        P:◯ □ 4 8
+        (P ⌷ X) → G
+        (X × T) → C
+        (C + 1.0) → A
+        ((A + G) + (□1 (◇+1 C))) → B
+        (B × 2.0) → Y
+        ((Y × 0.5) + (X × 0.25)) ⇒ Y
+        (Y + B) → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let mut codegen = LlvmCodeGen::new("explain").with_max_sweeps(8);
+    assert!(codegen.explain().is_empty(), "nothing to say before the IR");
+    codegen.generate_llvm_ir(&block).unwrap();
+    let text = codegen.explain();
+    let row = |target: &str| -> String {
+        text.lines()
+            .find(|l| l.split_whitespace().nth(2) == Some(target))
+            .unwrap_or_else(|| panic!("no row for {target}:\n{text}"))
+            .to_string()
+    };
+    assert!(row("G").contains("scalar: `⌷` reads by position"), "{text}");
+    assert!(row("C").contains("vector ×4, rows stretched over rows"), "{text}");
+    assert!(row("B").contains("scalar: a stretched read is not contiguous"), "{text}");
+    assert!(row("B").contains("1 fold pass first"), "{text}");
+    assert!(text.contains("↳ fused into it: A\n"), "{text}");
+    assert!(text.contains("every round of ⇒ Y"), "{text}");
+    assert!(text.contains("  a call: 5 sweeps, 1 fold pass\n"), "{text}");
+    assert!(text.contains("  ⇒ Y: 1 sweep and 0 fold passes a round, at most 8 rounds\n"), "{text}");
+    assert!(text.contains("fused: 1 intermediate,"), "{text}");
+    // The bounded entrypoint emits the flows again; they are said once.
+    assert_eq!(text.matches("scalar: `⌷`").count(), 1, "{text}");
+}
+
+#[test]
+fn test_explain_counts_a_circuits_products() {
+    // Of two variables, by a constant, by one bit, and a division by a
+    // constant; a power of two would be a shift and is not counted.
+    let source = "{\n    X:◯ □ 1 8\n    Y:◯ □ 1 8\n    ((X × Y) + (X × 3.0) + (X × (ind (Y > 0.0))) + (X / 3.0) + (X × 2.0)) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    use rho_lang::codegen::sv::{emit, Numbers};
+    let circuit = emit(&block, 0.0, None, Numbers::Fixed { width: 32, frac: 16 }).unwrap();
+    assert!(
+        circuit.explain.contains(
+            "products: 1 of two variables, 1 by a constant, 1 by one bit (an AND); divisions: 1 by a constant"
+        ),
+        "{}",
+        circuit.explain
+    );
+    assert!(circuit.explain.contains("1  OUTPUT"), "{}", circuit.explain);
+    // In `real` the products are not counted: such a circuit is simulated, not built.
+    let real = emit(&block, 0.0, None, Numbers::Real).unwrap();
+    assert!(real.explain.contains("counted in fixed point"), "{}", real.explain);
+}
+
+#[test]
 fn test_a_parts_loads_come_in_slot_order() {
     // A part loads the pointers it needs from @rho_ctx at its entry. The
     // folds among them were keyed by their node's address, so their order

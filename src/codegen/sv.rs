@@ -132,6 +132,8 @@ pub struct Circuit {
     /// Clocks from a cell entering to its output cell leaving.
     pub latency: usize,
     pub numbers: Numbers,
+    /// What the circuit is made of, stage by stage, for `rhoc --explain`.
+    pub explain: String,
 }
 
 /// What a simulation produced.
@@ -1133,6 +1135,7 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
     let _ = writeln!(h, "  return out.size() == {out_cells} ? 0 : 5;");
     let _ = writeln!(h, "}}");
 
+    let explain = explain_circuit(&stages, &replays, &loops, numbers, out_latency);
     Ok(Circuit {
         module: sv,
         harness: h,
@@ -1140,7 +1143,162 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
         output_cells: out_cells,
         latency: out_latency,
         numbers,
+        explain,
     })
+}
+
+/// The products and quotients of a stage, read from its SystemVerilog in
+/// fixed point: of two variables, by a literal (a power of two is a shift
+/// and is not one), by one bit (`ind` of a comparison: an AND), and
+/// quotients by a constant (a product by its magic number) or a variable.
+/// Which of them become DSP blocks is the synthesiser's choice: Yosys puts
+/// both kinds of product on an ECP5's.
+#[derive(Default)]
+struct Arithmetic {
+    multipliers: usize,
+    by_bit: usize,
+    by_constant: usize,
+    constant_divisions: usize,
+    divisions: usize,
+}
+
+/// The arguments of the call whose `(` ends just before `rest`, split at
+/// the commas of its own level.
+fn call_args(rest: &str) -> Vec<&str> {
+    let (mut depth, mut from, mut args) = (0usize, 0usize, Vec::new());
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth == 0 => {
+                args.push(rest[from..i].trim());
+                break;
+            }
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(rest[from..i].trim());
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    args
+}
+
+fn literal(arg: &str) -> bool {
+    arg.contains("'sh") && arg.chars().all(|c| c.is_ascii_hexdigit() || matches!(c, '\'' | 's' | 'h'))
+}
+
+/// `((l > r) ? ONE : ZERO)` or `rho_ind(x)`: a value of one bit.
+fn one_bit(arg: &str) -> bool {
+    if arg.starts_with("rho_ind(") {
+        return true;
+    }
+    match (arg.starts_with("(("), arg.rfind(" ? ")) {
+        (true, Some(q)) if arg.ends_with(')') => {
+            let tail = &arg[q + 3..arg.len() - 1];
+            tail.split_once(" : ").is_some_and(|(a, b)| literal(a) && literal(b))
+        }
+        _ => false,
+    }
+}
+
+fn arithmetic(expr: &str) -> Arithmetic {
+    let mut a = Arithmetic::default();
+    let mut at = 0;
+    while let Some(off) = expr[at..].find("fx_mul(") {
+        let start = at + off + "fx_mul(".len();
+        let args = call_args(&expr[start..]);
+        if args.len() == 2 {
+            if args.iter().any(|x| literal(x)) {
+                a.by_constant += 1;
+            } else if args.iter().any(|x| one_bit(x)) {
+                a.by_bit += 1;
+            } else {
+                a.multipliers += 1;
+            }
+        }
+        at = start;
+    }
+    a.constant_divisions = expr.matches("fx_div_const(").count();
+    a.divisions = expr.matches("fx_div(").count();
+    a
+}
+
+fn explain_circuit(stages: &[Stage], replays: &[Replay], loops: &[Loop], numbers: Numbers, latency: usize) -> String {
+    let fixed = matches!(numbers, Numbers::Fixed { .. });
+    let cell_bits = match numbers {
+        Numbers::Fixed { width, .. } => width as usize,
+        Numbers::Real => 64,
+    };
+    let width = stages.iter().map(|s| s.target.chars().count()).max().unwrap_or(0).max(6);
+    let mut out = format!("  stage  {:<width$}  {:>7}  {:>5}  arithmetic\n", "target", "cells", "reach");
+    let mut total = Arithmetic::default();
+    for (i, stage) in stages.iter().enumerate() {
+        let cells: usize = stage.shape.iter().product::<usize>().max(1);
+        let what = match stage.kind {
+            Kind::Flow => "",
+            Kind::Fold { running: false, .. } => "fold; ",
+            Kind::Fold { running: true, .. } => "scan; ",
+        };
+        let arith = if fixed {
+            let a = arithmetic(&stage.expr);
+            let mut parts = Vec::new();
+            for (n, name) in [
+                (a.multipliers, "variable × variable"),
+                (a.by_bit, "× one bit"),
+                (a.by_constant, "× constant"),
+                (a.constant_divisions, "÷ constant"),
+                (a.divisions, "÷ variable"),
+            ] {
+                if n > 0 {
+                    parts.push(format!("{n} {name}"));
+                }
+            }
+            total.multipliers += a.multipliers;
+            total.by_bit += a.by_bit;
+            total.by_constant += a.by_constant;
+            total.constant_divisions += a.constant_divisions;
+            total.divisions += a.divisions;
+            if parts.is_empty() { "no products".to_string() } else { parts.join(", ") }
+        } else {
+            "counted in fixed point (--fixed)".to_string()
+        };
+        out.push_str(&format!(
+            "  {:>5}  {:<width$}  {:>7}  {:>5}  {what}{arith}\n",
+            i + 1,
+            stage.target,
+            cells,
+            stage.reach
+        ));
+    }
+    if fixed {
+        out.push_str(&format!(
+            "  {}-bit cells; products: {} of two variables, {} by a constant, {} by one bit (an AND); divisions: {} by a constant (a product by its magic number), {} by a variable (a divider)\n",
+            cell_bits, total.multipliers, total.by_constant, total.by_bit, total.constant_divisions, total.divisions
+        ));
+    }
+    if !replays.is_empty() {
+        let cells: usize = replays.iter().map(|r| r.cells).sum();
+        out.push_str(&format!(
+            "  replay memories: {}, {} cells ({} kbit at {} bits a cell): a stage that reads by place (`⌷`, a turn, a broadcast) captures its sources and reads them back\n",
+            replays.len(),
+            cells,
+            (cells * cell_bits).div_ceil(1024),
+            cell_bits
+        ));
+    }
+    for l in loops {
+        out.push_str(&format!(
+            "  ⇒ {}: stages {}..{} every round over {} cells, at most {} rounds\n",
+            l.target,
+            l.first_stage + 1,
+            l.update + 1,
+            l.cells,
+            l.cap
+        ));
+    }
+    out.push_str(&format!("  one cell a clock; latency {latency} clocks\n"));
+    out
 }
 
 /// One flow as a stage: every fold or scan in the expression becomes a

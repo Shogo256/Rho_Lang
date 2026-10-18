@@ -140,6 +140,7 @@ rhoc examples/matrix_add.rho --run INPUT=in.txt    # runs it: prints OUTPUT, one
 | `--emit-sv <DIR>` | Also write the program as a SystemVerilog pipeline with a Verilator harness |
 | `--fixed <W.F>` | Make the circuit's cells fixed point, e.g. `32.16` |
 | `--constant-time`, `--public NAME,…` | Refuse the program unless its cells may be secrets: no division or residue by a non-constant, no `sqrt` `exp` `log` `sin` `cos` or fractional power, no `⇒`, and `⌷` only at positions made of `⍳`, constants and the `--public` spaces |
+| `--explain` | Say what each flow became: the sweeps a call runs, vector or one cell at a time and why, the folds computed first, what fused into what, a `⇒`'s rounds; with `--emit-sv`, the circuit's stages, products and memories |
 | `--dump-llvm`, `--dump-dag`, `--no-simd` | Print the IR, print the dataflow, emit scalar loops only |
 
 ### From Python

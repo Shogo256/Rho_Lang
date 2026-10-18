@@ -228,12 +228,37 @@ pub struct LlvmCodeGen {
     /// The globals that hold scratch kept between calls, and their count.
     keeps: RefCell<String>,
     keep_count: Cell<usize>,
-    /// Intermediates fused into their reader (see `fuse`): their flows run
-    /// only when a caller passed a buffer for the space.
-    fused: BTreeSet<String>,
+    /// Intermediates fused into their reader (see `fuse`), each with the
+    /// space its reader writes: their flows run only when a caller passed a
+    /// buffer for the space.
+    fused: BTreeMap<String, String>,
     /// The spaces an entrypoint keeps on its stack, by label, with their
     /// bytes: what `rho_kernel_zeroize` has to overwrite.
     stack_spaces: RefCell<BTreeMap<String, usize>>,
+    /// The scratch kept between calls, by label, with its bytes.
+    kept_spaces: RefCell<BTreeMap<String, usize>>,
+    /// What became of each flow of the shared body, for `explain`; recorded
+    /// while that body is emitted (the bounded entrypoint repeats the flows).
+    notes: RefCell<Vec<FlowNote>>,
+    recording: Cell<bool>,
+    /// The `⇒` whose round is being emitted.
+    in_loop: RefCell<Option<String>>,
+}
+
+/// What the compiler made of one flow, for `explain`.
+struct FlowNote {
+    line: usize,
+    target: String,
+    cells: String,
+    /// How the sweep runs: vector lanes, or one cell at a time and why.
+    plan: String,
+    /// Folds and scans, each computed as a pass of its own before the sweep.
+    folds: usize,
+    /// For a flow fused into its reader, the space the reader writes; such
+    /// a flow runs only when the caller passes its space.
+    fused_into: Option<String>,
+    /// The `⇒` whose every round runs this sweep.
+    round_of: Option<String>,
 }
 
 /// Stack wiped past the spaces themselves: the spills and the small frames
@@ -265,8 +290,12 @@ impl LlvmCodeGen {
             outlined_count: Cell::new(0),
             keeps: RefCell::new(String::new()),
             keep_count: Cell::new(0),
-            fused: BTreeSet::new(),
+            fused: BTreeMap::new(),
             stack_spaces: RefCell::new(BTreeMap::new()),
+            kept_spaces: RefCell::new(BTreeMap::new()),
+            notes: RefCell::new(Vec::new()),
+            recording: Cell::new(false),
+            in_loop: RefCell::new(None),
         }
     }
 
@@ -330,6 +359,112 @@ impl LlvmCodeGen {
     /// Cells swept by each flow loop; also what a caller must allocate.
     pub fn element_count(&self) -> usize {
         self.elements
+    }
+
+    /// What `generate_llvm_ir` made of the program, as a table: each sweep a
+    /// call runs, vector or one cell at a time and why, the folds computed as
+    /// passes of their own, the intermediates fused into it, what a `⇒` runs
+    /// every round, and the memory `rho_kernel_zeroize` overwrites. Empty
+    /// before the IR is generated.
+    pub fn explain(&self) -> String {
+        let notes = self.notes.borrow();
+        let mut out = String::new();
+        if notes.is_empty() {
+            return out;
+        }
+        // A space fused into a space fused into another is carried by the last.
+        let carrier = |name: &str| -> String {
+            let mut at = name.to_string();
+            for _ in 0..=self.fused.len() {
+                match self.fused.get(&at) {
+                    Some(next) => at = next.clone(),
+                    None => break,
+                }
+            }
+            at
+        };
+        let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        // Each fused flow belongs to the first sweep after it that writes the
+        // space carrying it (a space may be written more than once).
+        let shown: Vec<usize> = (0..notes.len()).filter(|&i| notes[i].fused_into.is_none()).collect();
+        let mut carried: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
+        for (p, m) in notes.iter().enumerate().filter(|(_, m)| m.fused_into.is_some()) {
+            let home = carrier(&m.target);
+            if let Some(&r) = shown
+                .iter()
+                .find(|&&r| r > p && notes[r].target == home && notes[r].round_of == m.round_of)
+            {
+                carried.entry(r).or_default().push(m.target.as_str());
+            }
+        }
+        let width = shown.iter().map(|&i| notes[i].target.chars().count()).max().unwrap_or(0).max(6);
+        out.push_str(&format!("  sweep  line  {:<width$}  {:>7}  plan\n", "target", "cells"));
+        let (mut once, mut once_folds) = (0usize, 0usize);
+        let mut rounds: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for (i, &at) in shown.iter().enumerate() {
+            let note = &notes[at];
+            let mut plan = note.plan.clone();
+            if note.folds > 0 {
+                plan.push_str(&format!("; {} first", plural(note.folds, "fold pass", "fold passes")));
+            }
+            if let Some(l) = &note.round_of {
+                plan.push_str(&format!("; every round of ⇒ {l}"));
+            }
+            out.push_str(&format!(
+                "  {:>5}  {:>4}  {:<width$}  {:>7}  {plan}\n",
+                i + 1,
+                note.line,
+                note.target,
+                note.cells
+            ));
+            if let Some(carried) = carried.get(&at) {
+                let list = if carried.len() > 6 {
+                    format!("{} … ({} in all)", carried[..5].join(", "), carried.len())
+                } else {
+                    carried.join(", ")
+                };
+                out.push_str(&format!("  {:>5}  {:>4}  {:<width$}  {:>7}  ↳ fused into it: {list}\n", "", "", "", ""));
+            }
+            match &note.round_of {
+                Some(l) => {
+                    let r = rounds.entry(l.clone()).or_insert((0, 0));
+                    r.0 += 1;
+                    r.1 += note.folds;
+                }
+                None => {
+                    once += 1;
+                    once_folds += note.folds;
+                }
+            }
+        }
+        out.push_str(&format!(
+            "  a call: {}, {}\n",
+            plural(once, "sweep", "sweeps"),
+            plural(once_folds, "fold pass", "fold passes")
+        ));
+        for (l, (sweeps, folds)) in &rounds {
+            out.push_str(&format!(
+                "  ⇒ {l}: {} and {} a round, at most {} rounds\n",
+                plural(*sweeps, "sweep", "sweeps"),
+                plural(*folds, "fold pass", "fold passes"),
+                self.max_sweeps.unwrap_or(0)
+            ));
+        }
+        let fused = notes.iter().filter(|n| n.fused_into.is_some()).count();
+        if fused > 0 {
+            out.push_str(&format!(
+                "  fused: {}, each computed inside the sweep that reads it; a fused space's own sweep runs only when the caller passes the space\n",
+                plural(fused, "intermediate", "intermediates")
+            ));
+        }
+        let stack: usize = self.stack_spaces.borrow().values().sum::<usize>() + ZEROIZE_MARGIN;
+        let kept: usize = self.kept_spaces.borrow().values().sum();
+        out.push_str(&format!(
+            "  rho_kernel_zeroize overwrites {} KB of stack and {} KB kept between calls\n",
+            stack.div_ceil(1024),
+            kept.div_ceil(1024)
+        ));
+        out
     }
 
     /// Generate complete LLVM IR (.ll) from a ToposBlock AST
@@ -699,7 +834,7 @@ impl LlvmCodeGen {
     /// or None for an entrypoint through which no intermediate arrives.
     fn emit_given(&self, ir: &mut String, null_flag: &dyn Fn(&str) -> Option<String>) {
         let n = self.space_shapes.len().max(1);
-        for name in &self.fused {
+        for name in self.fused.keys() {
             let slot = self.space_slot(name);
             let ident = self.sanitize_ident(name);
             let value = match null_flag(name) {
@@ -751,6 +886,9 @@ impl LlvmCodeGen {
             // here, and fresh pages cost more than the sweep at a million
             // cells. Nothing goes on the free list.
             let _ = &heap;
+            self.kept_spaces
+                .borrow_mut()
+                .insert(label.to_string(), count * self.precision.bytes());
             let keep = self.keep_count.get();
             self.keep_count.set(keep + 1);
             self.keeps
@@ -778,6 +916,46 @@ impl LlvmCodeGen {
     /// reversal wraps at the end of the axis, and a reshape to more cells
     /// reads its operand round again. Such lanes are not contiguous, so the
     /// sweep stays scalar. 📋 A gathered vector path would lift this.
+    /// Why a sweep runs one cell at a time, as `explain` says it.
+    fn scalar_reason(&self, src: &Expr, result_shape: &[usize], bound: &str) -> String {
+        if let Some(turn) = self.turn_kind(src) {
+            return turn.to_string();
+        }
+        if self.needs_broadcast(src, result_shape, &[])
+            && !self.stretched_contiguously(src, result_shape, &[], VECTOR_WIDTH, false)
+        {
+            return "a stretched read is not contiguous (a column stretched along a row, or under a shift)"
+                .to_string();
+        }
+        if !self.simd {
+            return "vectors are off (--no-simd)".to_string();
+        }
+        if bound.parse::<u64>().is_err() {
+            return "its length is known only at run time".to_string();
+        }
+        "too short for a vector beside its shifts' reach".to_string()
+    }
+
+    /// The first read out of order in an expression, as `explain` says it.
+    fn turn_kind(&self, expr: &Expr) -> Option<&'static str> {
+        match expr {
+            Expr::Gather { .. } => Some("`⌷` reads by position"),
+            Expr::Rotate { .. } => Some("`⌽` wraps at the end of an axis"),
+            Expr::Reverse { .. } => Some("`⌽` reverses an axis"),
+            Expr::Transpose { .. } => Some("`⍉` reads across rows"),
+            Expr::Take { .. } | Expr::Drop { .. } => Some("`↑` or `↓` changes the length of a row"),
+            Expr::Reshape { .. } if self.turns(expr) => Some("`⍴` to another count reads its operand round"),
+            Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } | Expr::Call { .. } | Expr::Reshape { .. } => None,
+            Expr::AuditTrace(inner)
+            | Expr::Shift { operand: inner, .. }
+            | Expr::Builtin { operand: inner, .. }
+            | Expr::Lift { operand: inner, .. }
+            | Expr::Scan { operand: inner, .. }
+            | Expr::Reduce { operand: inner, .. } => self.turn_kind(inner),
+            Expr::BinaryOp { lhs, rhs, .. } => self.turn_kind(lhs).or_else(|| self.turn_kind(rhs)),
+        }
+    }
+
     fn turns(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Rotate { .. }
@@ -1062,7 +1240,11 @@ impl LlvmCodeGen {
         ir.push_str("  store i64 0, ptr @rho_sweeps\n");
         ir.push_str("  store i64 1, ptr @rho_converged\n");
         let mut counter = 0usize;
-        self.emit_flows(&block.statements, ir, &mut bufs, "entry", &mut counter)?;
+        self.notes.borrow_mut().clear();
+        self.recording.set(true);
+        let emitted = self.emit_flows(&block.statements, ir, &mut bufs, "entry", &mut counter);
+        self.recording.set(false);
+        emitted?;
         for ptr in &bufs.heap {
             ir.push_str(&format!("  call void @free(ptr {ptr})\n"));
         }
@@ -1123,7 +1305,7 @@ impl LlvmCodeGen {
                     };
                     let label = format!("f{loop_id}");
                     let guarded = match target {
-                        FlowTarget::Var(name) if self.fused.contains(name) => {
+                        FlowTarget::Var(name) if self.fused.contains_key(name) => {
                             let (run, skip) = self.open_given(ir, name, &label);
                             pred = run;
                             Some(skip)
@@ -1199,6 +1381,26 @@ impl LlvmCodeGen {
         } else {
             self.plan_sweep(src, &sweep, false)?
         };
+        if self.recording.get() {
+            let name = match target {
+                FlowTarget::Var(n) => n.clone(),
+                FlowTarget::Equilibrium => "OUTPUT".to_string(),
+            };
+            let plan_text = match &plan {
+                Sweep::Split { width, aligned: true, .. } => format!("vector ×{width}, rows stretched over rows"),
+                Sweep::Split { width, .. } => format!("vector ×{width}"),
+                Sweep::AllScalar => format!("scalar: {}", self.scalar_reason(src, &result_shape, &sweep)),
+            };
+            self.notes.borrow_mut().push(FlowNote {
+                line: self.current_line.get(),
+                target: name.clone(),
+                cells: sweep.clone(),
+                plan: plan_text,
+                folds: fold_count(src),
+                fused_into: self.fused.get(&name).cloned(),
+                round_of: self.in_loop.borrow().clone(),
+            });
+        }
         ir.push_str(&format!(
             "  ; {what}: sweep {sweep} cells{}\n",
             plan.describe()
@@ -1460,6 +1662,25 @@ impl LlvmCodeGen {
         loop_id: usize,
         counter: &mut usize,
     ) -> Result<String> {
+        // The sweeps emitted here run every round, which `explain` says.
+        *self.in_loop.borrow_mut() = Some(target.to_string());
+        let emitted = self.emit_iterate_rounds(prelude, src, target, ir, bufs, pred, loop_id, counter);
+        *self.in_loop.borrow_mut() = None;
+        emitted
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_iterate_rounds(
+        &self,
+        prelude: &[Statement],
+        src: &Expr,
+        target: &str,
+        ir: &mut String,
+        bufs: &mut Buffers,
+        pred: &str,
+        loop_id: usize,
+        counter: &mut usize,
+    ) -> Result<String> {
         let cap = self.max_sweeps.ok_or_else(|| HarmonyDisruption::LoweringErr {
             detail: "this program iterates (⇒); say how many sweeps it may take with --max-iter"
                 .to_string(),
@@ -1535,7 +1756,7 @@ impl LlvmCodeGen {
             };
             let ptr = self.lookup(bufs, t)?;
             let plabel = format!("{label}.p{i}");
-            let guarded = self.fused.contains(t).then(|| {
+            let guarded = self.fused.contains_key(t).then(|| {
                 let (run, skip) = self.open_given(ir, t, &plabel);
                 inner_pred = run;
                 skip
@@ -3791,5 +4012,26 @@ impl LlvmCodeGen {
             }
         }
         sanitized
+    }
+}
+
+/// Folds and scans in an expression: each is computed as a pass of its own
+/// before the sweep that reads it.
+fn fold_count(expr: &Expr) -> usize {
+    match expr {
+        Expr::Reduce { operand, .. } | Expr::Scan { operand, .. } => 1 + fold_count(operand),
+        Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } => 0,
+        Expr::AuditTrace(inner)
+        | Expr::Builtin { operand: inner, .. }
+        | Expr::Shift { operand: inner, .. }
+        | Expr::Lift { operand: inner, .. }
+        | Expr::Rotate { operand: inner, .. }
+        | Expr::Reverse { operand: inner, .. }
+        | Expr::Reshape { operand: inner, .. }
+        | Expr::Transpose { operand: inner, .. }
+        | Expr::Take { operand: inner, .. }
+        | Expr::Drop { operand: inner, .. } => fold_count(inner),
+        Expr::BinaryOp { lhs, rhs, .. } | Expr::Gather { index: lhs, operand: rhs } => fold_count(lhs) + fold_count(rhs),
+        Expr::Call { args, .. } => args.iter().map(fold_count).sum(),
     }
 }

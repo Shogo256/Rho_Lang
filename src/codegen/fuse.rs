@@ -227,11 +227,11 @@ fn evaluated(stmt: &Statement) -> Vec<&Expr> {
 const MOST_READS: usize = 8;
 
 /// The block with every fusable intermediate folded into its reader, and
-/// the names of those intermediates, whose flows run only when a caller
-/// asked for the space.
-pub fn fuse(block: &ToposBlock) -> (ToposBlock, BTreeSet<String>) {
+/// for each of those intermediates (whose flows run only when a caller
+/// asked for the space) the space its reader writes.
+pub fn fuse(block: &ToposBlock) -> (ToposBlock, BTreeMap<String, String>) {
     let mut statements = block.statements.clone();
-    let mut fused: BTreeSet<String> = BTreeSet::new();
+    let mut fused: BTreeMap<String, String> = BTreeMap::new();
     let mut writes: BTreeMap<String, usize> = BTreeMap::new();
     for stmt in &statements {
         for w in writes_of(stmt) {
@@ -282,7 +282,7 @@ pub fn fuse(block: &ToposBlock) -> (ToposBlock, BTreeSet<String>) {
         if let Statement::Flow { src, .. } = &mut statements[j] {
             *src = fused_src;
         }
-        fused.insert(name);
+        fused.insert(name, reader_writes);
     }
 
     // A loop's prelude: a flow read once by a later flow of the prelude or
@@ -299,7 +299,7 @@ pub fn fuse(block: &ToposBlock) -> (ToposBlock, BTreeSet<String>) {
         })
         .collect();
     for (i, stmt) in statements.iter_mut().enumerate() {
-        let Statement::Iterate { prelude, src: update, .. } = stmt else { continue };
+        let Statement::Iterate { prelude, src: update, target: iterate } = stmt else { continue };
         for p in 0..prelude.len() {
             let (e, name) = match &prelude[p] {
                 Statement::Flow {
@@ -354,7 +354,7 @@ pub fn fuse(block: &ToposBlock) -> (ToposBlock, BTreeSet<String>) {
                 }
                 None => *update = fused_expr,
             }
-            fused.insert(name);
+            fused.insert(name, reader_writes.clone().unwrap_or_else(|| iterate.clone()));
         }
     }
 

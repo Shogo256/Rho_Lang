@@ -112,6 +112,14 @@ struct Args {
     #[arg(long)]
     constant_time: bool,
 
+    /// Say what the compiler made of each flow: the sweeps a call runs,
+    /// vector or one cell at a time and why, the folds computed as passes of
+    /// their own, which intermediates fused into which sweep, what a `⇒`
+    /// runs every round, and, with --emit-sv, the circuit's stages,
+    /// memories and multipliers.
+    #[arg(long)]
+    explain: bool,
+
     /// Spaces that hold no secret, such as tables, for --constant-time.
     /// Repeat, or separate with commas.
     #[arg(long, value_name = "NAME,...", value_delimiter = ',')]
@@ -259,6 +267,10 @@ fn run(args: &Args) -> anyhow::Result<()> {
         codegen = codegen.bind(name.trim(), value);
     }
     let llvm_ir = codegen.generate_llvm_ir(&block).map_err(|e| block.attribute(e))?;
+    if args.explain {
+        println!("[Explain] What each flow became in the kernel");
+        print!("{}", codegen.explain());
+    }
 
     if args.dump_llvm {
         println!("-----------------------------------------------------");
@@ -305,6 +317,10 @@ fn run(args: &Args) -> anyhow::Result<()> {
             dir.display(),
             circuit.latency
         );
+        if args.explain {
+            println!("[Explain] What the circuit is made of");
+            print!("{}", circuit.explain);
+        }
     }
 
     println!("=====================================================");

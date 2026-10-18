@@ -31,6 +31,12 @@ needs.
   the interpreter, 32-bit fixed point against binary64, the constant-time
   rules, and with `DIFFTEST_SV=1` the circuit at `--fixed 32.0`.
 - A fixed-point circuit's header says its cells are fixed point.
+- **`rhoc --explain`** prints what each flow became: the sweeps a call runs,
+  vector or one cell at a time and why, the folds computed as passes of their
+  own, which intermediates fused into which sweep, what a `⇒` runs every
+  round, and what `rho_kernel_zeroize` overwrites; with `--emit-sv`, the
+  circuit's stages, its products (of two variables, by a constant, by one
+  bit) and its replay memories. Nothing it prints changes the code.
 - **A part's loads come in slot order.** The pointers an outlined sweep loads
   at its entry followed the addresses of the fold nodes they came from, so a
   build that allocated differently could emit other IR for the same source.

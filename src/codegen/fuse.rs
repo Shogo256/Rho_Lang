@@ -14,7 +14,10 @@
 //! side of `⌷` (those take a place in a declared space); a space read by
 //! more than one statement (the reader would recompute it); an expression
 //! with a turn or a gather in it (they would force the reader's sweep onto
-//! the scalar path); an intermediate a loop reads (recomputed every round);
+//! the scalar path); an expression with a fold or scan in it that the reader
+//! names more than once (each copy would run the fold again as its own pass,
+//! where a repeated cell expression is merged back by LLVM); an intermediate
+//! a loop reads (recomputed every round);
 //! and a reader that writes something the expression reads, or has such a
 //! write between it and the flow (the values would no longer be the ones
 //! the flow saw). The space stays declared, and its flow still runs when a
@@ -136,6 +139,35 @@ fn portable(expr: &Expr) -> bool {
     }
 }
 
+/// Whether the expression folds or scans anywhere: computed as a pass of
+/// its own ahead of the sweep that reads it, once per place it is written.
+fn folds(expr: &Expr) -> bool {
+    match expr {
+        Expr::Reduce { .. } | Expr::Scan { .. } => true,
+        Expr::Var(_) | Expr::Number(_) => false,
+        Expr::AuditTrace(inner)
+        | Expr::Builtin { operand: inner, .. }
+        | Expr::Shift { operand: inner, .. }
+        | Expr::Index { operand: inner, .. }
+        | Expr::Lift { operand: inner, .. }
+        | Expr::Rotate { operand: inner, .. }
+        | Expr::Reverse { operand: inner, .. }
+        | Expr::Reshape { operand: inner, .. }
+        | Expr::Transpose { operand: inner, .. }
+        | Expr::Take { operand: inner, .. }
+        | Expr::Drop { operand: inner, .. } => folds(inner),
+        Expr::BinaryOp { lhs, rhs, .. } | Expr::Gather { index: lhs, operand: rhs } => folds(lhs) || folds(rhs),
+        Expr::Call { args, .. } => args.iter().any(folds),
+    }
+}
+
+/// Whether the reader may carry the expression as many times as it names
+/// the space: not past `MOST_READS`, and only once when it holds a fold.
+fn copies_allowed(expr: &Expr, reader: &Expr, name: &str) -> bool {
+    let n = occurrences(reader, name);
+    n <= MOST_READS && (n == 1 || !folds(expr))
+}
+
 /// The expression with every read of the space replaced by `value`.
 fn substitute(expr: &Expr, name: &str, value: &Expr) -> Expr {
     let sub = |e: &Expr| Box::new(substitute(e, name, value));
@@ -231,7 +263,7 @@ pub fn fuse(block: &ToposBlock) -> (ToposBlock, BTreeSet<String>) {
         else {
             continue; // a loop would recompute it every round
         };
-        if !pointwise(reader, &name, false) || occurrences(reader, &name) > MOST_READS {
+        if !pointwise(reader, &name, false) || !copies_allowed(&src, reader, &name) {
             continue;
         }
         let mut sources = BTreeSet::new();
@@ -304,7 +336,7 @@ pub fn fuse(block: &ToposBlock) -> (ToposBlock, BTreeSet<String>) {
                 // reads the current one, so reading the target here is fine.
                 None => (&*update, None, p + 1..prelude.len()),
             };
-            if !pointwise(reader_expr, &name, false) || occurrences(reader_expr, &name) > MOST_READS {
+            if !pointwise(reader_expr, &name, false) || !copies_allowed(&e, reader_expr, &name) {
                 continue;
             }
             if reader_writes.as_ref().is_some_and(|t| sources.contains(t)) {

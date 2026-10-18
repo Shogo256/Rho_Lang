@@ -4931,6 +4931,26 @@ fn test_an_intermediate_read_once_cell_for_cell_is_computed_inside_its_reader() 
 }
 
 #[test]
+fn test_a_fold_is_not_copied_into_a_reader_that_names_it_twice() {
+    // S is a fold the next flow names three times. Fused, each copy would
+    // run the fold again as a pass of its own (a repeated cell expression is
+    // merged by LLVM; a repeated loop is not), so S keeps its sweep. R is a
+    // fold named once and still goes into its reader.
+    let source = "{\n    X:◯ □ 4 8\n    (◇+1 X) → S\n    (◇+1 (X × 2.0)) → R\n    (((S × S) + S) + R) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let mut codegen = LlvmCodeGen::new("fusion_fold");
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    assert!(!ir.contains("; [S] is fused into its reader"), "{ir}");
+    assert!(ir.contains("; [R] is fused into its reader"), "{ir}");
+    let grid: Vec<f64> = (0..32).map(|i| ((i as f64) * 0.7).sin() * 3.0).collect();
+    let mut env: Env<f64> = Env::new();
+    env.insert("X".to_string(), Grid::from(vec![4, 8], grid.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    let out = run_spaces("fusion_fold", source, &[("X", grid), ("OUTPUT", vec![0.0; 4])]);
+    assert_eq!(bits(&out["OUTPUT"]), bits(&meant));
+}
+
+#[test]
 fn test_a_bodys_flows_inside_a_loop_are_computed_inside_the_round() {
     // The body's S and its value are read once each: one sweep a round.
     let source = "\nstep:{ U\n    (▷U + ▽U) → S\n    (S / 4.0) → =\n}\n{\n    INPUT:◯ □ 48\n    INPUT → X\n    ((INPUT / 4.0) + (step X)) ⇒ X\n    X → =\n}";

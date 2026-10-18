@@ -5071,3 +5071,54 @@ fn test_every_error_a_program_can_raise_names_its_line() {
         assert!(line.is_some_and(|l| l > 0), "{what}: no line in: {text}");
     }
 }
+
+#[test]
+fn test_zeroize_overwrites_what_a_call_left_on_the_stack() {
+    // The spaces of this kernel are small enough to live on the stack of
+    // the entrypoint. After a call, the stack below the caller still holds
+    // A's cells (3000 to 3300, a range garbage does not fall in); after
+    // rho_kernel_zeroize it holds none, and the next call is unchanged.
+    // The scanner reads memory it did not write, on purpose: it is C at
+    // -O0, called from the same frame as the kernel and so at its depth.
+    let source = "{\n    INPUT:◯ □ 4 64\n    (INPUT × 3.0) → A\n    ((▷A + A) + 0.5) → B\n    (B - (A × 0.25)) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let mut codegen = LlvmCodeGen::new("zeroize");
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    assert!(ir.contains("define void @rho_kernel_zeroize()"), "{ir}");
+    let so = "target/zeroize.so";
+    codegen.compile_to_so(&ir, so).unwrap();
+
+    let scan_c = "target/zeroize_scan.c";
+    let scan_so = "target/zeroize_scan.so";
+    std::fs::write(
+        scan_c,
+        "#include <string.h>\nlong scan(long bytes, double lo, double hi) {\n    unsigned char buf[bytes];\n    long n = 0;\n    for (long i = 0; i + 8 <= bytes; i += 8) {\n        double d;\n        memcpy(&d, buf + i, 8);\n        if (d >= lo && d < hi) n++;\n    }\n    return n;\n}\n",
+    )
+    .unwrap();
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let built = std::process::Command::new(&cc).args(["-O0", "-shared", "-fPIC", "-o", scan_so, scan_c]).status();
+    if !built.is_ok_and(|s| s.success()) {
+        eprintln!("skipping the stack scan: {cc} did not build it");
+        return;
+    }
+
+    let input: Vec<f64> = (0..256).map(|i| 1000.0 + (i as f64) * 0.375).collect();
+    let lib = unsafe { libloading::Library::new(so).unwrap() };
+    let scanner = unsafe { libloading::Library::new(scan_so).unwrap() };
+    let exec: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
+        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let zeroize: libloading::Symbol<unsafe extern "C" fn()> = unsafe { lib.get(b"rho_kernel_zeroize").unwrap() };
+    let scan: libloading::Symbol<unsafe extern "C" fn(i64, f64, f64) -> i64> = unsafe { scanner.get(b"scan").unwrap() };
+    let mut out = vec![0.0; 256];
+    unsafe { exec(input.as_ptr(), out.as_mut_ptr()) };
+    let first = bits(&out);
+    let left = unsafe { scan(1 << 20, 3000.0, 3300.0) };
+    unsafe { exec(input.as_ptr(), out.as_mut_ptr()) };
+    unsafe { zeroize() };
+    let after = unsafe { scan(1 << 20, 3000.0, 3300.0) };
+    unsafe { exec(input.as_ptr(), out.as_mut_ptr()) };
+    // Most of A's 256 cells: the calls in between overwrite a few.
+    assert!(left > 128, "a call should leave A's cells below the caller, found {left}");
+    assert_eq!(after, 0, "zeroize left {after} of them");
+    assert_eq!(bits(&out), first);
+}

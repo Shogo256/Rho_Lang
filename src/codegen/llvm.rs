@@ -231,7 +231,14 @@ pub struct LlvmCodeGen {
     /// Intermediates fused into their reader (see `fuse`): their flows run
     /// only when a caller passed a buffer for the space.
     fused: BTreeSet<String>,
+    /// The spaces an entrypoint keeps on its stack, by label, with their
+    /// bytes: what `rho_kernel_zeroize` has to overwrite.
+    stack_spaces: RefCell<BTreeMap<String, usize>>,
 }
+
+/// Stack wiped past the spaces themselves: the spills and the small frames
+/// of the body and the parts, which can hold a cell or a lane of one.
+const ZEROIZE_MARGIN: usize = 16 * 1024;
 
 impl LlvmCodeGen {
     pub fn new(module_name: &str) -> Self {
@@ -259,6 +266,7 @@ impl LlvmCodeGen {
             keeps: RefCell::new(String::new()),
             keep_count: Cell::new(0),
             fused: BTreeSet::new(),
+            stack_spaces: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -410,6 +418,7 @@ impl LlvmCodeGen {
         // and say how many parts that was.
         ir.push_str("declare void @rho_rt_run(ptr, i64, i64, i64)\n");
         ir.push_str("declare ptr @rho_rt_scratch(ptr, i64)\n");
+        ir.push_str("declare void @rho_rt_zeroize(i64)\n");
         ir.push_str("declare i64 @rho_rt_parts()\n\n");
         // What each part of a comparison found: the largest move in its range.
         ir.push_str(&format!(
@@ -559,6 +568,18 @@ impl LlvmCodeGen {
         ir.push_str("entry:\n");
         ir.push_str("  %converged = load i64, ptr @rho_converged\n");
         ir.push_str("  ret i64 %converged\n");
+        ir.push_str("}\n\n");
+
+        // 8. Overwrite what the last calls left behind: the scratch kept
+        // between calls, and the stack an entrypoint's frame used, measured
+        // from where this is called — the same depth as the kernel when it
+        // is called the same way. A caller that computed on secrets calls it
+        // before letting them go.
+        let frame = self.stack_spaces.borrow().values().sum::<usize>() + ZEROIZE_MARGIN;
+        ir.push_str("define void @rho_kernel_zeroize() #0 {\n");
+        ir.push_str("entry:\n");
+        ir.push_str(&format!("  call void @rho_rt_zeroize(i64 {frame})\n"));
+        ir.push_str("  ret void\n");
         ir.push_str("}\n\n");
 
         // The parts the pool runs, and the table of pointers they read.
@@ -741,6 +762,9 @@ impl LlvmCodeGen {
                 count * self.precision.bytes()
             ));
         } else {
+            self.stack_spaces
+                .borrow_mut()
+                .insert(label.to_string(), count * self.precision.bytes());
             ir.push_str(&format!("  ; [{label}] {count} cells -> stack\n"));
             ir.push_str(&format!(
                 "  {sym} = alloca [{count} x {}], align 64\n",

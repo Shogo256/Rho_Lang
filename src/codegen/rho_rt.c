@@ -11,6 +11,7 @@
  * cells unless said otherwise, or RHO_GRAIN — runs on the caller alone.
  */
 #include <stdlib.h>
+#include <string.h>
 
 /* Scratch a kernel keeps between calls: an intermediate no caller asked for,
  * a fold's lines, a loop's next grid. Its size is fixed by the shapes at
@@ -19,17 +20,42 @@
  * which cost more than the sweeps did at a million cells. */
 #define RT_MAX_SCRATCH 4096
 static void *rt_scratch[RT_MAX_SCRATCH];
+static unsigned long rt_scratch_bytes[RT_MAX_SCRATCH];
 static long rt_scratch_count;
 void *rho_rt_scratch(void **slot, unsigned long bytes) {
     if (*slot == 0) {
         *slot = malloc(bytes);
-        if (rt_scratch_count < RT_MAX_SCRATCH) rt_scratch[rt_scratch_count++] = *slot;
+        if (rt_scratch_count < RT_MAX_SCRATCH) {
+            rt_scratch[rt_scratch_count] = *slot;
+            rt_scratch_bytes[rt_scratch_count++] = bytes;
+        }
     }
     return *slot;
 }
 static void rt_free_scratch(void) {
     for (long i = 0; i < rt_scratch_count; i++) free(rt_scratch[i]);
     rt_scratch_count = 0;
+}
+
+/* Zero memory in a way the compiler may not drop as a dead store: the
+ * empty asm claims to read the bytes after the memset. */
+static void rt_wipe(void *p, unsigned long n) {
+    memset(p, 0, n);
+    __asm__ __volatile__("" : : "r"(p) : "memory");
+}
+
+/* Overwrite `bytes` of the stack below the caller: the frames a kernel's
+ * entrypoint used, when this is reached at the same depth. */
+__attribute__((noinline)) static void rt_burn_stack(unsigned long bytes) {
+    void *p = __builtin_alloca(bytes);
+    rt_wipe(p, bytes);
+}
+
+/* rho_kernel_zeroize: every byte of kept scratch, then the stack. The
+ * scratch stays allocated, so the next call needs no new pages. */
+void rho_rt_zeroize(unsigned long stack_bytes) {
+    for (long i = 0; i < rt_scratch_count; i++) rt_wipe(rt_scratch[i], rt_scratch_bytes[i]);
+    rt_burn_stack(stack_bytes);
 }
 
 #if defined(_WIN32)

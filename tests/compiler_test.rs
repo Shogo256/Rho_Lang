@@ -1084,6 +1084,25 @@ fn test_the_analysis_states_the_output_range() {
 }
 
 #[test]
+fn test_a_deep_chain_of_flows_is_analysed_within_a_limit() {
+    // Each flow reads the last one four times, so substituting definitions
+    // whole builds 4^24 nodes; seven NTT layers ran out of memory that way.
+    // Past the limit a space is read as a free value named for its
+    // definition and cell, so the same cell is still the same value: a sum
+    // of squares stays provably non-negative however deep the chain.
+    let mut source = String::from("{\n    INPUT:◯ □ 8\n    INPUT → X0\n");
+    for i in 1..=24 {
+        let p = i - 1;
+        source.push_str(&format!("    ((X{p} × X{p}) + (X{p} × X{p})) → X{i}\n"));
+    }
+    source.push_str("    ! (X24 >= 0)\n    X24 → =\n}\n");
+    let block = parse_rho_program(&source).unwrap();
+    let report = ConstraintSolver::analyze(&block, 0.0);
+    assert_eq!(report.constraints[0].verdict, Verdict::Proved);
+    assert_eq!(report.output_range.lo, 0.0);
+}
+
+#[test]
 fn test_division_by_a_square_plus_one_is_proved_safe() {
     // inf / inf is NaN, so endpoint arithmetic alone gave up here and reported
     // an unbounded range. The sign of the quotient is still known.

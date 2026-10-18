@@ -156,9 +156,39 @@ struct Builder<'a> {
     fallback_shape: Vec<usize>,
     tau: f64,
     folds: usize,
+    /// Nodes built, counted to measure a definition's expansion.
+    nodes: usize,
+    /// The definitions read as free values rather than substituted.
+    cut: Vec<bool>,
 }
 
+/// The most nodes a definition may expand to and still be substituted.
+/// Substitution copies a definition into every place that reads it, so a
+/// chain of flows that each read the previous one more than once — the seven
+/// layers of an NTT, say — grows by that factor per flow, and expanding it
+/// whole exhausted memory. A definition past the limit is read as a free
+/// value named for it and the cell: any real, which keeps every bound sound
+/// and loses only the precision that looking further back would have given.
+/// The choice belongs to the definition, not to the order of reading, so
+/// both operands of `X × X` are still the same value and still a square.
+const EXPANSION_LIMIT: usize = 1 << 14;
+
 impl Builder<'_> {
+    /// Decide, in source order, which definitions are too large to
+    /// substitute. Each is measured with the earlier decisions in force, so
+    /// a measurement costs at most its reads times the limit.
+    fn decide_cuts(&mut self) {
+        let defs = self.defs;
+        for (idx, (_, def)) in defs.iter().enumerate() {
+            if self.looped[idx] {
+                continue;
+            }
+            self.nodes = 0;
+            let _ = self.build(def, idx, 0);
+            self.cut[idx] = self.nodes > EXPANSION_LIMIT;
+        }
+    }
+
     /// Whether `name`, read while expanding definition `at`, is that
     /// definition's own iterate rather than an earlier flow's value.
     fn is_iterate_of(&self, at: usize, name: &str) -> bool {
@@ -182,6 +212,7 @@ impl Builder<'_> {
     /// `offset`. Substituting a space always moves to an earlier flow, so the
     /// recursion is bounded by the number of flows.
     fn build(&mut self, expr: &Expr, before: usize, offset: i64) -> Sym {
+        self.nodes += 1;
         match expr {
             Expr::Number(v) => Sym::Const(*v),
             Expr::Var(name) if is_tau(name) => Sym::Const(self.tau),
@@ -193,6 +224,12 @@ impl Builder<'_> {
                 }
                 match self.definition(name, before) {
                     Some((idx, _)) if self.looped[idx] => self.iterate_value(idx, name, offset),
+                    // The definition's index is in the name, so two
+                    // definitions of one space are never taken for the same
+                    // value; the same cell of one definition is, rightly.
+                    Some((idx, _)) if self.cut[idx] => {
+                        Sym::Free(format!("{name}#{idx}@{}", offset_tag(offset)))
+                    }
                     Some((idx, def)) => self.build(&def, idx, offset),
                     None => Sym::Free(format!("{name}@{offset}")),
                 }
@@ -461,7 +498,10 @@ pub fn expand(block: &ToposBlock, tau: f64) -> Expansion {
         fallback_shape,
         tau,
         folds: 0,
+        nodes: 0,
+        cut: vec![false; defs_snapshot.len()],
     };
+    builder.decide_cuts();
 
     // One entry per division written in the source, with its denominator
     // expanded in the context of the flow that performs it.

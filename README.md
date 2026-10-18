@@ -3,6 +3,14 @@
 [![CI](https://github.com/Escoffier1156/Rho_Lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Escoffier1156/Rho_Lang/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
+```
+   _ __
+  | '_ \      ρ (RHO) 1.0.0
+  | |_) |     an array language in the line of APL
+  | .__/      one source → a native kernel, a JAX module, a circuit
+  |_|
+```
+
 **An array language in the line of APL, compiled to native kernels.**
 
 ρ writes computation over whole arrays — no indices, no loops. A shift reads a

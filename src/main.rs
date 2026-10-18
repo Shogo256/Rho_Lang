@@ -7,10 +7,25 @@ use rho_lang::solver::{ConstraintSolver, Verdict};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// The glyph, as the terminal draws it. Shown by `rhoc` on its own, at the
+/// top of `--help`, and at the start of every compile.
+const BANNER: &str = r#"
+   _ __
+  | '_ \      ρ (RHO)
+  | |_) |     an array language in the line of APL
+  | .__/      one source → a native kernel, a JAX module, a circuit
+  |_|
+"#;
+
+fn banner() -> String {
+    BANNER.replace("ρ (RHO)", concat!("ρ (RHO) ", env!("CARGO_PKG_VERSION")))
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "rhoc")]
 #[command(version)]
-#[command(about = "ρ (RHO) Language Compiler - Time-eliminated topological dataflow driver", long_about = None)]
+#[command(before_help = BANNER)]
+#[command(about = "Compile a ρ program to a native kernel, and run it, or write it as JAX or a circuit", long_about = None)]
 struct Args {
     /// Input .rho source file
     #[arg(required = true)]
@@ -92,6 +107,14 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
+    // `rhoc` alone: the glyph and the one line that gets someone started.
+    if std::env::args_os().len() == 1 {
+        print!("{}", banner());
+        println!("  usage: rhoc program.rho [--run INPUT=file] [--emit-jax m.py] [--emit-sv dir]");
+        println!("         rhoc --help for every flag");
+        println!();
+        return Ok(());
+    }
     let args = Args::parse();
     match run(&args) {
         Ok(()) => Ok(()),
@@ -120,9 +143,7 @@ fn fmt_bound(v: f64) -> String {
 
 fn run(args: &Args) -> anyhow::Result<()> {
 
-    println!("=====================================================");
-    println!("  ρ (RHO) Language Compiler v{}", env!("CARGO_PKG_VERSION"));
-    println!("=====================================================");
+    print!("{}", banner());
 
     let source_code = fs::read_to_string(&args.input)
         .map_err(|e| anyhow::anyhow!("Failed to read source file: {}", e))?;

@@ -235,7 +235,7 @@ the wiki's Syntax Reference lists them all.
 
 | Symbol | Signature | Purpose |
 |---|---|---|
-| `rho_kernel_exec_spaces` | `void (void **spaces)` | One pointer per space, in the order `rho_kernel_metadata()` lists them. Inputs must be given; a null intermediate is the kernel's own |
+| `rho_kernel_exec_spaces` | `void (void **spaces)` | One pointer per space, in the order `rho_kernel_metadata()` lists them. Inputs must be given; a null intermediate is the kernel's own, and a null fused one is never stored |
 | `rho_kernel_exec_with_args` | `void (const double *in, double *out)` | The two-pointer form; buffers hold `rho_kernel_element_count()` values |
 | `rho_kernel_exec_bounded` | `void (const double *in, double *out, int64_t n)` | Same, clamped to `n` cells |
 | `rho_kernel_metadata` | `const char * (void)` | JSON: every space's name, shape and role, the loop's cap and tolerance, and `reentrant`: whether two threads may call the kernel at once (true unless it keeps scratch between calls) |

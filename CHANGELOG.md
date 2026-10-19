@@ -64,6 +64,11 @@ needs.
   are now on the call's stack and handed down; a sweep split across the
   pool takes the pool for itself until it is done. The metadata says
   `"reentrant"`, true unless the kernel keeps scratch between calls.
+- **A fused space takes no memory unless passed.** Every entrypoint gave
+  every intermediate a buffer, fused ones included, which are computed
+  inside their reader and never stored: ML-KEM's matrix-vector product for
+  k = 4 used 2.1 MB of stack, more than a thread is given by default, and
+  uses 222 KB.
 
 ## 1.0.0 — 2026-09-14
 

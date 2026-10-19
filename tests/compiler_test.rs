@@ -5366,3 +5366,33 @@ fn test_calls_at_once_each_have_their_own_table() {
     assert!(ir.contains("reentrant\\22:false"), "{ir}");
 }
 
+#[test]
+fn test_a_fused_space_takes_no_memory_unless_passed() {
+    // A is fused into the output's sweep: computed there, never stored, so
+    // no entrypoint gives it a buffer. Passed through exec_spaces, it is
+    // computed into the caller's.
+    let source = "{\n    X:◯ □ 4 64\n    (X × 2.0) → A\n    (A + 1.0) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let mut codegen = LlvmCodeGen::new("fused_stack");
+    let ir = codegen.generate_llvm_ir(&block).unwrap();
+    assert!(!ir.contains("%A_own = alloca") && !ir.contains("%A_buf = alloca"), "{ir}");
+    let x: Vec<f64> = (0..256).map(|i| i as f64 * 0.5).collect();
+    let mut env: Env<f64> = Env::new();
+    env.insert("X".to_string(), Grid::from(vec![4, 64], x.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap();
+    let so_path = "target/fused_stack.so";
+    codegen.compile_to_so(&ir, so_path).unwrap();
+    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
+    let spaces: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> = unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+    // Spaces in metadata order: A, OUTPUT, X.
+    for pass_a in [false, true] {
+        let mut a = vec![0.0f64; 256];
+        let mut out = vec![0.0f64; 256];
+        let table = [if pass_a { a.as_mut_ptr() } else { std::ptr::null_mut() }, out.as_mut_ptr(), x.as_ptr() as *mut f64];
+        unsafe { spaces(table.as_ptr()) };
+        assert_eq!(bits(&out), bits(&meant["OUTPUT"].cells), "passed A: {pass_a}");
+        if pass_a {
+            assert_eq!(bits(&a), bits(&meant["A"].cells));
+        }
+    }
+}

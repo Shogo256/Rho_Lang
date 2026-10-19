@@ -1030,6 +1030,13 @@ impl LlvmCodeGen {
                 continue;
             }
 
+            // A fused space is computed inside its reader; through an
+            // entrypoint that cannot pass it, it is never stored.
+            if self.fused.contains_key(name) {
+                map.insert(name.clone(), "null".to_string());
+                continue;
+            }
+
             let count = shape.iter().product::<usize>().max(1);
             let label = format!("{sanitized}_buf");
             let sym = self.emit_scratch(ir, &label, count, &mut heap);
@@ -1224,6 +1231,12 @@ impl LlvmCodeGen {
         let mut heap = Vec::new();
         let mut null_flags: BTreeMap<String, String> = BTreeMap::new();
         for (name, arg, flag) in optional {
+            // A fused space the caller did not pass is computed inside its
+            // reader and never stored: it needs no memory, and gets none.
+            if self.fused.contains_key(&name) {
+                null_flags.insert(name, flag);
+                continue;
+            }
             let ident = self.sanitize_ident(&name);
             let count = self.space_shapes[&name].iter().product::<usize>().max(1);
             let own = self.emit_scratch(ir, &format!("{ident}_own"), count, &mut heap);

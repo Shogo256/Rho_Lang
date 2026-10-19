@@ -4647,7 +4647,9 @@ fn test_a_sweep_split_across_threads_gives_the_same_bits() {
         .unwrap();
     let parts = ir.matches("define internal void @rho_part").count();
     assert_eq!(parts, 7, "{ir}");
-    assert!(ir.contains("@rho_partial"), "{ir}");
+    // The parts' largest moves are kept in the call's own frame.
+    assert!(ir.contains("%rho.partial.p = alloca"), "{ir}");
+    assert!(!ir.contains("@rho_partial"), "{ir}");
     // The bounded entrypoint keeps its inline, single-thread loops.
     let bounded = ir
         .split("define void @rho_kernel_exec_bounded")
@@ -5250,10 +5252,11 @@ fn test_explain_counts_a_circuits_products() {
 
 #[test]
 fn test_a_parts_loads_come_in_slot_order() {
-    // A part loads the pointers it needs from @rho_ctx at its entry. The
-    // folds among them were keyed by their node's address, so their order
-    // followed the allocator: the same program could give other IR from a
-    // build that allocated differently. The loads now come in slot order.
+    // A part loads the pointers it needs from the call's table at its
+    // entry, `%cS` from slot S. The folds among them were keyed by their
+    // node's address, so their order followed the allocator: the same
+    // program could give other IR from a build that allocated differently.
+    // The loads now come in slot order.
     let source = "{\n    INPUT:◯ □ 6 8\n    (exp INPUT) → E\n    (E / (□1 (◇+1 E))) → N\n    (N + (□0 (◈+0 N)) + (□1 (◇>1 N))) → =\n}";
     let block = parse_rho_program(source).unwrap();
     let ir = LlvmCodeGen::new("slot_order").generate_llvm_ir(&block).unwrap();
@@ -5262,9 +5265,10 @@ fn test_a_parts_loads_come_in_slot_order() {
         let slots: Vec<usize> = part
             .lines()
             .skip(2)
-            .take_while(|l| l.contains("= load ptr, ptr getelementptr (ptr, ptr @rho_ctx"))
-            .map(|l| l.rsplit("i64 ").next().unwrap().trim_end_matches(')').parse().unwrap())
+            .take_while(|l| l.contains("getelementptr ptr, ptr %rho.ctx") || l.contains("= load ptr, ptr %ctx."))
+            .filter_map(|l| l.trim().strip_prefix("%c")?.split(" = load").next()?.parse().ok())
             .collect();
+        assert!(!slots.is_empty(), "{part}");
         assert!(slots.windows(2).all(|w| w[0] < w[1]), "{slots:?}\n{part}");
         parts += 1;
     }
@@ -5308,3 +5312,57 @@ fn test_the_circuit_fuses_intermediates_and_computes_a_part_once() {
     let run = simulate(&circuit, std::path::Path::new("target/sv_fused_fixed"), &[x, y]).unwrap();
     assert_eq!(bits(&run.output), bits(&fixed), "fixed");
 }
+
+#[test]
+fn test_calls_at_once_each_have_their_own_table() {
+    // The pointers a kernel's sweeps read, its parts' partial results and
+    // its record of passed spaces are the call's own, on its stack: eight
+    // threads calling one kernel at once, each on its own grid, get what a
+    // call alone gets. Once with the sweeps on the caller, once split
+    // across a pool of four (grain 64), which the calls then take in turn.
+    let source = r#"{
+        INPUT:◯ □ 64 80
+        INPUT → X
+        (◇+1 X) → ROW
+        ((▷0X + ▽0X + ▷1X + ▽1X) / 4.0) → M
+        ((M × 0.5) + (INPUT × 0.25) + ((□1 ROW) / 80.0)) ⇒ X
+        (X + (◈+1 X)) → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let cells = 64 * 80;
+    for (threads, grain) in [(1, 16384), (4, 64)] {
+        let name = format!("reentrant_{threads}");
+        let mut codegen = LlvmCodeGen::new(&name).with_tau(1e-10).with_max_sweeps(100).with_threads(threads).with_grain(grain);
+        let ir = codegen.generate_llvm_ir(&block).unwrap();
+        assert!(ir.contains("reentrant\\22:true"), "{ir}");
+        assert!(!ir.contains("@rho_ctx"), "{ir}");
+        let so_path = format!("target/{name}.so");
+        codegen.compile_to_so(&ir, &so_path).unwrap();
+        let grids: Vec<Vec<f64>> = (0..8).map(|t| (0..cells).map(|i| ((i as f64) * 0.37 + t as f64).sin()).collect()).collect();
+        let alone: Vec<Vec<u64>> = grids.iter().map(|g| bits(&run_iterating(&so_path, g, cells).0)).collect();
+        assert!(alone.windows(2).all(|w| w[0] != w[1]));
+        let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
+        let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
+            unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+        std::thread::scope(|s| {
+            for (grid, want) in grids.iter().zip(&alone) {
+                let (func, name) = (&func, &name);
+                s.spawn(move || {
+                    for _ in 0..20 {
+                        let mut out = vec![0.0f64; cells];
+                        unsafe { func(grid.as_ptr(), out.as_mut_ptr()) };
+                        assert_eq!(&bits(&out), want, "{name}");
+                    }
+                });
+            }
+        });
+    }
+
+    // Scratch kept between calls is the kernel's one copy: such a kernel
+    // says it is not reentrant.
+    let big = parse_rho_program("{\n    INPUT:◯ □ 100 100\n    (INPUT × 2.0) → A\n    (A + (◇+1 A)) → =\n}").unwrap();
+    let ir = LlvmCodeGen::new("kept").generate_llvm_ir(&big).unwrap();
+    assert!(ir.contains("scratch kept between calls"), "{ir}");
+    assert!(ir.contains("reentrant\\22:false"), "{ir}");
+}
+

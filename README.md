@@ -238,8 +238,8 @@ the wiki's Syntax Reference lists them all.
 | `rho_kernel_exec_spaces` | `void (void **spaces)` | One pointer per space, in the order `rho_kernel_metadata()` lists them. Inputs must be given; a null intermediate is the kernel's own |
 | `rho_kernel_exec_with_args` | `void (const double *in, double *out)` | The two-pointer form; buffers hold `rho_kernel_element_count()` values |
 | `rho_kernel_exec_bounded` | `void (const double *in, double *out, int64_t n)` | Same, clamped to `n` cells |
-| `rho_kernel_metadata` | `const char * (void)` | JSON: every space's name, shape and role, and the loop's cap and tolerance |
-| `rho_kernel_sweeps`, `rho_kernel_converged` | `int64_t (void)` | Sweeps the last call's `⇒` took, and whether every one settled |
+| `rho_kernel_metadata` | `const char * (void)` | JSON: every space's name, shape and role, the loop's cap and tolerance, and `reentrant`: whether two threads may call the kernel at once (true unless it keeps scratch between calls) |
+| `rho_kernel_sweeps`, `rho_kernel_converged` | `int64_t (void)` | Sweeps the last call's `⇒` took, and whether every one settled (with calls at once, one of them) |
 | `rho_kernel_element_count` | `int64_t (void)` | The larger of the input's and the output's cell counts |
 | `rho_kernel_exec` | `void (void)` | Zero-copy: runs against the addresses bound with `&[0x…]` or `--bind` |
 | `rho_kernel_zeroize` | `void (void)` | Overwrite the scratch kept between calls and the stack an entrypoint's frame used; call it from where the kernel was called, before letting secrets go |

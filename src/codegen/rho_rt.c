@@ -9,6 +9,11 @@
  * called in a tight loop pays no wake-up and one that is idle costs nothing.
  * A sweep shorter than the grain — what the kernel was compiled with, 16384
  * cells unless said otherwise, or RHO_GRAIN — runs on the caller alone.
+ *
+ * Two calls of a kernel may run at once, from two threads of the caller:
+ * each hands its parts its own table of pointers (`ctx`), a sweep on the
+ * caller alone touches nothing shared, and a sweep split across the pool
+ * takes the pool for itself until it is done.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -60,13 +65,13 @@ void rho_rt_zeroize(unsigned long stack_bytes) {
 
 #if defined(_WIN32)
 
-typedef void (*rho_part_fn)(long lo, long hi, long part);
-static long rt_parts = 1;
-void rho_rt_run(rho_part_fn fn, long n, long threads, long grain) {
+typedef void (*rho_part_fn)(long lo, long hi, long part, void *ctx);
+static _Thread_local long rt_parts = 1;
+void rho_rt_run(rho_part_fn fn, void *ctx, long n, long threads, long grain) {
     (void)threads;
     (void)grain;
     rt_parts = 1;
-    if (n > 0) fn(0, n, 0);
+    if (n > 0) fn(0, n, 0, ctx);
 }
 long rho_rt_parts(void) { return rt_parts; }
 
@@ -78,13 +83,17 @@ long rho_rt_parts(void) { return rt_parts; }
 #include <stdlib.h>
 #include <unistd.h>
 
-typedef void (*rho_part_fn)(long lo, long hi, long part);
+typedef void (*rho_part_fn)(long lo, long hi, long part, void *ctx);
 
 #define RT_MAX_THREADS 256
 #define RT_SPINS 50000
 
-static long rt_threads;          /* 0 until the count is settled */
-static long rt_grain = 16384;
+static atomic_long rt_threads;   /* 0 until the count is settled */
+static long rt_grain = 16384;    /* written before rt_threads is */
+static pthread_mutex_t rt_settle_mu = PTHREAD_MUTEX_INITIALIZER;
+/* Held by the caller whose sweep is on the pool, from publishing it until
+ * every part is done: the pool runs one sweep at a time. */
+static pthread_mutex_t rt_run_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t rt_workers[RT_MAX_THREADS];
 static long rt_made;             /* workers running */
 static atomic_int rt_quit;       /* set when the kernel is being unloaded */
@@ -100,7 +109,10 @@ static atomic_ulong rt_word;
 static atomic_long rt_gen;       /* what sleeping workers wait on */
 static atomic_long rt_remaining; /* parts of the current sweep not yet done */
 static rho_part_fn rt_fn;
-static long rt_n, rt_parts, rt_chunk;
+static void *rt_ctx;
+static long rt_n, rt_chunk;
+/* How many parts the calling thread's last run was split into. */
+static _Thread_local long rt_parts;
 
 static void rt_take_parts(unsigned long gen) {
     for (;;) {
@@ -117,7 +129,7 @@ static void rt_take_parts(unsigned long gen) {
         long lo = p * rt_chunk;
         long hi = lo + rt_chunk;
         if (hi > rt_n) hi = rt_n;
-        if (lo < hi) rt_fn(lo, hi, p);
+        if (lo < hi) rt_fn(lo, hi, p, rt_ctx);
         atomic_fetch_sub_explicit(&rt_remaining, 1, memory_order_acq_rel);
     }
 }
@@ -167,49 +179,65 @@ static long rt_env(const char *name, long fallback) {
     return v > 0 ? v : fallback;
 }
 
-/* Settle how many threads to use; the workers are made when first needed. */
-static void rt_settle(long compiled, long grain) {
-    long n = rt_env("RHO_THREADS", compiled);
-    if (n <= 0) n = sysconf(_SC_NPROCESSORS_ONLN);
-    if (n <= 0) n = 1;
-    if (n > RT_MAX_THREADS) n = RT_MAX_THREADS;
-    rt_grain = rt_env("RHO_GRAIN", grain > 0 ? grain : rt_grain);
-    rt_threads = n;
+/* Settle how many threads to use, once; the workers are made when first
+ * needed. */
+static long rt_settle(long compiled, long grain) {
+    pthread_mutex_lock(&rt_settle_mu);
+    long n = atomic_load_explicit(&rt_threads, memory_order_acquire);
+    if (n == 0) {
+        n = rt_env("RHO_THREADS", compiled);
+        if (n <= 0) n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n <= 0) n = 1;
+        if (n > RT_MAX_THREADS) n = RT_MAX_THREADS;
+        rt_grain = rt_env("RHO_GRAIN", grain > 0 ? grain : rt_grain);
+        atomic_store_explicit(&rt_threads, n, memory_order_release);
+    }
+    pthread_mutex_unlock(&rt_settle_mu);
+    return n;
 }
 
+/* Under rt_run_mu. */
 static void rt_start(void) {
-    for (long i = 1; i < rt_threads; i++) {
+    long want = atomic_load_explicit(&rt_threads, memory_order_acquire);
+    for (long i = 1; i < want; i++) {
         if (pthread_create(&rt_workers[rt_made], 0, rt_worker, 0) != 0) break;
         rt_made++;
     }
-    rt_threads = rt_made + 1; /* as many as could be made */
+    /* as many as could be made */
+    atomic_store_explicit(&rt_threads, rt_made + 1, memory_order_release);
 }
 
-/* Run fn over [0, n) in parts, on the pool and the calling thread. Returns
- * when every part has finished. */
-void rho_rt_run(rho_part_fn fn, long n, long threads, long grain) {
+/* Run fn over [0, n) in parts, on the pool and the calling thread, each
+ * part given ctx, the calling kernel's table. Returns when every part has
+ * finished. */
+void rho_rt_run(rho_part_fn fn, void *ctx, long n, long threads, long grain) {
     if (n <= 0) {
         rt_parts = 0;
         return;
     }
-    if (rt_threads == 0) rt_settle(threads, grain);
-    if (rt_threads == 1 || n < rt_grain) {
+    long th = atomic_load_explicit(&rt_threads, memory_order_acquire);
+    if (th == 0) th = rt_settle(threads, grain);
+    if (th == 1 || n < rt_grain) {
         rt_parts = 1;
-        fn(0, n, 0);
+        fn(0, n, 0, ctx);
         return;
     }
+    pthread_mutex_lock(&rt_run_mu);
     if (rt_made == 0) rt_start();
-    if (rt_threads == 1) {
+    th = atomic_load_explicit(&rt_threads, memory_order_acquire);
+    if (th == 1) {
+        pthread_mutex_unlock(&rt_run_mu);
         rt_parts = 1;
-        fn(0, n, 0);
+        fn(0, n, 0, ctx);
         return;
     }
     /* Parts of a whole number of 64-cell lines: a boundary that is a
      * multiple of the vector width keeps most of every part in its body. */
-    long chunk = (n + rt_threads - 1) / rt_threads;
+    long chunk = (n + th - 1) / th;
     chunk = (chunk + 63) & ~63L;
     long parts = (n + chunk - 1) / chunk;
     rt_fn = fn;
+    rt_ctx = ctx;
     rt_n = n;
     rt_chunk = chunk;
     rt_parts = parts;
@@ -224,10 +252,11 @@ void rho_rt_run(rho_part_fn fn, long n, long threads, long grain) {
     rt_take_parts(gen);
     while (atomic_load_explicit(&rt_remaining, memory_order_acquire) != 0)
         sched_yield();
+    pthread_mutex_unlock(&rt_run_mu);
 }
 
-/* How many parts the last run was split into: the partial results a sweep
- * left behind are indexed by part. */
+/* How many parts the calling thread's last run was split into: the partial
+ * results a sweep left behind are indexed by part. */
 long rho_rt_parts(void) { return rt_parts; }
 
 #endif

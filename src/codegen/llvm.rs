@@ -12,6 +12,9 @@ use std::process::Command;
 const RUNTIME_C: &str = include_str!("rho_rt.c");
 /// The most parts one sweep is split into; the runtime caps its threads here.
 const MAX_PARTS: usize = 256;
+/// Stands in an entrypoint for the length of the call's table of pointers,
+/// which is known once the whole module has been emitted.
+const CTX_SLOTS: &str = "@@rho_ctx_slots@@";
 
 /// Spaces larger than this are heap-allocated instead of living on the stack,
 /// so a 1024x1024 grid cannot blow the 8 MB default stack.
@@ -218,12 +221,17 @@ pub struct LlvmCodeGen {
     /// takes a range [lo, hi) and a part number, and the runtime hands every
     /// thread its own. Appended after the entrypoints.
     outlined: RefCell<String>,
-    /// Slot in @rho_ctx of every pointer an outlined function may need, by
-    /// the symbol the function that made it knows it as. The entrypoints
-    /// store the spaces there, the body stores what it allocates, and a
-    /// part loads what it reads.
+    /// Slot in the call's table of every pointer an outlined function may
+    /// need, by the symbol the function that made it knows it as. The
+    /// entrypoints store the spaces there, the body stores what it
+    /// allocates, and a part loads what it reads. The table is on the
+    /// entrypoint's stack and handed down as `%rho.ctx`, so two calls at
+    /// once each have their own: a kernel that keeps no scratch is
+    /// reentrant.
     slots: RefCell<BTreeMap<String, usize>>,
     slot_count: Cell<usize>,
+    /// Names for the instructions that address the table.
+    ctx_tmp: Cell<usize>,
     outlined_count: Cell<usize>,
     /// The globals that hold scratch kept between calls, and their count.
     keeps: RefCell<String>,
@@ -287,6 +295,7 @@ impl LlvmCodeGen {
             outlined: RefCell::new(String::new()),
             slots: RefCell::new(BTreeMap::new()),
             slot_count: Cell::new(0),
+            ctx_tmp: Cell::new(0),
             outlined_count: Cell::new(0),
             keeps: RefCell::new(String::new()),
             keep_count: Cell::new(0),
@@ -490,11 +499,13 @@ impl LlvmCodeGen {
                 .or_insert_with(|| vec![4]);
         }
         self.elements = self.resolve_element_count();
-        // Every space has a slot the entrypoints fill; the body's own
-        // buffers take the slots after them.
+        // Every space has a slot the entrypoints fill, then the call's
+        // partial results and its record of which fused spaces were passed;
+        // the body's own buffers take the slots after them.
         self.outlined.borrow_mut().clear();
         self.slots.borrow_mut().clear();
-        self.slot_count.set(self.space_shapes.len());
+        self.slot_count.set(self.space_shapes.len() + 2);
+        self.ctx_tmp.set(0);
         self.outlined_count.set(0);
 
         let mut ir = String::new();
@@ -551,35 +562,28 @@ impl LlvmCodeGen {
         ir.push_str("declare i64 @llvm.umin.i64(i64, i64)\n");
         // The pool: run a part function over [0, n) split across threads,
         // and say how many parts that was.
-        ir.push_str("declare void @rho_rt_run(ptr, i64, i64, i64)\n");
+        ir.push_str("declare void @rho_rt_run(ptr, ptr, i64, i64, i64)\n");
         ir.push_str("declare ptr @rho_rt_scratch(ptr, i64)\n");
         ir.push_str("declare void @rho_rt_zeroize(i64)\n");
         ir.push_str("declare i64 @rho_rt_parts()\n\n");
-        // What each part of a comparison found: the largest move in its range.
-        ir.push_str(&format!(
-            "@rho_partial = internal global [{MAX_PARTS} x {elem}] zeroinitializer\n"
-        ));
 
         // What the last call's `⇒` loops did: how many sweeps in all, and
         // whether every one of them stopped on the tolerance rather than on
-        // the cap. Internal, so two kernels in one process do not share them.
+        // the cap. Internal, so two kernels in one process do not share them;
+        // atomic, so two calls at once do not race (the record is then one
+        // call's or the other's).
         ir.push_str("@rho_sweeps = internal global i64 0\n");
         ir.push_str("@rho_converged = internal global i64 1\n\n");
 
-        let (meta_escaped, meta_len) = Self::c_string(&self.generate_metadata_json());
-        ir.push_str(&format!(
-            "@.rho_meta_str = private unnamed_addr constant [{meta_len} x i8] c\"{meta_escaped}\", align 1\n\n"
-        ));
-
-
         // 0. The body, once: every entrypoint resolves the spaces to pointers,
-        // stores them in @rho_ctx and calls this. Its sweeps are outlined
-        // into parts the pool runs.
+        // stores them in the call's table and calls this with it. Its sweeps
+        // are outlined into parts the pool runs.
         self.emit_shared_body(block, &mut ir)?;
 
         // 1. Static entrypoint: void @rho_kernel_exec()
         ir.push_str("define void @rho_kernel_exec() #0 {\n");
         ir.push_str("entry:\n");
+        self.emit_frame(&mut ir);
 
         // Every space a flow never writes is read from memory the caller owns,
         // so the entrypoint is only meaningful once all of them are bound. A
@@ -627,6 +631,7 @@ impl LlvmCodeGen {
         // 2. C-ABI entrypoint: void @rho_kernel_exec_with_args(ptr, ptr)
         ir.push_str("define void @rho_kernel_exec_with_args(ptr %in_ptr, ptr %out_ptr) #0 {\n");
         ir.push_str("entry:\n");
+        self.emit_frame(&mut ir);
         ir.push_str("  ; Null pointer safety check\n");
         ir.push_str("  %in_null = icmp eq ptr %in_ptr, null\n");
         ir.push_str("  br i1 %in_null, label %safety_fail, label %exec_start\n\n");
@@ -646,6 +651,7 @@ impl LlvmCodeGen {
             "define void @rho_kernel_exec_bounded(ptr %in_ptr, ptr %out_ptr, i64 %n) #0 {\n",
         );
         ir.push_str("entry:\n");
+        self.emit_frame(&mut ir);
         ir.push_str("  %b_in_null = icmp eq ptr %in_ptr, null\n");
         ir.push_str("  br i1 %b_in_null, label %bounded_fail, label %bounded_start\n\n");
         ir.push_str("bounded_fail:\n");
@@ -696,12 +702,12 @@ impl LlvmCodeGen {
         // reports no sweeps and counts as converged.
         ir.push_str("define i64 @rho_kernel_sweeps() #0 {\n");
         ir.push_str("entry:\n");
-        ir.push_str("  %sweeps = load i64, ptr @rho_sweeps\n");
+        ir.push_str("  %sweeps = load atomic i64, ptr @rho_sweeps monotonic, align 8\n");
         ir.push_str("  ret i64 %sweeps\n");
         ir.push_str("}\n\n");
         ir.push_str("define i64 @rho_kernel_converged() #0 {\n");
         ir.push_str("entry:\n");
-        ir.push_str("  %converged = load i64, ptr @rho_converged\n");
+        ir.push_str("  %converged = load atomic i64, ptr @rho_converged monotonic, align 8\n");
         ir.push_str("  ret i64 %converged\n");
         ir.push_str("}\n\n");
 
@@ -717,22 +723,22 @@ impl LlvmCodeGen {
         ir.push_str("  ret void\n");
         ir.push_str("}\n\n");
 
-        // The parts the pool runs, and the table of pointers they read.
+        // The parts the pool runs, and the scratch kept between calls.
         ir.push_str(&self.outlined.borrow());
-        ir.push_str(&format!(
-            "@rho_ctx = internal global [{} x ptr] zeroinitializer\n",
-            self.slot_count.get().max(1)
-        ));
         ir.push_str(&self.keeps.borrow());
+        ir.push('\n');
+
+        // The metadata last: whether the kernel keeps scratch, and so is
+        // reentrant, is known only now.
+        let (meta_escaped, meta_len) = Self::c_string(&self.generate_metadata_json());
         ir.push_str(&format!(
-            "@rho_given = internal global [{} x i8] zeroinitializer  ; which fused spaces the caller passed\n\n",
-            self.space_shapes.len().max(1)
+            "@.rho_meta_str = private unnamed_addr constant [{meta_len} x i8] c\"{meta_escaped}\", align 1\n\n"
         ));
 
         // No target-cpu pin in the IR: clang is told the machine, or not.
         ir.push_str("attributes #0 = { nounwind uwtable }\n");
 
-        Ok(ir)
+        Ok(ir.replace(CTX_SLOTS, &self.slot_count.get().to_string()))
     }
 
     // ---------------------------------------------------------------- shapes
@@ -846,13 +852,14 @@ impl LlvmCodeGen {
                 None => "0".to_string(),
             };
             ir.push_str(&format!(
-                "  store i8 {value}, ptr getelementptr ([{n} x i8], ptr @rho_given, i64 0, i64 {slot})\n"
+                "  %{ident}_gat = getelementptr [{n} x i8], ptr %rho.given.p, i64 0, i64 {slot}\n"
             ));
+            ir.push_str(&format!("  store i8 {value}, ptr %{ident}_gat\n"));
         }
     }
 
     /// A fused space's own sweep, run only when the caller asked for the
-    /// space: the test on @rho_given and the blocks around the sweep.
+    /// space: the test on the call's record and the blocks around the sweep.
     /// Returns the label the sweep starts in and the one that follows it.
     fn open_given(&self, ir: &mut String, name: &str, label: &str) -> (String, String) {
         let n = self.space_shapes.len().max(1);
@@ -860,8 +867,9 @@ impl LlvmCodeGen {
         let (run, skip) = (format!("{label}.given"), format!("{label}.owned"));
         ir.push_str(&format!("  ; [{name}] is fused into its reader: its own sweep only if the caller passed it\n"));
         ir.push_str(&format!(
-            "  %{label}.g = load i8, ptr getelementptr ([{n} x i8], ptr @rho_given, i64 0, i64 {slot})\n"
+            "  %{label}.gat = getelementptr [{n} x i8], ptr %rho.given.p, i64 0, i64 {slot}\n"
         ));
+        ir.push_str(&format!("  %{label}.g = load i8, ptr %{label}.gat\n"));
         ir.push_str(&format!("  %{label}.gb = icmp ne i8 %{label}.g, 0\n"));
         ir.push_str(&format!("  br i1 %{label}.gb, label %{run}, label %{skip}\n\n{run}:\n"));
         (run, skip)
@@ -1037,8 +1045,45 @@ impl LlvmCodeGen {
         }
     }
 
-    /// Slot of a pointer in @rho_ctx, storing it there the first time. Every
-    /// pointer an outlined part reads goes through here.
+    /// The call's table slot of its partial results (one per part, the
+    /// largest move a part of a `⇒` comparison found).
+    fn partial_slot(&self) -> usize {
+        self.space_shapes.len()
+    }
+
+    /// The call's table slot of its record of which fused spaces the caller
+    /// passed.
+    fn given_slot(&self) -> usize {
+        self.space_shapes.len() + 1
+    }
+
+    /// The address of slot `slot` of the call's table, as an instruction
+    /// appended to `ir` (the table is not a constant, so neither is it).
+    fn ctx_slot(&self, ir: &mut String, slot: usize) -> String {
+        let n = self.ctx_tmp.get();
+        self.ctx_tmp.set(n + 1);
+        ir.push_str(&format!("  %ctx.{n} = getelementptr ptr, ptr %rho.ctx, i64 {slot}\n"));
+        format!("%ctx.{n}")
+    }
+
+    /// The start of every entrypoint: the call's table, its partial results
+    /// and its record of passed spaces, on its own stack, so that calls at
+    /// once do not share them. The table's length is known when the whole
+    /// module is (`CTX_SLOTS` is replaced then).
+    fn emit_frame(&self, ir: &mut String) {
+        let elem = self.precision.llvm_type();
+        let n = self.space_shapes.len().max(1);
+        ir.push_str(&format!("  %rho.ctx = alloca [{CTX_SLOTS} x ptr], align 8\n"));
+        ir.push_str(&format!("  %rho.partial.p = alloca [{MAX_PARTS} x {elem}], align 64\n"));
+        ir.push_str(&format!("  %rho.given.p = alloca [{n} x i8], align 8\n"));
+        let at = self.ctx_slot(ir, self.partial_slot());
+        ir.push_str(&format!("  store ptr %rho.partial.p, ptr {at}\n"));
+        let at = self.ctx_slot(ir, self.given_slot());
+        ir.push_str(&format!("  store ptr %rho.given.p, ptr {at}\n"));
+    }
+
+    /// Slot of a pointer in the call's table, storing it there the first
+    /// time. Every pointer an outlined part reads goes through here.
     fn share(&self, ir: &mut String, sym: &str) -> usize {
         if let Some(&slot) = self.slots.borrow().get(sym) {
             return slot;
@@ -1046,15 +1091,14 @@ impl LlvmCodeGen {
         let slot = self.slot_count.get();
         self.slot_count.set(slot + 1);
         self.slots.borrow_mut().insert(sym.to_string(), slot);
-        ir.push_str(&format!(
-            "  store ptr {sym}, ptr getelementptr (ptr, ptr @rho_ctx, i64 {slot})\n"
-        ));
+        let at = self.ctx_slot(ir, slot);
+        ir.push_str(&format!("  store ptr {sym}, ptr {at}\n"));
         slot
     }
 
-    /// Open a part function: `void (i64 lo, i64 hi, i64 part)`. Its prologue
-    /// loads every pointer in `bufs` (and `extra`) from @rho_ctx, so the
-    /// body emitted into it reads like the caller's. Returns the function's
+    /// Open a part function: `void (i64 lo, i64 hi, i64 part, ptr ctx)`. Its
+    /// prologue loads every pointer in `bufs` (and `extra`) from the call's
+    /// table, so the body emitted into it reads like the caller's. Returns the function's
     /// name, its text so far, the buffers as seen from inside, and the
     /// translation of every symbol.
     fn open_part(
@@ -1066,7 +1110,7 @@ impl LlvmCodeGen {
         self.outlined_count.set(id);
         let name = format!("@rho_part{id}");
         let mut f = format!(
-            "define internal void {name}(i64 %lo, i64 %hi, i64 %part) #0 {{\nentry:\n"
+            "define internal void {name}(i64 %lo, i64 %hi, i64 %part, ptr %rho.ctx) #0 {{\nentry:\n"
         );
         let mut translated: BTreeMap<String, String> = BTreeMap::new();
         let mut loaded: BTreeSet<usize> = BTreeSet::new();
@@ -1091,10 +1135,11 @@ impl LlvmCodeGen {
         // In slot order: the folds are keyed by their node's address, so
         // the order they come in follows the allocator, and the IR must not.
         for slot in &loaded {
-            f.push_str(&format!(
-                "  %c{slot} = load ptr, ptr getelementptr (ptr, ptr @rho_ctx, i64 {slot})\n"
-            ));
+            let at = self.ctx_slot(&mut f, *slot);
+            f.push_str(&format!("  %c{slot} = load ptr, ptr {at}\n"));
         }
+        let at = self.ctx_slot(&mut f, self.partial_slot());
+        f.push_str(&format!("  %rho.partial.p = load ptr, ptr {at}\n"));
         let inner = Buffers {
             map: bufs.map.iter().map(|(k, v)| (k.clone(), translated[v].clone())).collect(),
             folds: bufs.folds.iter().map(|(k, v)| (*k, translated[v].clone())).collect(),
@@ -1110,7 +1155,7 @@ impl LlvmCodeGen {
         f.push_str("  ret void\n}\n\n");
         self.outlined.borrow_mut().push_str(&f);
         ir.push_str(&format!(
-            "  call void @rho_rt_run(ptr {name}, i64 {total}, i64 {}, i64 {})\n",
+            "  call void @rho_rt_run(ptr {name}, ptr %rho.ctx, i64 {total}, i64 {}, i64 {})\n",
             self.threads, self.grain
         ));
     }
@@ -1128,6 +1173,7 @@ impl LlvmCodeGen {
     fn emit_spaces_entrypoint(&self, ir: &mut String) -> Result<()> {
         ir.push_str("define void @rho_kernel_exec_spaces(ptr %spaces) #0 {\n");
         ir.push_str("entry:\n");
+        self.emit_frame(ir);
         ir.push_str("  %spaces_null = icmp eq ptr %spaces, null\n");
         ir.push_str("  br i1 %spaces_null, label %spaces_fail, label %spaces_load\n\n");
         ir.push_str("spaces_fail:\n");
@@ -1204,32 +1250,34 @@ impl LlvmCodeGen {
         let bufs = self.emit_buffers(ir, provided, heap, &self.elements.to_string());
         for (slot, name) in self.space_shapes.keys().enumerate() {
             if let Some(sym) = bufs.map.get(name) {
-                ir.push_str(&format!(
-                    "  store ptr {sym}, ptr getelementptr (ptr, ptr @rho_ctx, i64 {slot})\n"
-                ));
+                let at = self.ctx_slot(ir, slot);
+                ir.push_str(&format!("  store ptr {sym}, ptr {at}\n"));
             }
         }
-        ir.push_str("  call void @rho_body()\n");
+        ir.push_str("  call void @rho_body(ptr %rho.ctx)\n");
         for ptr in &bufs.heap {
             ir.push_str(&format!("  call void @free(ptr {ptr})\n"));
         }
         ir.push_str("  ret void\n");
     }
 
-    /// The flows, once, reading the spaces from @rho_ctx. Every sweep in it
-    /// is outlined into a part and run on the pool.
+    /// The flows, once, reading the spaces from the call's table. Every
+    /// sweep in it is outlined into a part and run on the pool.
     fn emit_shared_body(&self, block: &ToposBlock, ir: &mut String) -> Result<()> {
-        ir.push_str("define internal void @rho_body() #0 {\n");
+        ir.push_str("define internal void @rho_body(ptr %rho.ctx) #0 {\n");
         ir.push_str("entry:\n");
         let mut map = BTreeMap::new();
         for (slot, name) in self.space_shapes.keys().enumerate() {
             let sym = format!("%sp{slot}");
-            ir.push_str(&format!(
-                "  {sym} = load ptr, ptr getelementptr (ptr, ptr @rho_ctx, i64 {slot})  ; [{name}]\n"
-            ));
+            let at = self.ctx_slot(ir, slot);
+            ir.push_str(&format!("  {sym} = load ptr, ptr {at}  ; [{name}]\n"));
             self.slots.borrow_mut().insert(sym.clone(), slot);
             map.insert(name.clone(), sym);
         }
+        let at = self.ctx_slot(ir, self.partial_slot());
+        ir.push_str(&format!("  %rho.partial.p = load ptr, ptr {at}\n"));
+        let at = self.ctx_slot(ir, self.given_slot());
+        ir.push_str(&format!("  %rho.given.p = load ptr, ptr {at}\n"));
         let mut bufs = Buffers {
             map,
             folds: BTreeMap::new(),
@@ -1237,8 +1285,8 @@ impl LlvmCodeGen {
             bound: self.elements.to_string(),
             parallel: true,
         };
-        ir.push_str("  store i64 0, ptr @rho_sweeps\n");
-        ir.push_str("  store i64 1, ptr @rho_converged\n");
+        ir.push_str("  store atomic i64 0, ptr @rho_sweeps monotonic, align 8\n");
+        ir.push_str("  store atomic i64 1, ptr @rho_converged monotonic, align 8\n");
         let mut counter = 0usize;
         self.notes.borrow_mut().clear();
         self.recording.set(true);
@@ -1264,8 +1312,8 @@ impl LlvmCodeGen {
     ) -> Result<()> {
         let mut bufs = self.emit_buffers(ir, provided, heap, bound);
         // Every call starts its iteration record afresh.
-        ir.push_str("  store i64 0, ptr @rho_sweeps\n");
-        ir.push_str("  store i64 1, ptr @rho_converged\n");
+        ir.push_str("  store atomic i64 0, ptr @rho_sweeps monotonic, align 8\n");
+        ir.push_str("  store atomic i64 1, ptr @rho_converged monotonic, align 8\n");
         let mut counter = 0usize;
         self.emit_flows(&block.statements, ir, &mut bufs, entry_label, &mut counter)?;
         for ptr in &bufs.heap {
@@ -1416,7 +1464,7 @@ impl LlvmCodeGen {
             // A round's sweep measures its largest move as it goes: one
             // accumulator for the scalar cells, one of lanes for the vector
             // body, both in the part's own frame, reduced into its slot of
-            // @rho_partial when the range is done.
+            // the call's partial results when the range is done.
             let elem = self.precision.llvm_type();
             let width = match plan {
                 Sweep::Split { width, .. } => width,
@@ -1558,7 +1606,7 @@ impl LlvmCodeGen {
                     acc = next;
                 }
                 f.push_str(&format!(
-                    "  %{label}.mslot = getelementptr inbounds {elem}, ptr @rho_partial, i64 %part\n"
+                    "  %{label}.mslot = getelementptr inbounds {elem}, ptr %rho.partial.p, i64 %part\n"
                 ));
                 f.push_str(&format!("  store {elem} {acc}, ptr %{label}.mslot, align {}\n", self.precision.bytes()));
                 // the block above must be entered from the last loop's end
@@ -1737,12 +1785,10 @@ impl LlvmCodeGen {
             ir.push_str(&format!(
                 "  %{label}.nxt = phi ptr [ {next}, %{pred} ], [ %{label}.cur, %{label}.decide ]\n"
             ));
-            ir.push_str(&format!(
-                "  store ptr %{label}.cur, ptr getelementptr (ptr, ptr @rho_ctx, i64 {slot_held})\n"
-            ));
-            ir.push_str(&format!(
-                "  store ptr %{label}.nxt, ptr getelementptr (ptr, ptr @rho_ctx, i64 {slot_next})\n"
-            ));
+            let at = self.ctx_slot(ir, slot_held);
+            ir.push_str(&format!("  store ptr %{label}.cur, ptr {at}\n"));
+            let at = self.ctx_slot(ir, slot_next);
+            ir.push_str(&format!("  store ptr %{label}.nxt, ptr {at}\n"));
         }
         // The prelude's flows first, every round, each a sweep of its own.
         let mut inner_pred = format!("{label}.header");
@@ -1815,7 +1861,7 @@ impl LlvmCodeGen {
             ));
             ir.push_str(&format!("{label}.red.body:\n"));
             ir.push_str(&format!(
-                "  %{label}.pp = getelementptr inbounds {elem}, ptr @rho_partial, i64 %{label}.p\n"
+                "  %{label}.pp = getelementptr inbounds {elem}, ptr %rho.partial.p, i64 %{label}.p\n"
             ));
             ir.push_str(&format!("  %{label}.pd = load {elem}, ptr %{label}.pp, align {align}\n"));
             ir.push_str(&format!(
@@ -1873,22 +1919,20 @@ impl LlvmCodeGen {
             ));
             ir.push_str(&format!("  br label %{label}.fin\n\n"));
             ir.push_str(&format!("{label}.fin:\n"));
-            ir.push_str(&format!(
-                "  store ptr {held}, ptr getelementptr (ptr, ptr @rho_ctx, i64 {slot_held})\n"
-            ));
-            ir.push_str(&format!(
-                "  store ptr {next}, ptr getelementptr (ptr, ptr @rho_ctx, i64 {slot_next})\n"
-            ));
+            let at = self.ctx_slot(ir, slot_held);
+            ir.push_str(&format!("  store ptr {held}, ptr {at}\n"));
+            let at = self.ctx_slot(ir, slot_next);
+            ir.push_str(&format!("  store ptr {next}, ptr {at}\n"));
             landing = format!("{label}.fin");
         }
-        ir.push_str(&format!("  %{label}.s0 = load i64, ptr @rho_sweeps\n"));
+        ir.push_str(&format!("  %{label}.s0 = load atomic i64, ptr @rho_sweeps monotonic, align 8\n"));
         ir.push_str(&format!("  %{label}.s1 = add i64 %{label}.s0, %{label}.k.next\n"));
-        ir.push_str(&format!("  store i64 %{label}.s1, ptr @rho_sweeps\n"));
-        ir.push_str(&format!("  %{label}.c0 = load i64, ptr @rho_converged\n"));
+        ir.push_str(&format!("  store atomic i64 %{label}.s1, ptr @rho_sweeps monotonic, align 8\n"));
+        ir.push_str(&format!("  %{label}.c0 = load atomic i64, ptr @rho_converged monotonic, align 8\n"));
         ir.push_str(&format!(
             "  %{label}.c1 = select i1 %{label}.capped, i64 0, i64 %{label}.c0\n"
         ));
-        ir.push_str(&format!("  store i64 %{label}.c1, ptr @rho_converged\n"));
+        ir.push_str(&format!("  store atomic i64 %{label}.c1, ptr @rho_converged monotonic, align 8\n"));
         Ok(landing)
     }
 
@@ -3920,11 +3964,14 @@ impl LlvmCodeGen {
             ),
             _ => String::new(),
         };
+        // Reentrant: two calls may run at once. Every call has its own table
+        // and stack; scratch kept between calls is the kernel's one copy.
         format!(
-            "{{\"precision\":\"{}\",\"elements\":{},\"threads\":{},\"spaces\":[{}],\"bindings\":[{}]{}}}",
+            "{{\"precision\":\"{}\",\"elements\":{},\"threads\":{},\"reentrant\":{},\"spaces\":[{}],\"bindings\":[{}]{}}}",
             self.precision,
             self.elements,
             self.threads,
+            self.keep_count.get() == 0,
             spaces.join(","),
             bindings.join(","),
             iteration

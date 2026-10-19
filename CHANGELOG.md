@@ -56,6 +56,14 @@ needs.
   byte for byte.
 - **The differential test runs the fused circuit too** (`DIFFTEST_SV=1`,
   in both modes), whenever fusing changes the circuit.
+- **Two threads may call a kernel at once.** An entrypoint stored the
+  spaces' pointers in a table of the library's own, from which its sweeps
+  read them, and kept its parts' partial results and its record of passed
+  spaces there too; two calls at once read each other's (eight threads on
+  one iterating kernel: 988 of 1,600 calls wrong). The table and the rest
+  are now on the call's stack and handed down; a sweep split across the
+  pool takes the pool for itself until it is done. The metadata says
+  `"reentrant"`, true unless the kernel keeps scratch between calls.
 
 ## 1.0.0 — 2026-09-14
 

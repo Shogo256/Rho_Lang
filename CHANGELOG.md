@@ -69,6 +69,14 @@ needs.
   inside their reader and never stored: ML-KEM's matrix-vector product for
   k = 4 used 2.1 MB of stack, more than a thread is given by default, and
   uses 222 KB.
+- **A 64-bit fixed format can be used.** The circuit emitter took
+  `--fixed 64.F`, but the fixed-point interpreter's `Fixed<64, F>` could not
+  be instantiated: the ends of its range, computed in i64, overflowed. They
+  are computed in i128. Rhodium's ML-DSA, whose products reach 2^46, is held
+  to `Fixed<64, 0>` this way.
+- **A roll with no fraction bits is 0** in the interpreter, as in the
+  circuit: `?` in a format like `32.0` shifted its hash by 64, a panic in a
+  debug build and the whole hash in a release one.
 
 ## 1.0.0 — 2026-09-14
 

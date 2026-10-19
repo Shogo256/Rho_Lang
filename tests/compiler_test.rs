@@ -5396,3 +5396,48 @@ fn test_a_fused_space_takes_no_memory_unless_passed() {
         }
     }
 }
+
+#[test]
+fn test_two_kernels_link_into_one_program_as_static_libraries() {
+    // Two kernels share every exported name; --emit-static with a prefix
+    // renames them, so both link into one C program and each computes its
+    // own cells.
+    let add = parse_rho_program("{\n    A:◯ □ 2 4\n    B:◯ □ 2 4\n    (A + B) → =\n}").unwrap();
+    let mul = parse_rho_program("{\n    A:◯ □ 2 4\n    B:◯ □ 2 4\n    (A × B) → =\n}").unwrap();
+    let dir = std::path::Path::new("target/static_link");
+    std::fs::create_dir_all(dir).unwrap();
+    for (block, prefix) in [(&add, "k_add"), (&mul, "k_mul")] {
+        let mut codegen = LlvmCodeGen::new(prefix);
+        let ir = codegen.generate_llvm_ir(block).unwrap();
+        codegen.compile_to_static(&ir, &dir.join(format!("lib{prefix}.a")).to_string_lossy(), prefix).unwrap();
+    }
+    let main = r#"
+#include <stdio.h>
+void k_add_exec_spaces(void **); void k_mul_exec_spaces(void **);
+int main(void) {
+    double a[8], b[8], s[8], p[8];
+    for (int i = 0; i < 8; i++) { a[i] = i + 1; b[i] = 0.5 * i; }
+    void *ts[3] = {a, b, s}, *tp[3] = {a, b, p};
+    k_add_exec_spaces(ts); k_mul_exec_spaces(tp);
+    for (int i = 0; i < 8; i++) printf("%.17g %.17g\n", s[i], p[i]);
+    return 0;
+}
+"#;
+    std::fs::write(dir.join("main.c"), main).unwrap();
+    let built = std::process::Command::new("cc")
+        .args(["-O2", "main.c", "-L.", "-lk_add", "-lk_mul", "-lpthread", "-o", "main"])
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    assert!(built.success());
+    let out = std::process::Command::new(dir.join("main")).output().unwrap();
+    let lines: Vec<String> = String::from_utf8(out.stdout).unwrap().lines().map(String::from).collect();
+    for (i, line) in lines.iter().enumerate() {
+        let (a, b) = (i as f64 + 1.0, 0.5 * i as f64);
+        assert_eq!(line, &format!("{} {}", a + b, a * b), "cell {i}");
+    }
+    assert_eq!(lines.len(), 8);
+    // A prefix that is not a C identifier is refused.
+    let codegen = LlvmCodeGen::new("bad");
+    assert!(codegen.compile_to_static("", "target/static_link/libbad.a", "1bad").is_err());
+}

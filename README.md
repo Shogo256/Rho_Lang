@@ -137,6 +137,7 @@ rhoc examples/matrix_add.rho --run INPUT=in.txt    # runs it: prints OUTPUT, one
 | `--portable` | Build for any x86-64 rather than this machine |
 | `--bind NAME=0x…` | Point a space at an address the caller owns |
 | `--emit-jax <FILE.py>` | Also write the program as a JAX module (`rho`, `rho_jit`) |
+| `--emit-static <LIB.a>`, `--symbol-prefix <P>` | Also write the kernel as a static library whose symbols are `P_exec_spaces`, `P_metadata`, ... in place of `rho_kernel_*`, so that several kernels link into one program |
 | `--emit-sv <DIR>` | Also write the program as a SystemVerilog pipeline with a Verilator harness |
 | `--fixed <W.F>` | Make the circuit's cells fixed point, e.g. `32.16` |
 | `--fuse` | With `--emit-sv`, compute each intermediate that one flow reads cell for cell inside that flow's stage, as the kernel does, and a part a stage reads twice once: fewer stages, registers and replay memories, and a longer path through a stage, so a slower clock |

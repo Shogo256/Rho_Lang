@@ -4057,6 +4057,54 @@ impl LlvmCodeGen {
         }
     }
 
+    /// Compile LLVM IR to a static library (`.a`) whose symbols all start
+    /// with `prefix`: `rho_kernel_exec_spaces` is `{prefix}_exec_spaces`, and
+    /// so on for every entrypoint, and the runtime's `rho_rt_*` are
+    /// `{prefix}_rt_*`. Kernels built with different prefixes link into one
+    /// program side by side, which kernels sharing their names cannot; the
+    /// runtime's state is its own per kernel, as in a shared library.
+    pub fn compile_to_static(&self, ir_content: &str, output_path: &str, prefix: &str) -> std::io::Result<()> {
+        let valid = prefix.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            return Err(std::io::Error::other(format!("--symbol-prefix {prefix:?} is not a C identifier")));
+        }
+        let ir = ir_content
+            .replace("@rho_kernel_", &format!("@{prefix}_"))
+            .replace("@rho_rt_", &format!("@{prefix}_rt_"));
+        let temp_ll = format!("{output_path}.ll");
+        let temp_rt = format!("{output_path}.rt.c");
+        let (kernel_o, rt_o) = (format!("{output_path}.kernel.o"), format!("{output_path}.rt.o"));
+        fs::write(&temp_ll, ir)?;
+        let renames: String = ["scratch", "zeroize", "run", "parts"]
+            .iter()
+            .map(|f| format!("#define rho_rt_{f} {prefix}_rt_{f}\n"))
+            .collect();
+        fs::write(&temp_rt, format!("{renames}{RUNTIME_C}"))?;
+        let mut flags: Vec<&str> = vec!["-c", "-fPIC", "-O3", "-ffp-contract=off", "-Wno-override-module", "-pthread"];
+        if self.native && cfg!(target_arch = "x86_64") {
+            flags.push("-march=native");
+        }
+        let clang = |input: &str, out: &str| -> std::io::Result<bool> {
+            let mut args = flags.clone();
+            args.extend([input, "-o", out]);
+            Ok(Command::new("clang-22").args(&args).status().or_else(|_| Command::new("clang").args(&args).status())?.success())
+        };
+        let built = clang(&temp_ll, &kernel_o)? && clang(&temp_rt, &rt_o)?;
+        let _ = fs::remove_file(output_path);
+        let archived = built
+            && Command::new("ar").args(["rcs", output_path, &kernel_o, &rt_o]).status()?.success();
+        let _ = fs::remove_file(&kernel_o);
+        let _ = fs::remove_file(&rt_o);
+        if archived {
+            let _ = fs::remove_file(temp_ll);
+            let _ = fs::remove_file(temp_rt);
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!("building {output_path} failed; the IR was kept in {temp_ll}")))
+        }
+    }
+
     fn sanitize_ident(&self, ident: &str) -> String {
         let mut sanitized = String::new();
         for ch in ident.chars() {

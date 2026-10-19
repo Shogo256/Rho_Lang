@@ -77,6 +77,17 @@ struct Args {
     #[arg(long)]
     dump_llvm: bool,
 
+    /// Also write the kernel as a static library (`.a`) to link into a
+    /// program, its symbols renamed by --symbol-prefix.
+    #[arg(long, value_name = "LIB.a", requires = "symbol_prefix")]
+    emit_static: Option<PathBuf>,
+
+    /// With --emit-static, what every exported symbol starts with in place
+    /// of `rho_kernel` (`PREFIX_exec_spaces`, `PREFIX_metadata`, ...), so that
+    /// several kernels link into one program.
+    #[arg(long, value_name = "PREFIX")]
+    symbol_prefix: Option<String>,
+
     /// Also write the program as a SystemVerilog streaming pipeline
     /// (rho_kernel.sv and a Verilator harness) into this directory.
     #[arg(long, value_name = "DIR")]
@@ -288,6 +299,10 @@ fn run(args: &Args) -> anyhow::Result<()> {
     let out_path = args.output.to_string_lossy();
     codegen.compile_to_so(&llvm_ir, &out_path)?;
     println!("  └─ Compilation Successful: Binary emitted to -> {}", out_path);
+    if let (Some(lib), Some(prefix)) = (&args.emit_static, &args.symbol_prefix) {
+        codegen.compile_to_static(&llvm_ir, &lib.to_string_lossy(), prefix)?;
+        println!("  └─ Static library emitted to -> {} (symbols {prefix}_*)", lib.display());
+    }
 
     if let Some(path) = &args.emit_jax {
         let module = rho_lang::codegen::jax::emit(&block, args.tau, args.max_iter, precision)

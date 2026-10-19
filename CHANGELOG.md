@@ -69,6 +69,11 @@ needs.
   inside their reader and never stored: ML-KEM's matrix-vector product for
   k = 4 used 2.1 MB of stack, more than a thread is given by default, and
   uses 222 KB.
+- **`rhoc --emit-static LIB.a --symbol-prefix P`** writes the kernel as a
+  static library, its entrypoints `P_exec_spaces`, `P_metadata`, ... and
+  its runtime `P_rt_*`: every kernel exports the same names, so a program
+  could load several only one shared library at a time, by dlopen. Rhodium's
+  Rust crate links its 86 kernels this way.
 - **A 64-bit fixed format can be used.** The circuit emitter took
   `--fixed 64.F`, but the fixed-point interpreter's `Fixed<64, F>` could not
   be instantiated: the ends of its range, computed in i64, overflowed. They

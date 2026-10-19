@@ -82,6 +82,13 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     emit_sv: Option<PathBuf>,
 
+    /// With --emit-sv, fuse every intermediate one flow reads cell for cell
+    /// into that flow's stage, as the kernel does: fewer stages, counters,
+    /// registers and replay memories, and a longer path through a stage, so
+    /// a slower clock.
+    #[arg(long)]
+    fuse: bool,
+
     /// Make the circuit's cells fixed point, WIDTH.FRAC bits (e.g. 32.16),
     /// which Yosys synthesises; without it they are `real`, for simulation.
     #[arg(long, value_name = "W.F")]
@@ -309,8 +316,8 @@ fn run(args: &Args) -> anyhow::Result<()> {
                 }
             }
         };
-        let circuit = rho_lang::codegen::sv::emit(&block, args.tau, args.max_iter, numbers)
-            .map_err(|e| block.attribute(e))?;
+        let emit = if args.fuse { rho_lang::codegen::sv::emit_fused } else { rho_lang::codegen::sv::emit };
+        let circuit = emit(&block, args.tau, args.max_iter, numbers).map_err(|e| block.attribute(e))?;
         rho_lang::codegen::sv::write(&circuit, dir)?;
         println!(
             "  └─ Circuit emitted to -> {}/rho_kernel.sv (one cell per clock, latency {} clocks)",

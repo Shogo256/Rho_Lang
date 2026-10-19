@@ -170,11 +170,15 @@ struct Stage {
     reach: usize,
     /// Source space -> (value signal, valid signal, its latency, chain length, centre tap).
     chains: BTreeMap<String, (String, String, usize, usize, usize)>,
-    /// The expression, as SystemVerilog over the chains.
+    /// The expression, as SystemVerilog over the chains and `lets`.
     expr: String,
     /// The expression as lowered, with marks where its `parts` go.
     marked: String,
     parts: Vec<String>,
+    /// In a fused circuit, the parts the expression reads more than once,
+    /// each computed once per cell into a local before `expr`: a fused
+    /// intermediate read by two terms, say, is one piece of logic.
+    lets: Vec<(String, String)>,
     kind: Kind,
     /// For the update stage of a `⇒`: the signal that starts a round afresh.
     round_reset: Option<String>,
@@ -819,8 +823,65 @@ fn ident(name: &str) -> String {
         .collect()
 }
 
-/// Emit the circuit for `block`, or say what in it is not yet a circuit.
+/// Emit the circuit for `block`, or say what in it is not yet a circuit:
+/// a stage for every flow.
 pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) -> Result<Circuit> {
+    emit_block(block, tau, cap, numbers, false)
+}
+
+/// The circuit with every intermediate that one flow reads cell for cell
+/// fused into that flow, as in the kernel (see `fuse`): its stage goes, and
+/// the reader's stage computes it, once. The circuit's only output is
+/// OUTPUT, so nothing reads a fused space from outside. Fewer stages carry
+/// fewer counters, registers and replay memories; a stage that computes
+/// more has a longer path through it, so until a stage is pipelined the
+/// clock is slower. A part a stage reads twice (a fused intermediate read
+/// by two terms) is computed once, into a local. A program whose fused
+/// form the emitter refuses is emitted as written.
+pub fn emit_fused(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) -> Result<Circuit> {
+    let (fused_block, fused) = super::fuse::fuse(block);
+    if !fused.is_empty() {
+        if let Ok(mut circuit) = emit_block(&without(&fused_block, &fused), tau, cap, numbers, true) {
+            circuit.explain.push_str(&format!(
+                "  fused: {} computed inside the stage that reads {}\n",
+                if fused.len() == 1 { "1 intermediate".to_string() } else { format!("{} intermediates", fused.len()) },
+                if fused.len() == 1 { "it" } else { "each" }
+            ));
+            return Ok(circuit);
+        }
+    }
+    emit_block(block, tau, cap, numbers, true)
+}
+
+/// The block without the flows (and declarations) of the fused spaces:
+/// their readers compute them, and nothing else reads them.
+fn without(block: &ToposBlock, fused: &BTreeMap<String, String>) -> ToposBlock {
+    let gone = |stmt: &Statement| match stmt {
+        Statement::Flow { target: FlowTarget::Var(t), .. } => fused.contains_key(t),
+        Statement::SpaceDef(decl) => fused.contains_key(&decl.name),
+        _ => false,
+    };
+    let mut out = ToposBlock { statements: Vec::new(), lines: Vec::new(), origins: Vec::new() };
+    for (i, stmt) in block.statements.iter().enumerate() {
+        if gone(stmt) {
+            continue;
+        }
+        let stmt = match stmt {
+            Statement::Iterate { prelude, src, target } => Statement::Iterate {
+                prelude: prelude.iter().filter(|p| !gone(p)).cloned().collect(),
+                src: src.clone(),
+                target: target.clone(),
+            },
+            other => other.clone(),
+        };
+        out.statements.push(stmt);
+        out.lines.push(block.line_of(i));
+        out.origins.push(block.origins.get(i).cloned().flatten());
+    }
+    out
+}
+
+fn emit_block(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers, share: bool) -> Result<Circuit> {
     if let Numbers::Fixed { width, frac } = numbers {
         if !(2..=64).contains(&width) || frac >= width {
             return Err(unsupported(&format!("a fixed format of {width} bits with {frac} fraction bits"), 0));
@@ -1070,7 +1131,7 @@ pub fn emit(block: &ToposBlock, tau: f64, cap: Option<usize>, numbers: Numbers) 
         }
     }
     for stage in &mut stages {
-        stage.expr = locals(&stage.parts, &stage.marked, stage.index, false).1;
+        (stage.lets, stage.expr) = locals(&stage.parts, &stage.marked, stage.index, share);
     }
     let out_stream = streams
         .get("OUTPUT")
@@ -1299,7 +1360,7 @@ fn one_bit(arg: &str) -> bool {
 
 /// A stage's products and quotients, each part of its expression counted
 /// once however often the text repeats it (a gather writes its place three
-/// times, and Yosys merges the copies).
+/// times; Yosys merges the copies, and a fused circuit computes it once).
 fn arithmetic(stage: &Stage) -> Arithmetic {
     let (lets, expr) = locals(&stage.parts, &stage.marked, stage.index, true);
     let named: BTreeMap<&str, &str> = lets.iter().map(|(n, e)| (n.as_str(), e.as_str())).collect();
@@ -1753,6 +1814,7 @@ fn plan_stage(
         expr: String::new(),
         marked,
         parts,
+        lets: Vec::new(),
         kind,
         round_reset: None,
         timing,
@@ -2135,6 +2197,10 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
     let _ = writeln!(sv, "  always_ff @(posedge clk) begin : stage{k}");
     let _ = writeln!(sv, "    longint pos [0:{}];", rank.max(1) - 1);
     let _ = writeln!(sv, "    {ty} x;");
+    if !stage.lets.is_empty() {
+        let names: Vec<&str> = stage.lets.iter().map(|(n, _)| n.as_str()).collect();
+        let _ = writeln!(sv, "    {ty} {};", names.join(", "));
+    }
     let _ = writeln!(sv, "    if ({clear}) begin");
     let mut zeroed: Vec<String> = vec![
         format!("n{k}_in <= 0"),
@@ -2161,6 +2227,9 @@ fn emit_stage(sv: &mut String, stage: &Stage, streams: &BTreeMap<String, Stream>
         let _ = writeln!(sv, "        pos[{a}] = pc{k}_{a};");
     }
     let _ = writeln!(sv, "        if (n{k}_in >= {} && nc{k} < {cells}) begin", r + 1);
+    for (local, part) in &stage.lets {
+        let _ = writeln!(sv, "          {local} = {part};");
+    }
     let _ = writeln!(sv, "          x = {};", stage.expr);
     match stage.kind {
         Kind::Flow => {

@@ -139,6 +139,7 @@ rhoc examples/matrix_add.rho --run INPUT=in.txt    # runs it: prints OUTPUT, one
 | `--emit-jax <FILE.py>` | Also write the program as a JAX module (`rho`, `rho_jit`) |
 | `--emit-sv <DIR>` | Also write the program as a SystemVerilog pipeline with a Verilator harness |
 | `--fixed <W.F>` | Make the circuit's cells fixed point, e.g. `32.16` |
+| `--fuse` | With `--emit-sv`, compute each intermediate that one flow reads cell for cell inside that flow's stage, as the kernel does, and a part a stage reads twice once: fewer stages, registers and replay memories, and a longer path through a stage, so a slower clock |
 | `--constant-time`, `--public NAME,…` | Refuse the program unless its cells may be secrets: no division or residue by a non-constant, no `sqrt` `exp` `log` `sin` `cos` or fractional power, no `⇒`, and `⌷` only at positions made of `⍳`, constants and the `--public` spaces |
 | `--explain` | Say what each flow became: the sweeps a call runs, vector or one cell at a time and why, the folds computed first, what fused into what, a `⇒`'s rounds; with `--emit-sv`, the circuit's stages, products and memories |
 | `--dump-llvm`, `--dump-dag`, `--no-simd` | Print the IR, print the dataflow, emit scalar loops only |

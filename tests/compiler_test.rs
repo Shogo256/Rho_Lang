@@ -5270,3 +5270,41 @@ fn test_a_parts_loads_come_in_slot_order() {
     }
     assert!(parts >= 3, "{ir}");
 }
+
+#[test]
+fn test_the_circuit_fuses_intermediates_and_computes_a_part_once() {
+    // A is read three times by B, and B once by the output: fused, the
+    // circuit is one stage (as written, three). A's product is a part of
+    // that stage, computed once and read three times: two multipliers, not
+    // four.
+    let source = "{\n    X:◯ □ 2 8\n    Y:◯ □ 2 8\n    (X × Y) → A\n    ((A × A) + A) → B\n    (B - X) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    use rho_lang::codegen::sv::{emit, emit_fused, simulate, Numbers};
+    let staged = emit(&block, 0.0, None, Numbers::Fixed { width: 32, frac: 16 }).unwrap();
+    assert_eq!(staged.module.matches("begin : stage").count(), 3, "{}", staged.module);
+    let circuit = emit_fused(&block, 0.0, None, Numbers::Fixed { width: 32, frac: 16 }).unwrap();
+    assert_eq!(circuit.module.matches("begin : stage").count(), 1, "{}", circuit.module);
+    assert!(circuit.explain.contains("products: 2 of two variables"), "{}", circuit.explain);
+    assert!(circuit.explain.contains("fused: 2 intermediates"), "{}", circuit.explain);
+    if !verilator_available() {
+        eprintln!("verilator not found: circuit run skipped");
+        return;
+    }
+    let x: Vec<f64> = (0..16).map(|i| (i as f64) * 0.25 - 1.5).collect();
+    let y: Vec<f64> = (0..16).map(|i| 2.0 - (i as f64) * 0.125).collect();
+    let mut env: Env<f64> = Env::new();
+    env.insert("X".to_string(), Grid::from(vec![2, 8], x.clone()));
+    env.insert("Y".to_string(), Grid::from(vec![2, 8], y.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    let real = emit_fused(&block, 0.0, None, Numbers::Real).unwrap();
+    let run = simulate(&real, std::path::Path::new("target/sv_fused_real"), &[x.clone(), y.clone()]).unwrap();
+    assert_eq!(bits(&run.output), bits(&meant), "real");
+    let mut fenv: Env<rho_lang::numeric::Fixed<32, 16>> = Env::new();
+    for (name, cells) in [("X", &x), ("Y", &y)] {
+        let q = cells.iter().map(|&v| rho_lang::numeric::Fixed::<32, 16>::from_f64(v)).collect();
+        fenv.insert(name.to_string(), Grid::from(vec![2, 8], q));
+    }
+    let fixed: Vec<f64> = interpret(&block, &fenv, 0.0).unwrap()["OUTPUT"].cells.iter().map(|q| q.to_f64()).collect();
+    let run = simulate(&circuit, std::path::Path::new("target/sv_fused_fixed"), &[x, y]).unwrap();
+    assert_eq!(bits(&run.output), bits(&fixed), "fixed");
+}

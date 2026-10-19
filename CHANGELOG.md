@@ -44,6 +44,16 @@ needs.
   writes its place three times and Yosys merges the copies (a gather at
   `X × 3` maps to two DSP blocks, one product); a matrix-vector product's
   circuit had been said to have 35 products by a constant, where it has 33.
+- **`rhoc --emit-sv --fuse`** fuses the circuit as the kernel is fused:
+  each intermediate that one flow reads cell for cell is computed inside
+  that flow's stage, and a part the stage reads more than once is computed
+  once, into a local. Seven NTT layers over three polynomials go from 63
+  stages and 21 replay memories to 14 and 14; on an ECP5, from 17,211 LUT4,
+  9,815 registers and 98 block RAMs to 14,242, 3,795 and 49, the 112 DSP
+  blocks unchanged. The clock falls from 21.9 to 7.3 MHz, a stage now
+  computing a whole layer's arithmetic in one clock, so fusing is asked for
+  until stages are pipelined. Without `--fuse` the circuit is the same,
+  byte for byte.
 
 ## 1.0.0 — 2026-09-14
 

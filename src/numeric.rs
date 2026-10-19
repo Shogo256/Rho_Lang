@@ -381,7 +381,10 @@ impl<const W: u32, const F: u32> Numeric for Fixed<W, F> {
             },
             BuiltinOp::Ceil => Self::wrap(((self.raw as i128) + Self::MASK as i128) & !(Self::MASK as i128)),
             // The roll over the value's W bits, sign-extended to 64: the top
-            // F bits of the hash are the fraction of a number in [0, 1).
+            // F bits of the hash are the fraction of a number in [0, 1). With
+            // no fraction bits there are none and the roll is 0, as in the
+            // circuit, where a shift of the 64-bit hash by 64 is 0; in Rust
+            // `z >> 64` overflows, so the shift is checked.
             BuiltinOp::Roll => {
                 let bits = self.raw as u64;
                 let mut z = bits.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -389,7 +392,7 @@ impl<const W: u32, const F: u32> Numeric for Fixed<W, F> {
                 z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
                 z ^= z >> 31;
                 Fixed {
-                    raw: (z >> (64 - F)) as i64,
+                    raw: z.checked_shr(64 - F).unwrap_or(0) as i64,
                 }
             }
             BuiltinOp::Exp => Self::from_f64(self.to_f64().exp()),
@@ -486,5 +489,18 @@ mod fixed_tests {
         assert!(rolls.windows(2).any(|w| w[0] != w[1]));
         assert!(Q::constant(1.0).compare(&Q::constant(0.999), Compare::Gt));
         assert_eq!(integer_power(&Q::constant(1.5), &Q::constant(3.0)).to_f64(), 3.375);
+    }
+
+    #[test]
+    fn a_roll_with_no_fraction_bits_is_the_integer_part_zero() {
+        // The integer part of a number in [0, 1), at the ends of the range
+        // too; shifting the hash down by 64 - F is a shift by 64 here.
+        for i in -32..32 {
+            assert_eq!(Fixed::<32, 0>::constant(i as f64).unary(BuiltinOp::Roll).raw, 0);
+            assert_eq!(Fixed::<64, 0>::constant(i as f64).unary(BuiltinOp::Roll).raw, 0);
+        }
+        assert_eq!(Fixed::<32, 0> { raw: i32::MIN as i64 }.unary(BuiltinOp::Roll).raw, 0);
+        assert_eq!(Fixed::<64, 0> { raw: i64::MIN }.unary(BuiltinOp::Roll).raw, 0);
+        assert_eq!(Fixed::<64, 0> { raw: i64::MAX }.unary(BuiltinOp::Roll).raw, 0);
     }
 }

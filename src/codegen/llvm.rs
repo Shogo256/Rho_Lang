@@ -944,10 +944,85 @@ impl LlvmCodeGen {
         "too short for a vector beside its shifts' reach".to_string()
     }
 
+    /// A gather a vector at a time: the positions as the scalar path takes
+    /// them (floored, clamped into the space, so a lane never reads outside
+    /// it), each lane's cell loaded, and zero where the position named no
+    /// cell. The loads are per lane, not `llvm.masked.gather`, whose
+    /// signature differs between LLVM versions; the backend may join them.
+    fn emit_vector_gather(
+        &self,
+        ir: &mut String,
+        ptr: &str,
+        count: usize,
+        position: &str,
+        w: usize,
+        counter: &mut usize,
+    ) -> String {
+        let mode = Mode::Vector(w, self.precision);
+        let (vty, ity, bty) = (mode.ty(), mode.int_ty(), mode.bool_ty());
+        let elem = self.precision.llvm_type();
+        let floor = mode.unary_intrinsic("floor");
+        let floored = Self::fresh(counter);
+        let not_before = Self::fresh(counter);
+        let not_past = Self::fresh(counter);
+        let inside = Self::fresh(counter);
+        let safe = Self::fresh(counter);
+        let at = Self::fresh(counter);
+        ir.push_str(&format!("  {floored} = call {vty} {floor}({vty} {position})\n"));
+        ir.push_str(&format!("  {not_before} = fcmp oge {vty} {floored}, {}\n", mode.splat(0.0)));
+        ir.push_str(&format!("  {not_past} = fcmp olt {vty} {floored}, {}\n", mode.splat(count as f64)));
+        ir.push_str(&format!("  {inside} = and {bty} {not_before}, {not_past}\n"));
+        ir.push_str(&format!("  {safe} = select {bty} {inside}, {vty} {floored}, {vty} zeroinitializer\n"));
+        // To 32 bits where the space allows, which x86-64 converts four
+        // lanes at a time without AVX-512 (to 64 bits it converts one by one).
+        let narrow = count < (1usize << 31);
+        let ity = if narrow { format!("<{w} x i32>") } else { ity };
+        ir.push_str(&format!("  {at} = fptosi {vty} {safe} to {ity}\n"));
+        let mut lanes = "poison".to_string();
+        for lane in 0..w {
+            let (i, gep, val, next) =
+                (Self::fresh(counter), Self::fresh(counter), Self::fresh(counter), Self::fresh(counter));
+            let lane_ty = if narrow { "i32" } else { "i64" };
+            ir.push_str(&format!("  {i} = extractelement {ity} {at}, i64 {lane}\n"));
+            ir.push_str(&format!("  {gep} = getelementptr inbounds {elem}, ptr {ptr}, {lane_ty} {i}\n"));
+            ir.push_str(&format!("  {val} = load {elem}, ptr {gep}, align {}\n", self.precision.bytes()));
+            ir.push_str(&format!("  {next} = insertelement {vty} {lanes}, {elem} {val}, i64 {lane}\n"));
+            lanes = next;
+        }
+        let out = Self::fresh(counter);
+        ir.push_str(&format!("  {out} = select {bty} {inside}, {vty} {lanes}, {vty} zeroinitializer\n"));
+        out
+    }
+
+    /// Whether a gather in the expression reads the space the flow writes:
+    /// the sweep then stays scalar, so that its cells read what they read
+    /// before gathers ran a vector at a time.
+    fn gathers_from(&self, expr: &Expr, target: &str) -> bool {
+        match expr {
+            Expr::Gather { index, operand } => {
+                Self::place_name(operand).is_some_and(|n| n == target) || self.gathers_from(index, target)
+            }
+            Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } | Expr::Call { .. } => false,
+            Expr::AuditTrace(inner)
+            | Expr::Shift { operand: inner, .. }
+            | Expr::Builtin { operand: inner, .. }
+            | Expr::Lift { operand: inner, .. }
+            | Expr::Scan { operand: inner, .. }
+            | Expr::Reduce { operand: inner, .. }
+            | Expr::Rotate { operand: inner, .. }
+            | Expr::Reverse { operand: inner, .. }
+            | Expr::Reshape { operand: inner, .. }
+            | Expr::Transpose { operand: inner, .. }
+            | Expr::Take { operand: inner, .. }
+            | Expr::Drop { operand: inner, .. } => self.gathers_from(inner, target),
+            Expr::BinaryOp { lhs, rhs, .. } => self.gathers_from(lhs, target) || self.gathers_from(rhs, target),
+        }
+    }
+
     /// The first read out of order in an expression, as `explain` says it.
     fn turn_kind(&self, expr: &Expr) -> Option<&'static str> {
         match expr {
-            Expr::Gather { .. } => Some("`⌷` reads by position"),
+            Expr::Gather { index, .. } => self.turn_kind(index),
             Expr::Rotate { .. } => Some("`⌽` wraps at the end of an axis"),
             Expr::Reverse { .. } => Some("`⌽` reverses an axis"),
             Expr::Transpose { .. } => Some("`⍉` reads across rows"),
@@ -970,8 +1045,10 @@ impl LlvmCodeGen {
             | Expr::Reverse { .. }
             | Expr::Transpose { .. }
             | Expr::Take { .. }
-            | Expr::Drop { .. }
-            | Expr::Gather { .. } => true,
+            | Expr::Drop { .. } => true,
+            // A gather's positions are read like anything else, and its
+            // space at each lane's own position.
+            Expr::Gather { index, .. } => self.turns(index),
             // Same count: a reinterpretation, contiguous as the operand is.
             Expr::Reshape { shape, operand } => {
                 match Self::expr_shape(operand, &self.space_shapes) {
@@ -1431,7 +1508,11 @@ impl LlvmCodeGen {
         // A read that wraps at the end of an axis is not contiguous, so it
         // cannot be vector loaded; nor is a stretched read, unless every
         // lane of a chunk still lands on the next cell of its source.
-        let plan = if self.turns(src) {
+        let writes = match target {
+            FlowTarget::Var(n) => n.clone(),
+            FlowTarget::Equilibrium => "OUTPUT".to_string(),
+        };
+        let plan = if self.turns(src) || self.gathers_from(src, &writes) {
             Sweep::AllScalar
         } else if self.needs_broadcast(src, &result_shape, &[]) {
             if self.stretched_contiguously(src, &result_shape, &[], VECTOR_WIDTH, false) {
@@ -1450,6 +1531,7 @@ impl LlvmCodeGen {
             let plan_text = match &plan {
                 Sweep::Split { width, aligned: true, .. } => format!("vector ×{width}, rows stretched over rows"),
                 Sweep::Split { width, .. } => format!("vector ×{width}"),
+                Sweep::AllScalar if self.gathers_from(src, &writes) => "scalar: `⌷` reads the space it writes".to_string(),
                 Sweep::AllScalar => format!("scalar: {}", self.scalar_reason(src, &result_shape, &sweep)),
             };
             self.notes.borrow_mut().push(FlowNote {
@@ -2875,8 +2957,10 @@ impl LlvmCodeGen {
             | Expr::Transpose { .. }
             | Expr::Take { .. }
             | Expr::Drop { .. }
-            | Expr::Gather { .. }
             | Expr::Call { .. } => false,
+            Expr::Gather { index, .. } => {
+                self.stretched_contiguously(index, result_shape, lifts, width, shifted)
+            }
         }
     }
 
@@ -3400,16 +3484,13 @@ impl LlvmCodeGen {
                         detail: "⌷ reads a declared space, so its right side is a space's name, not a computed value. Flow the sub-expression into its own space first.".to_string(),
                     }
                 })?;
-                if matches!(mode, Mode::Vector(..)) {
-                    return Err(HarmonyDisruption::LoweringErr {
-                        line: self.current_line.get(),
-                        detail: "internal: a gather reached the vector path".to_string(),
-                    });
-                }
                 let ptr = self.lookup(bufs, &name)?;
                 let count = self.shape_for(&name).iter().product::<usize>().max(1);
                 let position =
                     self.emit_expr(index, ir, bufs, idx, counter, mode, result_shape, lifts)?;
+                if let Mode::Vector(w, _) = mode {
+                    return Ok(self.emit_vector_gather(ir, &ptr, count, &position, w, counter));
+                }
                 let elem = self.precision.llvm_type();
                 let suffix = self.precision.intrinsic_suffix();
                 let floored = Self::fresh(counter);

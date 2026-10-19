@@ -5190,14 +5190,16 @@ fn test_constant_time_refuses_what_could_follow_a_secret() {
 
 #[test]
 fn test_explain_says_what_each_flow_became() {
-    // A gather (one cell at a time), a table row stretched over rows
-    // (vector), a column stretched along rows (one cell at a time), an
+    // A gather (vector), a gather from the space it writes (one cell at a
+    // time), a table row stretched over rows (vector), a column stretched
+    // along rows (one cell at a time), an
     // intermediate fused into its reader, a fold computed first, a `⇒`.
     let source = r#"{
         X:◯ □ 4 8
         T:◯ □ 1 8
         P:◯ □ 4 8
         (P ⌷ X) → G
+        (P ⌷ G) → G
         (X × T) → C
         (C + 1.0) → A
         ((A + G) + (□1 (◇+1 C))) → B
@@ -5216,13 +5218,14 @@ fn test_explain_says_what_each_flow_became() {
             .unwrap_or_else(|| panic!("no row for {target}:\n{text}"))
             .to_string()
     };
-    assert!(row("G").contains("scalar: `⌷` reads by position"), "{text}");
+    assert!(text.contains("G            32  vector ×4"), "{text}");
+    assert!(text.contains("G            32  scalar: `⌷` reads the space it writes"), "{text}");
     assert!(row("C").contains("vector ×4, rows stretched over rows"), "{text}");
     assert!(row("B").contains("scalar: a stretched read is not contiguous"), "{text}");
     assert!(row("B").contains("1 fold pass first"), "{text}");
     assert!(text.contains("↳ fused into it: A\n"), "{text}");
     assert!(text.contains("every round of ⇒ Y"), "{text}");
-    assert!(text.contains("  a call: 5 sweeps, 1 fold pass\n"), "{text}");
+    assert!(text.contains("  a call: 6 sweeps, 1 fold pass\n"), "{text}");
     assert!(text.contains("  ⇒ Y: 1 sweep and 0 fold passes a round, at most 8 rounds\n"), "{text}");
     assert!(text.contains("fused: 1 intermediate,"), "{text}");
     // The bounded entrypoint emits the flows again; they are said once.

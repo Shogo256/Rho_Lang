@@ -674,6 +674,7 @@ fn integer_main(seed: u64, rounds: usize) -> ! {
     let mut rng = Rng(seed);
     let (mut compared, mut skipped, mut mismatches, mut wrapped, mut lint) = (0usize, 0usize, 0usize, 0usize, 0usize);
     let (mut circuit_compared, mut circuit_mismatches, mut circuit_failed) = (0usize, 0usize, 0usize);
+    let mut fused_compared = 0usize;
     let public: std::collections::BTreeSet<String> = ["PERM".to_string()].into_iter().collect();
     for round in 0..rounds {
         let (dims, shape) = &shapes[rng.below(shapes.len())];
@@ -748,24 +749,33 @@ fn integer_main(seed: u64, rounds: usize) -> ! {
             println!("MISMATCH at cell {cell} (round {round})\n{source}  interpreted {} compiled {}", expected[cell], output[cell]);
         }
         if circuit_leg {
-            match rho_lang::codegen::sv::emit(&block, 0.0, None, rho_lang::codegen::sv::Numbers::Fixed { width: 32, frac: 0 }) {
+            let numbers = rho_lang::codegen::sv::Numbers::Fixed { width: 32, frac: 0 };
+            match rho_lang::codegen::sv::emit(&block, 0.0, None, numbers) {
                 Ok(circuit) => {
-                    let feed: Vec<Vec<f64>> = circuit.inputs.iter().map(|(n, _)| inputs[n].clone()).collect();
-                    let dir = std::path::PathBuf::from(format!("target/diffqsv{round}"));
-                    match rho_lang::codegen::sv::simulate(&circuit, &dir, &feed) {
-                        Ok(run) => {
-                            circuit_compared += 1;
-                            if let Some(cell) = first_gap(&fixed, &run.output) {
-                                circuit_mismatches += 1;
-                                println!("CIRCUIT MISMATCH at cell {cell} (round {round})\n{source}");
+                    // The circuit as written, and fused when fusing changes it.
+                    let fused = rho_lang::codegen::sv::emit_fused(&block, 0.0, None, numbers)
+                        .ok()
+                        .filter(|f| f.module != circuit.module);
+                    let variants = [Some(("", circuit)), fused.map(|f| (" (fused)", f))];
+                    for (what, circuit) in variants.into_iter().flatten() {
+                        let feed: Vec<Vec<f64>> = circuit.inputs.iter().map(|(n, _)| inputs[n].clone()).collect();
+                        let dir = std::path::PathBuf::from(format!("target/diffqsv{round}"));
+                        match rho_lang::codegen::sv::simulate(&circuit, &dir, &feed) {
+                            Ok(run) => {
+                                circuit_compared += 1;
+                                fused_compared += usize::from(!what.is_empty());
+                                if let Some(cell) = first_gap(&fixed, &run.output) {
+                                    circuit_mismatches += 1;
+                                    println!("CIRCUIT{what} MISMATCH at cell {cell} (round {round})\n{source}");
+                                }
+                            }
+                            Err(e) => {
+                                circuit_failed += 1;
+                                println!("CIRCUIT{what} BUILD FAILED (round {round})\n{source}\n{e}");
                             }
                         }
-                        Err(e) => {
-                            circuit_failed += 1;
-                            println!("CIRCUIT BUILD FAILED (round {round})\n{source}\n{e}");
-                        }
+                        let _ = std::fs::remove_dir_all(&dir);
                     }
-                    let _ = std::fs::remove_dir_all(&dir);
                 }
                 Err(e) => {
                     circuit_failed += 1;
@@ -779,7 +789,7 @@ fn integer_main(seed: u64, rounds: usize) -> ! {
          fixed point parted from binary64 {wrapped}, constant-time refusals {lint}"
     );
     if circuit_leg {
-        println!("  circuit at 32.0: {circuit_compared} compared, {circuit_mismatches} mismatches, {circuit_failed} failed");
+        println!("  circuit at 32.0: {circuit_compared} compared ({fused_compared} of them fused), {circuit_mismatches} mismatches, {circuit_failed} failed");
     }
     let bad = mismatches + wrapped + lint + circuit_mismatches + circuit_failed;
     std::process::exit(if bad > 0 { 1 } else { 0 })
@@ -814,6 +824,7 @@ fn main() {
     // asked for, since each build takes seconds.
     let circuit_leg = std::env::var("DIFFTEST_SV").is_ok();
     let (mut circuit_compared, mut circuit_mismatches, mut circuit_failed) = (0usize, 0usize, 0usize);
+    let mut fused_compared = 0usize;
     let mut stepping = 0usize;
     let mut narrow_mismatches = 0usize;
     let mut unsound = 0usize;
@@ -1044,26 +1055,36 @@ fn main() {
             .and_then(|r| r.parse::<usize>().ok())
             .is_none_or(|only| only == round);
         if circuit_leg && this_round {
-            if let Ok(circuit) = rho_lang::codegen::sv::emit(&block, RUN.tau, Some(SWEEPS), rho_lang::codegen::sv::Numbers::Real) {
-                let feed: Vec<Vec<f64>> = circuit.inputs.iter().map(|(n, _)| inputs[n].clone()).collect();
-                let dir = std::path::PathBuf::from(format!("target/diffsv{round}"));
-                match rho_lang::codegen::sv::simulate(&circuit, &dir, &feed) {
-                    Ok(run) => {
-                        circuit_compared += 1;
-                        if let Some(cell) = first_gap(&expected.cells, &run.output) {
-                            circuit_mismatches += 1;
-                            println!("CIRCUIT MISMATCH at cell {cell} (round {round}, shape {shape:?})");
-                            println!("{source}");
-                            println!("  interpreted {:?}", expected.cells[cell]);
-                            println!("  circuit     {:?}\n", run.output.get(cell));
+            let numbers = rho_lang::codegen::sv::Numbers::Real;
+            if let Ok(circuit) = rho_lang::codegen::sv::emit(&block, RUN.tau, Some(SWEEPS), numbers) {
+                // The circuit as written, and fused when fusing changes it.
+                let fused = rho_lang::codegen::sv::emit_fused(&block, RUN.tau, Some(SWEEPS), numbers)
+                    .ok()
+                    .filter(|f| f.module != circuit.module);
+                let variants = [Some(("", circuit)), fused.map(|f| (" (fused)", f))];
+                for (what, circuit) in variants.into_iter().flatten() {
+                    let feed: Vec<Vec<f64>> = circuit.inputs.iter().map(|(n, _)| inputs[n].clone()).collect();
+                    let dir = std::path::PathBuf::from(format!("target/diffsv{round}"));
+                    let fused = !what.is_empty();
+                    match rho_lang::codegen::sv::simulate(&circuit, &dir, &feed) {
+                        Ok(run) => {
+                            circuit_compared += 1;
+                            fused_compared += usize::from(fused);
+                            if let Some(cell) = first_gap(&expected.cells, &run.output) {
+                                circuit_mismatches += 1;
+                                println!("CIRCUIT{what} MISMATCH at cell {cell} (round {round}, shape {shape:?})");
+                                println!("{source}");
+                                println!("  interpreted {:?}", expected.cells[cell]);
+                                println!("  circuit     {:?}\n", run.output.get(cell));
+                            }
+                        }
+                        Err(e) => {
+                            circuit_failed += 1;
+                            println!("CIRCUIT{what} BUILD FAILED (round {round}, shape {shape:?})\n{source}\n{e}\n");
                         }
                     }
-                    Err(e) => {
-                        circuit_failed += 1;
-                        println!("CIRCUIT BUILD FAILED (round {round}, shape {shape:?})\n{source}\n{e}\n");
-                    }
+                    let _ = std::fs::remove_dir_all(&dir);
                 }
-                let _ = std::fs::remove_dir_all(&dir);
             }
         }
         let mut so_runs = vec![("exec_spaces", output)];
@@ -1096,7 +1117,7 @@ fn main() {
     );
     if circuit_leg {
         println!(
-            "  circuit: {circuit_compared} compared, {circuit_mismatches} mismatches, {circuit_failed} failed to build"
+            "  circuit: {circuit_compared} compared ({fused_compared} of them fused), {circuit_mismatches} mismatches, {circuit_failed} failed to build"
         );
     }
     if std::env::var("DIFFTEST_VERBOSE").is_ok() {

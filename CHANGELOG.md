@@ -54,6 +54,8 @@ needs.
   computing a whole layer's arithmetic in one clock, so fusing is asked for
   until stages are pipelined. Without `--fuse` the circuit is the same,
   byte for byte.
+- **The differential test runs the fused circuit too** (`DIFFTEST_SV=1`,
+  in both modes), whenever fusing changes the circuit.
 
 ## 1.0.0 — 2026-09-14
 

@@ -316,9 +316,11 @@ impl<const W: u32, const F: u32> Fixed<W, F> {
         }
     }
 
-    /// The most positive and most negative values the width holds.
-    pub const MAX: i64 = (1i64 << (W - 1)) - 1;
-    pub const MIN: i64 = -(1i64 << (W - 1));
+    /// The most positive and most negative values the width holds;
+    /// computed in i128, since at 64 bits 2^63 - 1 is i64::MAX and 2^63
+    /// itself is not an i64.
+    pub const MAX: i64 = ((1i128 << (W - 1)) - 1) as i64;
+    pub const MIN: i64 = (-(1i128 << (W - 1))) as i64;
 
     /// Round to the nearest step, half away from zero; an infinity is the
     /// end of the range it points to (so a fold's identity is the extreme),
@@ -456,6 +458,19 @@ mod fixed_tests {
         assert_eq!(Q::constant(1.0).div(&Q::constant(0.0)).raw, 0);
         // The sum of two large values wraps rather than saturating.
         assert_eq!(Q::constant(20000.0).add(&Q::constant(20000.0)).to_f64(), -25536.0);
+    }
+
+    #[test]
+    fn sixty_four_bits_hold_products_past_two_to_the_fifty_three() {
+        // ML-DSA's products are under q^2 < 2^46, and a 64-bit register
+        // holds them exactly; the ends of the range are i64's.
+        type W = Fixed<64, 0>;
+        let q = W::constant(8380416.0);
+        assert_eq!(q.mul(&q).raw, 8380416i64 * 8380416);
+        assert_eq!(W::constant(f64::INFINITY).raw, i64::MAX);
+        assert_eq!(W::constant(f64::NEG_INFINITY).raw, i64::MIN);
+        assert_eq!(Fixed::<64, 0> { raw: i64::MAX }.add(&W::constant(1.0)).raw, i64::MIN);
+        assert_eq!(W::constant(70231389274013184.0).raw, 70231389274013184);
     }
 
     #[test]

@@ -77,7 +77,10 @@ needs.
   comparison, `abs`, the greater and the lesser, calls. A function outside
   it is named in a comment, with the reason, and left out. Rhodium's proofs
   are now of what this writes from its kernels' sources, not of a
-  transcription by hand.
+  transcription by hand. A program block whose flows are all in the subset
+  becomes `kernel` too: one cell of OUTPUT from the same cell of each space
+  no flow writes, a lifted space read as it is; `--lean-program-only`
+  writes it alone, below the namespace its functions are in.
 - **A flow that reads the space it writes reads it as it was.** The
   interpreter, which is the meaning, computes a flow whole and then stores
   it. The kernel wrote the target as it swept it, so a flow that read its

@@ -99,6 +99,12 @@ struct Args {
     #[arg(long, value_name = "NAME", requires = "emit_lean")]
     lean_namespace: Option<String>,
 
+    /// With --emit-lean, write the program block alone (as `kernel`), not the
+    /// functions: its calls then name the functions of an enclosing
+    /// namespace, written once from the definitions' own file.
+    #[arg(long, requires = "emit_lean")]
+    lean_program_only: bool,
+
     /// Also write the program as a SystemVerilog streaming pipeline
     /// (rho_kernel.sv and a Verilator harness) into this directory.
     #[arg(long, value_name = "DIR")]
@@ -198,16 +204,23 @@ fn run(args: &Args) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to read source file: {}", e))?;
 
     if let Some(path) = &args.emit_lean {
-        let functions = rho_lang::parser::parse_definitions(&source_code)?;
+        let (functions, statements) = rho_lang::parser::parse_unexpanded(&source_code)?;
         let namespace = args.lean_namespace.as_deref().unwrap_or("Rho");
         let source = args.input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let text = rho_lang::codegen::lean::emit(&functions, namespace, &source)?;
-        let left_out = text.matches("is not emitted:").count();
+        let text = rho_lang::codegen::lean::emit_with(&functions, &statements, namespace, &source, args.lean_program_only)?;
+        let left_out = text.matches("` (line ").count();
+        let program = if text.contains("def «kernel»") {
+            ", the program as `kernel`"
+        } else if statements.is_empty() {
+            ""
+        } else {
+            ", the program left out"
+        };
         fs::write(path, text)?;
         println!(
-            "  └─ Lean definitions emitted to -> {} ({} functions, {left_out} left out)",
+            "  └─ Lean definitions emitted to -> {} ({} functions, {left_out} left out{program})",
             path.display(),
-            functions.len() - left_out
+            if args.lean_program_only { 0 } else { functions.len() - left_out }
         );
         return Ok(());
     }

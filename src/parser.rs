@@ -107,44 +107,12 @@ pub fn normalize_ascii_aliases(input: &str) -> String {
         .replace("@", "&")
 }
 
-/// The functions a source defines, in order, as written (calls inside
-/// them not expanded): what `--emit-lean` reads. A source of definitions
-/// alone, with no program block, is accepted.
-pub fn parse_definitions(input: &str) -> Result<Vec<Function>> {
-    let normalized_input = normalize_ascii_aliases(input);
-    validate_symbols(&normalized_input)?;
-    check_forbidden_keywords(&normalized_input)?;
-    let clean_code = remove_comments(&normalized_input);
-    let (raw_definitions, _) = split_definitions(&clean_code)?;
-    let mut functions = Functions::new();
-    let mut ordered = Vec::new();
-    for raw in raw_definitions {
-        let function = with_functions(functions.clone(), || parse_definition(&raw))?;
-        functions.insert(function.name.clone(), function.clone());
-        ordered.push(function);
-    }
-    Ok(ordered)
-}
-
-/// Top-level parser for ρ (RHO) Language source code
-pub fn parse_rho_program(input: &str) -> Result<ToposBlock> {
-    let normalized_input = normalize_ascii_aliases(input);
-    validate_symbols(&normalized_input)?;
-    check_forbidden_keywords(&normalized_input)?;
-    let clean_code = remove_comments(&normalized_input);
-
-    // Definitions come first and each sees only the ones before it.
-    let (raw_definitions, program_lines) = split_definitions(&clean_code)?;
-    let mut functions = Functions::new();
-    for raw in raw_definitions {
-        let function = with_functions(functions.clone(), || parse_definition(&raw))?;
-        functions.insert(function.name.clone(), function);
-    }
-
-    let (statements, lines) = with_functions(functions.clone(), || {
+/// The program block's statements, each with its line, calls not expanded.
+fn parse_program_lines(program_lines: &ProgramLines, functions: &Functions) -> Result<(Vec<Statement>, Vec<usize>)> {
+    with_functions(functions.clone(), || {
         let mut statements = Vec::new();
         let mut lines = Vec::new();
-        for (line_no, raw) in &program_lines {
+        for (line_no, raw) in program_lines {
             // The topos braces may share a line with a statement.
             let text = raw.trim().trim_start_matches('{').trim_end_matches('}').trim();
             if text.is_empty() {
@@ -171,7 +139,52 @@ pub fn parse_rho_program(input: &str) -> Result<ToposBlock> {
             }
         }
         Ok::<_, HarmonyDisruption>((statements, lines))
-    })?;
+    })
+}
+
+/// The functions a source defines, in order, as written (calls inside
+/// them not expanded): what `--emit-lean` reads. A source of definitions
+/// alone, with no program block, is accepted.
+pub fn parse_definitions(input: &str) -> Result<Vec<Function>> {
+    Ok(parse_unexpanded(input)?.0)
+}
+
+/// The functions a source defines, in order, and its program block's
+/// statements, calls not expanded: what `--emit-lean` reads. The block may
+/// be empty.
+pub fn parse_unexpanded(input: &str) -> Result<(Vec<Function>, Vec<Statement>)> {
+    let normalized_input = normalize_ascii_aliases(input);
+    validate_symbols(&normalized_input)?;
+    check_forbidden_keywords(&normalized_input)?;
+    let clean_code = remove_comments(&normalized_input);
+    let (raw_definitions, program_lines) = split_definitions(&clean_code)?;
+    let mut functions = Functions::new();
+    let mut ordered = Vec::new();
+    for raw in raw_definitions {
+        let function = with_functions(functions.clone(), || parse_definition(&raw))?;
+        functions.insert(function.name.clone(), function.clone());
+        ordered.push(function);
+    }
+    let (statements, _) = parse_program_lines(&program_lines, &functions)?;
+    Ok((ordered, statements))
+}
+
+/// Top-level parser for ρ (RHO) Language source code
+pub fn parse_rho_program(input: &str) -> Result<ToposBlock> {
+    let normalized_input = normalize_ascii_aliases(input);
+    validate_symbols(&normalized_input)?;
+    check_forbidden_keywords(&normalized_input)?;
+    let clean_code = remove_comments(&normalized_input);
+
+    // Definitions come first and each sees only the ones before it.
+    let (raw_definitions, program_lines) = split_definitions(&clean_code)?;
+    let mut functions = Functions::new();
+    for raw in raw_definitions {
+        let function = with_functions(functions.clone(), || parse_definition(&raw))?;
+        functions.insert(function.name.clone(), function);
+    }
+
+    let (statements, lines) = parse_program_lines(&program_lines, &functions)?;
 
     // A space may not take a function's name: `smooth` alone would then be
     // a space in one place and a function in another.

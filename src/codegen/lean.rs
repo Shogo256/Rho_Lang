@@ -16,6 +16,13 @@
 //! A function outside the subset (a shift, a gather, a fold, a fraction, a
 //! power, a transcendental) is not emitted; a comment names it and says
 //! why, and so does every function that calls it.
+//!
+//! A program block whose flows are all in the subset becomes one more
+//! definition, `kernel`: one cell of OUTPUT from the same cell of every
+//! space no flow writes (inputs and tables, stretched or lifted as they
+//! may be, which over one cell's values changes nothing), the flows as
+//! `let`s. `--lean-program-only` writes it alone, for a namespace below the
+//! functions'.
 
 use crate::ast::*;
 use crate::error::{HarmonyDisruption, Result};
@@ -116,7 +123,9 @@ impl Emitter<'_> {
             Expr::Transpose { .. } => return Err("`⍉`".to_string()),
             Expr::Take { .. } | Expr::Drop { .. } => return Err("`↑` or `↓`".to_string()),
             Expr::Index { .. } => return Err("`⍳`".to_string()),
-            Expr::Lift { .. } => return Err("`□`".to_string()),
+            // Cell for cell, a lifted space is read at the cell the reader
+            // maps to it: over one cell's values, the value itself.
+            Expr::Lift { operand, .. } => self.expr(operand)?,
             Expr::Reduce { .. } | Expr::Scan { .. } => return Err("a fold".to_string()),
         })
     }
@@ -146,9 +155,60 @@ impl Emitter<'_> {
     }
 }
 
+impl Emitter<'_> {
+    fn program(&self, statements: &[Statement]) -> std::result::Result<String, String> {
+        let written: BTreeSet<String> = statements
+            .iter()
+            .filter_map(|s| match s {
+                Statement::Flow { target: FlowTarget::Var(n), .. } => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        let inputs: Vec<String> = statements
+            .iter()
+            .filter_map(|s| match s {
+                Statement::SpaceDef(d) if !written.contains(&d.name) && d.name != "OUTPUT" => Some(d.name.clone()),
+                _ => None,
+            })
+            .collect();
+        let params: Vec<String> = inputs.iter().map(|p| format!("({} : Int)", ident(p))).collect();
+        let mut out = format!("def «kernel» {} : Int :=\n", params.join(" "));
+        let mut result = None;
+        for s in statements {
+            match s {
+                Statement::SpaceDef(_) => {}
+                Statement::Flow { src, target: FlowTarget::Var(name) } => {
+                    let _ = writeln!(out, "  let {} := {}", ident(name), self.expr(src)?);
+                }
+                Statement::Flow { src, target: FlowTarget::Equilibrium } => {
+                    result = Some(self.expr(src)?);
+                    break;
+                }
+                _ => return Err("a statement other than a flow".to_string()),
+            }
+        }
+        let result = result.ok_or("no flow into `=`")?;
+        let _ = writeln!(out, "  {result}");
+        Ok(out)
+    }
+}
+
 /// The functions in Lean, in a namespace of that name; `source` names the
 /// file they came from, in the header.
 pub fn emit(functions: &[Function], namespace: &str, source: &str) -> Result<String> {
+    emit_with(functions, &[], namespace, source, false)
+}
+
+/// The functions and, when it is in the subset, the program block as
+/// `kernel`; with `program_only`, the program alone, its calls naming the
+/// functions of an enclosing namespace.
+pub fn emit_with(
+    functions: &[Function],
+    statements: &[Statement],
+    namespace: &str,
+    source: &str,
+    program_only: bool,
+) -> Result<String> {
     if namespace.is_empty() || !namespace.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_alphanumeric() || c == '_')) {
         return Err(HarmonyDisruption::LoweringErr {
             detail: format!("`{namespace}` is not a Lean namespace"),
@@ -166,12 +226,26 @@ pub fn emit(functions: &[Function], namespace: &str, source: &str) -> Result<Str
         let emitted = Emitter { known: &known }.function(f);
         match emitted {
             Ok(text) => {
-                out.push_str(&text);
-                out.push('\n');
+                if !program_only {
+                    out.push_str(&text);
+                    out.push('\n');
+                }
                 known.insert(f.name.clone());
             }
-            Err(why) => {
+            Err(why) if !program_only => {
                 let _ = writeln!(out, "-- `{}` (line {}) is not emitted: {why}.\n", f.name, f.line);
+            }
+            Err(_) => {}
+        }
+    }
+    if !statements.is_empty() {
+        match (Emitter { known: &known }).program(statements) {
+            Ok(text) => {
+                out.push_str(&text);
+                out.push('\n');
+            }
+            Err(why) => {
+                let _ = writeln!(out, "-- the program is not emitted: {why}.\n");
             }
         }
     }

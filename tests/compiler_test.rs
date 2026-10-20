@@ -5571,6 +5571,22 @@ uses:{ X (next X) }
     assert!(lean.trim_end().ends_with("end Test.Gen"), "{lean}");
     // A namespace Lean could not read is refused.
     assert!(rho_lang::codegen::lean::emit(&functions, "not a name", "t.rho").is_err());
+    // A program block of cellwise flows becomes `kernel` over the spaces no
+    // flow writes; a lifted space is read as it is; one with a shift is not.
+    let program = format!("{source}{{\n    X:◯ □ 4 8\n    R:◯ □ 1 8\n    (red (X + (□0 R))) → S\n    (mix S X) → =\n}}\n");
+    let (functions, statements) = rho_lang::parser::parse_unexpanded(&program).unwrap();
+    assert_eq!(statements.len(), 4);
+    let whole = rho_lang::codegen::lean::emit_with(&functions, &statements, "Test.Gen", "t.rho", false).unwrap();
+    assert!(whole.contains(
+        "def «kernel» («X» : Int) («R» : Int) : Int :=\n  let «S» := («red» («X» + «R»))\n  («mix» «S» «X»)\n"
+    ), "{whole}");
+    assert!(whole.contains("def «red»"), "{whole}");
+    let alone = rho_lang::codegen::lean::emit_with(&functions, &statements, "Test.Gen.k", "t.rho", true).unwrap();
+    assert!(!alone.contains("def «red»") && alone.contains("def «kernel»"), "{alone}");
+    let shifted = format!("{source}{{\n    X:◯ □ 4 8\n    (▷X) → =\n}}\n");
+    let (functions, statements) = rho_lang::parser::parse_unexpanded(&shifted).unwrap();
+    let text = rho_lang::codegen::lean::emit_with(&functions, &statements, "Test.Gen", "t.rho", true).unwrap();
+    assert!(text.contains("-- the program is not emitted: a shift."), "{text}");
     // With Lean at hand ($LEAN), the file is Lean.
     if let Ok(lean_bin) = std::env::var("LEAN") {
         let path = "target/emit_lean_test.lean";

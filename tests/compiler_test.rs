@@ -5537,3 +5537,45 @@ int main(void) {
     let codegen = LlvmCodeGen::new("bad");
     assert!(codegen.compile_to_static("", "target/static_link/libbad.a", "1bad").is_err());
 }
+
+#[test]
+fn test_functions_are_written_as_lean_definitions_over_the_integers() {
+    // The whole-number subset: sums, products, a floored quotient by a
+    // constant, `ind` of a comparison, `abs`, calls, and a body of flows.
+    let source = r#"
+red:{ X (X - (7.0 × (ind (X >= 7.0)))) }
+half:{ X (⌊(X / 2.0)) }
+mix:{ A B
+    (red (A + B)) → S
+    (abs (S - (half B))) → =
+}
+next:{ X (▷X) }
+frac:{ X (X × 0.5) }
+uses:{ X (next X) }
+"#;
+    let functions = rho_lang::parser::parse_definitions(source).unwrap();
+    assert_eq!(functions.len(), 6);
+    let lean = rho_lang::codegen::lean::emit(&functions, "Test.Gen", "t.rho").unwrap();
+    assert!(lean.contains("namespace Test.Gen\n"), "{lean}");
+    assert!(lean.contains(
+        "def «red» («X» : Int) : Int :=\n  («X» - ((7 : Int) * (if «X» ≥ (7 : Int) then (1 : Int) else 0)))\n"
+    ), "{lean}");
+    assert!(lean.contains("def «half» («X» : Int) : Int :=\n  («X» / (2 : Int))\n"), "{lean}");
+    assert!(lean.contains(
+        "def «mix» («A» : Int) («B» : Int) : Int :=\n  let «S» := («red» («A» + «B»))\n  (((«S» - («half» «B»))).natAbs : Int)\n"
+    ), "{lean}");
+    // Outside the subset: named, with the reason, and so is a caller.
+    assert!(lean.contains("-- `next` (line 8) is not emitted: a shift."), "{lean}");
+    assert!(lean.contains("-- `frac` (line 9) is not emitted: the literal 0.5 is not a whole number."), "{lean}");
+    assert!(lean.contains("-- `uses` (line 10) is not emitted: a call of `next`, which is not emitted."), "{lean}");
+    assert!(lean.trim_end().ends_with("end Test.Gen"), "{lean}");
+    // A namespace Lean could not read is refused.
+    assert!(rho_lang::codegen::lean::emit(&functions, "not a name", "t.rho").is_err());
+    // With Lean at hand ($LEAN), the file is Lean.
+    if let Ok(lean_bin) = std::env::var("LEAN") {
+        let path = "target/emit_lean_test.lean";
+        std::fs::write(path, &lean).unwrap();
+        let status = std::process::Command::new(lean_bin).arg(path).status().unwrap();
+        assert!(status.success(), "{lean}");
+    }
+}

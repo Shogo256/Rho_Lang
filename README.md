@@ -136,6 +136,7 @@ rhoc examples/matrix_add.rho --run INPUT=in.txt    # runs it: prints OUTPUT, one
 | `--threads <N>` | Split every sweep across `N` threads; `0` (default) is one per CPU. `RHO_THREADS` overrides at run time |
 | `--portable` | Build for any x86-64 rather than this machine |
 | `--bind NAME=0x…` | Point a space at an address the caller owns |
+| `--emit-lean <FILE.lean>`, `--lean-namespace <NAME>` | Write the source's functions as Lean 4 definitions over the integers, for proofs about them, and stop: sums, products, `⌊` of a quotient by a whole constant, `ind`, `abs`, calls; a function outside that subset is named in a comment and left out. A source of definitions alone is accepted |
 | `--emit-jax <FILE.py>` | Also write the program as a JAX module (`rho`, `rho_jit`) |
 | `--emit-static <LIB.a>`, `--symbol-prefix <P>` | Also write the kernel as a static library whose symbols are `P_exec_spaces`, `P_metadata`, ... in place of `rho_kernel_*`, so that several kernels link into one program |
 | `--emit-sv <DIR>` | Also write the program as a SystemVerilog pipeline with a Verilator harness |

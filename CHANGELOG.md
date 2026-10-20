@@ -69,6 +69,15 @@ needs.
   inside their reader and never stored: ML-KEM's matrix-vector product for
   k = 4 used 2.1 MB of stack, more than a thread is given by default, and
   uses 222 KB.
+- **`rhoc --emit-lean FILE.lean`** writes a source's functions as Lean 4
+  definitions over the integers, for proofs about them, and compiles
+  nothing; a file of definitions alone is accepted. The subset is the
+  arithmetic of whole numbers a kernel computes exactly: sums, products,
+  `⌊` of a quotient by a positive whole constant (Lean's `/`), `ind` of a
+  comparison, `abs`, the greater and the lesser, calls. A function outside
+  it is named in a comment, with the reason, and left out. Rhodium's proofs
+  are now of what this writes from its kernels' sources, not of a
+  transcription by hand.
 - **A flow that reads the space it writes reads it as it was.** The
   interpreter, which is the meaning, computes a flow whole and then stores
   it. The kernel wrote the target as it swept it, so a flow that read its

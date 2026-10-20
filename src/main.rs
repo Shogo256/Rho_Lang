@@ -88,6 +88,17 @@ struct Args {
     #[arg(long, value_name = "PREFIX")]
     symbol_prefix: Option<String>,
 
+    /// Write the source's functions as Lean 4 definitions over the
+    /// integers, for proofs about them, and stop: nothing is compiled, and
+    /// a source of definitions alone is accepted. A function outside the
+    /// whole-number subset is named in a comment and left out.
+    #[arg(long, value_name = "FILE.lean")]
+    emit_lean: Option<PathBuf>,
+
+    /// With --emit-lean, the namespace of the definitions (default `Rho`).
+    #[arg(long, value_name = "NAME", requires = "emit_lean")]
+    lean_namespace: Option<String>,
+
     /// Also write the program as a SystemVerilog streaming pipeline
     /// (rho_kernel.sv and a Verilator harness) into this directory.
     #[arg(long, value_name = "DIR")]
@@ -185,6 +196,21 @@ fn run(args: &Args) -> anyhow::Result<()> {
 
     let source_code = fs::read_to_string(&args.input)
         .map_err(|e| anyhow::anyhow!("Failed to read source file: {}", e))?;
+
+    if let Some(path) = &args.emit_lean {
+        let functions = rho_lang::parser::parse_definitions(&source_code)?;
+        let namespace = args.lean_namespace.as_deref().unwrap_or("Rho");
+        let source = args.input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let text = rho_lang::codegen::lean::emit(&functions, namespace, &source)?;
+        let left_out = text.matches("is not emitted:").count();
+        fs::write(path, text)?;
+        println!(
+            "  └─ Lean definitions emitted to -> {} ({} functions, {left_out} left out)",
+            path.display(),
+            functions.len() - left_out
+        );
+        return Ok(());
+    }
 
     // 1. 20-Symbol Strict Lexer & Parser
     println!("[Phase 1] Parsing & 20-Symbol Strict Tokenizer...");

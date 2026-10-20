@@ -107,6 +107,25 @@ pub fn normalize_ascii_aliases(input: &str) -> String {
         .replace("@", "&")
 }
 
+/// The functions a source defines, in order, as written (calls inside
+/// them not expanded): what `--emit-lean` reads. A source of definitions
+/// alone, with no program block, is accepted.
+pub fn parse_definitions(input: &str) -> Result<Vec<Function>> {
+    let normalized_input = normalize_ascii_aliases(input);
+    validate_symbols(&normalized_input)?;
+    check_forbidden_keywords(&normalized_input)?;
+    let clean_code = remove_comments(&normalized_input);
+    let (raw_definitions, _) = split_definitions(&clean_code)?;
+    let mut functions = Functions::new();
+    let mut ordered = Vec::new();
+    for raw in raw_definitions {
+        let function = with_functions(functions.clone(), || parse_definition(&raw))?;
+        functions.insert(function.name.clone(), function.clone());
+        ordered.push(function);
+    }
+    Ok(ordered)
+}
+
 /// Top-level parser for ρ (RHO) Language source code
 pub fn parse_rho_program(input: &str) -> Result<ToposBlock> {
     let normalized_input = normalize_ascii_aliases(input);

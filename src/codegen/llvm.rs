@@ -994,31 +994,6 @@ impl LlvmCodeGen {
         out
     }
 
-    /// Whether a gather in the expression reads the space the flow writes:
-    /// the sweep then stays scalar, so that its cells read what they read
-    /// before gathers ran a vector at a time.
-    fn gathers_from(&self, expr: &Expr, target: &str) -> bool {
-        match expr {
-            Expr::Gather { index, operand } => {
-                Self::place_name(operand).is_some_and(|n| n == target) || self.gathers_from(index, target)
-            }
-            Expr::Var(_) | Expr::Number(_) | Expr::Index { .. } | Expr::Call { .. } => false,
-            Expr::AuditTrace(inner)
-            | Expr::Shift { operand: inner, .. }
-            | Expr::Builtin { operand: inner, .. }
-            | Expr::Lift { operand: inner, .. }
-            | Expr::Scan { operand: inner, .. }
-            | Expr::Reduce { operand: inner, .. }
-            | Expr::Rotate { operand: inner, .. }
-            | Expr::Reverse { operand: inner, .. }
-            | Expr::Reshape { operand: inner, .. }
-            | Expr::Transpose { operand: inner, .. }
-            | Expr::Take { operand: inner, .. }
-            | Expr::Drop { operand: inner, .. } => self.gathers_from(inner, target),
-            Expr::BinaryOp { lhs, rhs, .. } => self.gathers_from(lhs, target) || self.gathers_from(rhs, target),
-        }
-    }
-
     /// The first read out of order in an expression, as `explain` says it.
     fn turn_kind(&self, expr: &Expr) -> Option<&'static str> {
         match expr {
@@ -1450,6 +1425,20 @@ impl LlvmCodeGen {
                         }
                         _ => None,
                     };
+                    let written = self.written_names(target);
+                    let mut was = Vec::new();
+                    if matches!(target, FlowTarget::Equilibrium)
+                        && self.space_shapes.contains_key("INPUT")
+                        && Self::reads_elsewhere(src, &["INPUT".to_string()], false, &self.space_shapes)
+                    {
+                        let (input_was, join) = self.snapshot_if_aliased(ir, bufs, &target_ptr, &label)?;
+                        was.extend(input_was);
+                        pred = join;
+                    }
+                    if Self::reads_elsewhere(src, &written, false, &self.space_shapes) {
+                        let copy = self.reserve_snapshot(ir, bufs, &written, &label);
+                        was.extend(self.take_snapshot(ir, bufs, &written, &target_ptr, &copy));
+                    }
                     pred = self.emit_sweep(
                         src,
                         target,
@@ -1462,6 +1451,7 @@ impl LlvmCodeGen {
                         counter,
                         None,
                     )?;
+                    bufs.map.extend(was);
                     if let Some(skip) = guarded {
                         pred = Self::close_given(ir, &skip);
                     }
@@ -1478,6 +1468,123 @@ impl LlvmCodeGen {
         }
 
         Ok(())
+    }
+
+    /// The name a flow's target goes by.
+    fn written_names(&self, target: &FlowTarget) -> Vec<String> {
+        match target {
+            FlowTarget::Var(name) => vec![name.clone()],
+            FlowTarget::Equilibrium => vec!["OUTPUT".to_string()],
+        }
+    }
+
+    /// INPUT may be OUTPUT's own buffer at run time: an unbound OUTPUT
+    /// beside a bound INPUT, a null output pointer to the two-pointer form,
+    /// or a caller passing one pointer for both. A flow into OUTPUT that
+    /// reads INPUT elsewhere than at the cell it writes then reads a copy,
+    /// taken only when the two are the same. Returns the bindings to restore
+    /// and the block the sweep starts from.
+    fn snapshot_if_aliased(
+        &self,
+        ir: &mut String,
+        bufs: &mut Buffers,
+        target_ptr: &str,
+        label: &str,
+    ) -> Result<(Vec<(String, String)>, String)> {
+        let input = self.lookup(bufs, "INPUT")?;
+        let cells = self.shape_for("INPUT").iter().product::<usize>().max(1);
+        let copy = self.emit_scratch(ir, &format!("{label}_in_was"), cells, &mut bufs.heap);
+        let align = self.precision.bytes();
+        let (copying, join, read) = (format!("{label}.alias_copy"), format!("{label}.alias_join"), format!("%{label}.in"));
+        ir.push_str("  ; [INPUT] may be OUTPUT's buffer, written in place: the sweep then reads a copy\n");
+        ir.push_str(&format!("  %{label}.alias = icmp eq ptr {input}, {target_ptr}\n"));
+        ir.push_str(&format!("  br i1 %{label}.alias, label %{copying}, label %{join}\n\n{copying}:\n"));
+        ir.push_str(&format!(
+            "  call void @llvm.memcpy.p0.p0.i64(ptr align {align} {copy}, ptr align {align} {input}, i64 {}, i1 false)\n",
+            cells * align
+        ));
+        ir.push_str(&format!("  br label %{join}\n\n{join}:\n"));
+        ir.push_str(&format!("  {read} = select i1 %{label}.alias, ptr {copy}, ptr {input}\n"));
+        if bufs.parallel {
+            self.share(ir, &read);
+        }
+        let was = bufs.map.insert("INPUT".to_string(), read).map(|old| ("INPUT".to_string(), old));
+        Ok((was.into_iter().collect(), join))
+    }
+
+    /// Whether `expr` reads one of `names` at a cell other than the one the
+    /// sweep writes: shifted, turned, gathered, stretched or reshaped to
+    /// another count. A sweep writes its target in place, a cell at a time
+    /// (or a vector, or a part on each thread), so such a read would see
+    /// cells already overwritten; the interpreter, which is the meaning,
+    /// reads the values from before the flow. A fold is computed before the
+    /// sweep, and reads them; `⍳` reads no cell.
+    fn reads_elsewhere(
+        expr: &Expr,
+        names: &[String],
+        displaced: bool,
+        shapes: &BTreeMap<String, Vec<usize>>,
+    ) -> bool {
+        let again = |e: &Expr, d: bool| Self::reads_elsewhere(e, names, d, shapes);
+        match expr {
+            Expr::Var(name) => displaced && names.contains(name),
+            Expr::Number(_) | Expr::Index { .. } | Expr::Call { .. } => false,
+            Expr::Reduce { .. } | Expr::Scan { .. } => false,
+            Expr::AuditTrace(inner) | Expr::Builtin { operand: inner, .. } => again(inner, displaced),
+            Expr::Shift { operand, .. }
+            | Expr::Rotate { operand, .. }
+            | Expr::Reverse { operand, .. }
+            | Expr::Transpose { operand, .. }
+            | Expr::Take { operand, .. }
+            | Expr::Drop { operand, .. }
+            | Expr::Lift { operand, .. } => again(operand, true),
+            Expr::Reshape { shape, operand } => {
+                let same = Self::expr_shape(operand, shapes)
+                    .is_some_and(|s| s.iter().product::<usize>() == shape.iter().product::<usize>());
+                again(operand, displaced || !same)
+            }
+            Expr::Gather { index, operand } => again(operand, true) || again(index, displaced),
+            Expr::BinaryOp { lhs, rhs, .. } => again(lhs, displaced) || again(rhs, displaced),
+        }
+    }
+
+    /// Room for a copy of a flow's target, as large as the target.
+    fn reserve_snapshot(&self, ir: &mut String, bufs: &mut Buffers, written: &[String], label: &str) -> String {
+        let cells = self.shape_for(&written[0]).iter().product::<usize>().max(1);
+        let copy = self.emit_scratch(ir, &format!("{label}_was"), cells, &mut bufs.heap);
+        if bufs.parallel {
+            self.share(ir, &copy);
+        }
+        copy
+    }
+
+    /// Copy the target as it is into `copy` and point every name it goes by
+    /// at the copy for the sweep's reads; returns the bindings to restore.
+    fn take_snapshot(
+        &self,
+        ir: &mut String,
+        bufs: &mut Buffers,
+        written: &[String],
+        target_ptr: &str,
+        copy: &str,
+    ) -> Vec<(String, String)> {
+        let cells = self.shape_for(&written[0]).iter().product::<usize>().max(1);
+        let align = self.precision.bytes();
+        ir.push_str(&format!(
+            "  ; [{}] is read elsewhere than where it is written: the sweep reads a copy\n",
+            written[0]
+        ));
+        ir.push_str(&format!(
+            "  call void @llvm.memcpy.p0.p0.i64(ptr align {align} {copy}, ptr align {align} {target_ptr}, i64 {}, i1 false)\n",
+            cells * align
+        ));
+        let mut was = Vec::new();
+        for name in written {
+            if let Some(old) = bufs.map.insert(name.clone(), copy.to_string()) {
+                was.push((name.clone(), old));
+            }
+        }
+        was
     }
 
     /// One full sweep of `src` into `target_ptr`: the folds it needs first,
@@ -1508,11 +1615,7 @@ impl LlvmCodeGen {
         // A read that wraps at the end of an axis is not contiguous, so it
         // cannot be vector loaded; nor is a stretched read, unless every
         // lane of a chunk still lands on the next cell of its source.
-        let writes = match target {
-            FlowTarget::Var(n) => n.clone(),
-            FlowTarget::Equilibrium => "OUTPUT".to_string(),
-        };
-        let plan = if self.turns(src) || self.gathers_from(src, &writes) {
+        let plan = if self.turns(src) {
             Sweep::AllScalar
         } else if self.needs_broadcast(src, &result_shape, &[]) {
             if self.stretched_contiguously(src, &result_shape, &[], VECTOR_WIDTH, false) {
@@ -1531,7 +1634,6 @@ impl LlvmCodeGen {
             let plan_text = match &plan {
                 Sweep::Split { width, aligned: true, .. } => format!("vector ×{width}, rows stretched over rows"),
                 Sweep::Split { width, .. } => format!("vector ×{width}"),
-                Sweep::AllScalar if self.gathers_from(src, &writes) => "scalar: `⌷` reads the space it writes".to_string(),
                 Sweep::AllScalar => format!("scalar: {}", self.scalar_reason(src, &result_shape, &sweep)),
             };
             self.notes.borrow_mut().push(FlowNote {
@@ -1847,9 +1949,18 @@ impl LlvmCodeGen {
         if bufs.parallel {
             self.share(ir, &next);
         }
-        for flow in prelude {
-            if let Statement::Flow { src, .. } = flow {
+        // A prelude flow that reads its own space elsewhere than at the
+        // cell it writes reads a copy taken before it, made here, outside
+        // the rounds, so that the stack does not grow with them.
+        let mut copies = BTreeMap::new();
+        for (i, flow) in prelude.iter().enumerate() {
+            if let Statement::Flow { src, target } = flow {
                 self.reserve_fold_buffers(src, ir, bufs, counter)?;
+                let written = self.written_names(target);
+                if Self::reads_elsewhere(src, &written, false, &self.space_shapes) {
+                    let copy = self.reserve_snapshot(ir, bufs, &written, &format!("{label}.p{i}"));
+                    copies.insert(i, copy);
+                }
             }
         }
         self.reserve_fold_buffers(src, ir, bufs, counter)?;
@@ -1902,6 +2013,8 @@ impl LlvmCodeGen {
                 inner_pred = run;
                 skip
             });
+            let written = vec![t.clone()];
+            let was = copies.get(&i).map(|copy| self.take_snapshot(ir, bufs, &written, &ptr, copy));
             inner_pred = self.emit_sweep(
                 flow_src,
                 &FlowTarget::Var(t.clone()),
@@ -1914,6 +2027,9 @@ impl LlvmCodeGen {
                 counter,
                 None,
             )?;
+            if let Some(was) = was {
+                bufs.map.extend(was);
+            }
             if let Some(skip) = guarded {
                 inner_pred = Self::close_given(ir, &skip);
             }

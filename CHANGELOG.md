@@ -69,13 +69,26 @@ needs.
   inside their reader and never stored: ML-KEM's matrix-vector product for
   k = 4 used 2.1 MB of stack, more than a thread is given by default, and
   uses 222 KB.
+- **A flow that reads the space it writes reads it as it was.** The
+  interpreter, which is the meaning, computes a flow whole and then stores
+  it. The kernel wrote the target as it swept it, so a flow that read its
+  target at another cell (shifted, rotated, reversed, gathered, stretched)
+  read cells already overwritten, differently on one thread and on several:
+  `(▷Y + Y) → Y` gave another Y. Such a flow now reads a copy of its target
+  taken before the sweep. So does a flow into OUTPUT that reads INPUT at
+  another cell, when the two are one buffer at run time (the two-pointer
+  form with a null output, an unbound OUTPUT beside a bound INPUT): the
+  pointers are compared and the copy taken only then. A flow that reads its
+  target only at the cell it writes, and every other, is compiled as before,
+  byte for byte. difftest now writes an intermediate again from itself, one
+  in four; on the old compiler its first seed found four disagreements in
+  fifteen programs.
 - **A gather runs a vector at a time.** A flow with `⌷` in it ran one cell
   at a time, the whole flow, though only the read is out of order. Its
   positions are now computed four lanes at once like anything else, each
   lane loads its own cell, and the rest of the flow stays vector: Rhodium's
   NTT (seven of its fourteen sweeps gather a partner) went from 30 to 24 us,
-  its inverse from 29.5 to 22. A gather from the space its flow writes stays
-  one cell at a time, as it was (`--explain` says so). The positions are
+  its inverse from 29.5 to 22. The positions are
   converted to 32-bit integers, which x86-64 does four at once without
   AVX-512.
 - **`rhoc --emit-static LIB.a --symbol-prefix P`** writes the kernel as a

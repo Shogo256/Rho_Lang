@@ -477,6 +477,16 @@ fn program(rng: &mut Rng, dims: &str, shape: &[usize]) -> (String, Option<Vec<us
         ));
         spaces.push((name.clone(), target.clone()));
 
+        // One in four is then written again from itself, read at the cell
+        // before: every cell must read the value from before this flow,
+        // though the kernel writes the space as it sweeps it.
+        if rng.below(4) == 0 {
+            body.push_str(&format!(
+                "    ({} + (▷{name})) → {name}\n",
+                expression(rng, 2, &spaces, &target)
+            ));
+        }
+
         // One intermediate in four is then iterated: a body of its own shape,
         // anchored to a space so that it has one.
         if rng.below(4) == 0 {

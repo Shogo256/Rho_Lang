@@ -4724,6 +4724,100 @@ fn test_a_row_stretched_over_rows_keeps_the_vector_path() {
 }
 
 #[test]
+fn test_a_grid_transformed_in_place_reads_its_cells_as_they_were() {
+    // A null output pointer makes the two-pointer form write over its
+    // input. A flow into OUTPUT that reads INPUT at another cell read cells
+    // already written: here every cell its left neighbour's new value.
+    let source = r#"{
+        INPUT:◯ □ 64 1
+        ((▷INPUT) + (2.0 × INPUT) + (-1 ⌽ INPUT)) → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let input: Vec<f64> = (0..64).map(|i| 1.0 + (i as f64 * 0.7).sin()).collect();
+    let mut env: Env<f64> = Env::new();
+    env.insert("INPUT".to_string(), Grid::from(vec![64, 1], input.clone()));
+    let meant = interpret(&block, &env, 0.0).unwrap()["OUTPUT"].cells.clone();
+    for threads in [1, 4] {
+        let name = format!("in_place_{threads}");
+        let mut codegen = LlvmCodeGen::new(&name).with_threads(threads).with_grain(1);
+        let ir = codegen.generate_llvm_ir(&block).unwrap();
+        let so_path = format!("target/{name}.so");
+        codegen.compile_to_so(&ir, &so_path).unwrap();
+        let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
+        let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
+            unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+        // Apart, and then in place.
+        let mut out = vec![0.0; 64];
+        unsafe { func(input.as_ptr(), out.as_mut_ptr()) };
+        assert_eq!(bits(&out), bits(&meant), "{name}, apart");
+        let mut grid = input.clone();
+        // The kernel writes the grid it reads: the pointer is a mutable one.
+        unsafe { func(grid.as_mut_ptr().cast_const(), std::ptr::null_mut()) };
+        assert_eq!(bits(&grid), bits(&meant), "{name}, in place");
+    }
+}
+
+#[test]
+fn test_a_flow_that_reads_its_own_space_reads_it_as_it_was() {
+    // The interpreter computes a flow whole, then stores it: every cell
+    // reads the values from before. The kernel wrote in place, so a shift,
+    // a rotation, a reversal or a gather of the target read cells the sweep
+    // had already overwritten, in an order that depended on the vectors and
+    // the threads.
+    let source = r#"{
+        X:◯ □ 6 12
+        P:◯ □ 1 12
+        (X × 2.0) → Y
+        (▷Y + Y) → Y
+        (1 ⌽ Y) - (0.5 × Y) → Y
+        (⌽Y + Y) → Y
+        ((((⍳0 Y) × 12.0) + P) ⌷ Y) + Y → Y
+        (Y × 3.0) → Y
+        (Y + X) → OUTPUT
+        OUTPUT → =
+    }"#;
+    let block = parse_rho_program(source).unwrap();
+    let ramp = |n: usize, k: f64| -> Vec<f64> { (0..n).map(|i| 2.0 + ((i as f64) * k).sin()).collect() };
+    // Each cell's partner in its row: 0 <-> 1, 2 <-> 3, ...
+    let partners: Vec<f64> = (0..12).map(|j| (j ^ 1) as f64).collect();
+    let inputs = [
+        ("X", vec![6, 12], ramp(72, 0.37)),
+        ("P", vec![1, 12], partners),
+    ];
+    let mut env: Env<f64> = Env::new();
+    for (name, shape, cells) in &inputs {
+        env.insert(name.to_string(), Grid::from(shape.clone(), cells.clone()));
+    }
+    let meant = interpret(&block, &env, 0.0).unwrap();
+    for (threads, grain) in [(1, 16384), (3, 1), (5, 1)] {
+        let name = format!("own_space_{threads}_{grain}");
+        let mut codegen = LlvmCodeGen::new(&name).with_threads(threads).with_grain(grain);
+        let ir = codegen.generate_llvm_ir(&block).unwrap();
+        let so_path = format!("target/{name}.so");
+        codegen.compile_to_so(&ir, &so_path).unwrap();
+        let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
+        let spaces = kernel_spaces(&lib);
+        let mut buffers: std::collections::BTreeMap<String, Vec<f64>> = spaces
+            .iter()
+            .map(|(n, cells, _)| {
+                let given = inputs.iter().find(|(i, _, _)| i == n).map(|(_, _, c)| c.clone());
+                (n.clone(), given.unwrap_or_else(|| vec![0.0; (*cells).max(1)]))
+            })
+            .collect();
+        let table: Vec<*mut f64> = spaces.iter().map(|(n, _, _)| buffers.get_mut(n).unwrap().as_mut_ptr()).collect();
+        let exec: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> =
+            unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+        unsafe { exec(table.as_ptr()) };
+        assert_eq!(bits(&buffers["OUTPUT"]), bits(&meant["OUTPUT"].cells), "{name}");
+    }
+    // A copy for each flow that reads its target elsewhere, and none for
+    // the one that reads it at the cell it writes: four in the pool's body
+    // and four in the bounded entrypoint's.
+    let ir = LlvmCodeGen::new("own_space_plan").generate_llvm_ir(&block).unwrap();
+    assert_eq!(ir.matches("is read elsewhere than where it is written").count(), 8, "{ir}");
+}
+
+#[test]
 fn test_a_function_of_two_can_be_written_between_its_arguments() {
     // `A mix B` is `mix A B`, bit for bit.
     let input: Vec<f64> = (0..8).map(|i| (i as f64 * 0.9).sin()).collect();
@@ -5190,8 +5284,8 @@ fn test_constant_time_refuses_what_could_follow_a_secret() {
 
 #[test]
 fn test_explain_says_what_each_flow_became() {
-    // A gather (vector), a gather from the space it writes (one cell at a
-    // time), a table row stretched over rows (vector), a column stretched
+    // A gather (vector), a gather from the space it writes (vector, from a
+    // copy of the space), a table row stretched over rows (vector), a column stretched
     // along rows (one cell at a time), an
     // intermediate fused into its reader, a fold computed first, a `⇒`.
     let source = r#"{
@@ -5218,8 +5312,7 @@ fn test_explain_says_what_each_flow_became() {
             .unwrap_or_else(|| panic!("no row for {target}:\n{text}"))
             .to_string()
     };
-    assert!(text.contains("G            32  vector ×4"), "{text}");
-    assert!(text.contains("G            32  scalar: `⌷` reads the space it writes"), "{text}");
+    assert_eq!(text.matches("G            32  vector ×4").count(), 2, "{text}");
     assert!(row("C").contains("vector ×4, rows stretched over rows"), "{text}");
     assert!(row("B").contains("scalar: a stretched read is not contiguous"), "{text}");
     assert!(row("B").contains("1 fold pass first"), "{text}");
@@ -5229,7 +5322,7 @@ fn test_explain_says_what_each_flow_became() {
     assert!(text.contains("  ⇒ Y: 1 sweep and 0 fold passes a round, at most 8 rounds\n"), "{text}");
     assert!(text.contains("fused: 1 intermediate,"), "{text}");
     // The bounded entrypoint emits the flows again; they are said once.
-    assert_eq!(text.matches("scalar: `⌷`").count(), 1, "{text}");
+    assert_eq!(text.matches("a stretched read is not contiguous").count(), 1, "{text}");
 }
 
 #[test]

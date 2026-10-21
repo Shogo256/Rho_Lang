@@ -69,6 +69,12 @@ needs.
   inside their reader and never stored: ML-KEM's matrix-vector product for
   k = 4 used 2.1 MB of stack, more than a thread is given by default, and
   uses 222 KB.
+- **A single-precision kernel runs eight lanes to a vector step**, where
+  it ran four, as a double-precision one does: a step is one 32-byte AVX
+  register either way. Rhodium's ML-KEM NTT, written to stay exact in
+  single precision, takes 17.0 us against 27.5 in double (same machine,
+  same conditions). Double-precision kernels are compiled as before, byte
+  for byte.
 - **`rhoc --emit-lean FILE.lean`** writes a source's functions as Lean 4
   definitions over the integers, for proofs about them, and compiles
   nothing; a file of definitions alone is accepted. The subset is the

@@ -1943,7 +1943,7 @@ fn test_a_narrow_kernel_computes_in_narrow_arithmetic() {
         .generate_llvm_ir(&block)
         .unwrap();
     assert!(ir.contains("load float"), "{ir}");
-    assert!(ir.contains("<4 x float>"), "{ir}");
+    assert!(ir.contains("<8 x float>"), "eight singles to a vector step:\n{ir}");
     assert!(!ir.contains("double"), "no double should survive:\n{ir}");
     assert!(
         ir.contains("precision\\22:\\22f32"),
@@ -5594,4 +5594,16 @@ uses:{ X (next X) }
         let status = std::process::Command::new(lean_bin).arg(path).status().unwrap();
         assert!(status.success(), "{lean}");
     }
+}
+
+#[test]
+fn test_a_vector_step_is_one_register_at_either_precision() {
+    // Four doubles or eight singles to a 32-byte step: a single-precision
+    // kernel runs twice the lanes, and computes what the interpreter does.
+    let source = "{\n    INPUT:◯ □ 64 1\n    ((INPUT × 3.0) + 1.0) → =\n}";
+    let block = parse_rho_program(source).unwrap();
+    let ir64 = LlvmCodeGen::new("lanes64").generate_llvm_ir(&block).unwrap();
+    assert!(ir64.contains("<4 x double>") && !ir64.contains("<8 x double>"));
+    let ir32 = LlvmCodeGen::new("lanes32").with_precision(Precision::F32).generate_llvm_ir(&block).unwrap();
+    assert!(ir32.contains("<8 x float>") && !ir32.contains("<4 x float>"), "{ir32}");
 }

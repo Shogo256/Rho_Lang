@@ -20,9 +20,9 @@ const CTX_SLOTS: &str = "@@rho_ctx_slots@@";
 /// so a 1024x1024 grid cannot blow the 8 MB default stack.
 const STACK_LIMIT_BYTES: usize = 64 * 1024;
 
-/// Lanes per vector step. Four doubles is one AVX register; clang widens
-/// further when the target allows it.
-const VECTOR_WIDTH: usize = 4;
+/// Bytes per vector step: one AVX register, four doubles or eight singles;
+/// clang widens further when the target allows it.
+const VECTOR_BYTES: usize = 32;
 
 /// Whether a chunk of a flow is lowered one cell at a time or a vector at a time.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -525,7 +525,7 @@ impl LlvmCodeGen {
         if self.simd {
             ir.push_str(&format!(
                 "declare <{w} x {elem}> @llvm.pow.v{w}{suffix}(<{w} x {elem}>, <{w} x {elem}>)\n",
-                w = VECTOR_WIDTH
+                w = self.lanes()
             ));
         }
         // The greater and the lesser are IEEE 754-2019 maximum and minimum:
@@ -540,7 +540,7 @@ impl LlvmCodeGen {
             if self.simd {
                 ir.push_str(&format!(
                     "declare <{w} x {elem}> @llvm.{name}.v{w}{suffix}(<{w} x {elem}>, <{w} x {elem}>)\n",
-                    w = VECTOR_WIDTH
+                    w = self.lanes()
                 ));
             }
         }
@@ -551,7 +551,7 @@ impl LlvmCodeGen {
             if self.simd {
                 ir.push_str(&format!(
                     "declare <{w} x {elem}> @llvm.{name}.v{w}{suffix}(<{w} x {elem}>)\n",
-                    w = VECTOR_WIDTH
+                    w = self.lanes()
                 ));
             }
         }
@@ -930,7 +930,7 @@ impl LlvmCodeGen {
             return turn.to_string();
         }
         if self.needs_broadcast(src, result_shape, &[])
-            && !self.stretched_contiguously(src, result_shape, &[], VECTOR_WIDTH, false)
+            && !self.stretched_contiguously(src, result_shape, &[], self.lanes(), false)
         {
             return "a stretched read is not contiguous (a column stretched along a row, or under a shift)"
                 .to_string();
@@ -1470,6 +1470,11 @@ impl LlvmCodeGen {
         Ok(())
     }
 
+    /// Lanes per vector step at this precision.
+    fn lanes(&self) -> usize {
+        VECTOR_BYTES / self.precision.bytes()
+    }
+
     /// The name a flow's target goes by.
     fn written_names(&self, target: &FlowTarget) -> Vec<String> {
         match target {
@@ -1618,7 +1623,7 @@ impl LlvmCodeGen {
         let plan = if self.turns(src) {
             Sweep::AllScalar
         } else if self.needs_broadcast(src, &result_shape, &[]) {
-            if self.stretched_contiguously(src, &result_shape, &[], VECTOR_WIDTH, false) {
+            if self.stretched_contiguously(src, &result_shape, &[], self.lanes(), false) {
                 self.plan_sweep(src, &sweep, true)?
             } else {
                 Sweep::AllScalar
@@ -2772,7 +2777,7 @@ impl LlvmCodeGen {
             return Ok(Sweep::AllScalar);
         }
 
-        let width = VECTOR_WIDTH as u64;
+        let width = self.lanes() as u64;
         let reach = self.max_shift_stride(src)?;
 
         // The body may touch [idx - reach, idx + reach + width - 1].

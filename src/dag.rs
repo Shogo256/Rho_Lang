@@ -1,8 +1,61 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::ast::*;
 use crate::error::Result;
-use petgraph::graph::{DiGraph, NodeIndex};
 use std::collections::HashMap;
+
+/// A node's place in a [`DiGraph`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeIndex(usize);
+
+/// A directed graph that keeps what it is given: nodes, and edges between
+/// them with a weight, parallel edges and cycles included.
+#[derive(Debug, Clone)]
+pub struct DiGraph<N, E> {
+    nodes: Vec<N>,
+    edges: Vec<(NodeIndex, NodeIndex, E)>,
+}
+
+impl<N, E> DiGraph<N, E> {
+    pub fn new() -> Self {
+        DiGraph { nodes: Vec::new(), edges: Vec::new() }
+    }
+
+    pub fn add_node(&mut self, node: N) -> NodeIndex {
+        self.nodes.push(node);
+        NodeIndex(self.nodes.len() - 1)
+    }
+
+    pub fn add_edge(&mut self, from: NodeIndex, to: NodeIndex, weight: E) {
+        self.edges.push((from, to, weight));
+    }
+
+    /// The sources of the edges into `node`, the edge added last first, a
+    /// source once for each edge from it.
+    pub fn incoming(&self, node: NodeIndex) -> impl Iterator<Item = NodeIndex> + '_ {
+        self.edges.iter().rev().filter(move |(_, to, _)| *to == node).map(|(from, _, _)| *from)
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+}
+
+impl<N, E> Default for DiGraph<N, E> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<N, E> std::ops::Index<NodeIndex> for DiGraph<N, E> {
+    type Output = N;
+    fn index(&self, i: NodeIndex) -> &N {
+        &self.nodes[i.0]
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DagNode {
@@ -128,11 +181,7 @@ impl RhoDag {
             out.push_str(&format!("{}  └─ Expr: {:?}\n", pad, expr));
         }
 
-        let neighbors = self
-            .graph
-            .neighbors_directed(node_idx, petgraph::Direction::Incoming);
-
-        for parent in neighbors {
+        for parent in self.graph.incoming(node_idx) {
             self.trace_recursive(parent, indent + 1, out, visited);
         }
     }

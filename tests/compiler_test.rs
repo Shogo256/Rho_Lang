@@ -122,8 +122,8 @@ fn test_generated_kernel_writes_output_values() {
     let so_path = "target/runtime_kernel.so";
     assert!(codegen.compile_to_so(&ir, so_path).is_ok());
 
-    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
-    let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> = unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(so_path)).unwrap();
+    let func: unsafe extern "C" fn(*const f64, *mut f64) = unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
     let input = [1.0, 2.0, 3.0, 4.0];
     let mut output = [0.0; 4];
     unsafe { func(input.as_ptr(), output.as_mut_ptr()) };
@@ -178,13 +178,13 @@ fn run_kernel(name: &str, source: &str, input: &[f64]) -> Vec<f64> {
     let so_path = format!("target/{name}.so");
     assert!(codegen.compile_to_so(&ir, &so_path).is_ok(), "{name} should link");
 
-    let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
-    let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
-        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(&so_path)).unwrap();
+    let func: unsafe extern "C" fn(*const f64, *mut f64) =
+        unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
     // The buffers hold what the kernel says it needs, which covers an output
     // larger than the input.
-    let count: libloading::Symbol<unsafe extern "C" fn() -> i64> =
-        unsafe { lib.get(b"rho_kernel_element_count").unwrap() };
+    let count: unsafe extern "C" fn() -> i64 =
+        unsafe { lib.get("rho_kernel_element_count").unwrap() };
     let needed = (unsafe { count() } as usize).max(input.len());
     let mut padded_input = input.to_vec();
     padded_input.resize(needed, 0.0);
@@ -316,9 +316,9 @@ fn test_bounded_entrypoint_clamps_the_sweep() {
     let so_path = "target/bounded_kernel.so";
     assert!(codegen.compile_to_so(&ir, so_path).is_ok());
 
-    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
-    let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64, i64)> =
-        unsafe { lib.get(b"rho_kernel_exec_bounded").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(so_path)).unwrap();
+    let func: unsafe extern "C" fn(*const f64, *mut f64, i64) =
+        unsafe { lib.get("rho_kernel_exec_bounded").unwrap() };
 
     // The kernel declares 8 cells; the caller owns 4 and says so.
     let input = [1.0, 2.0, 3.0, 4.0];
@@ -541,13 +541,13 @@ fn run_variant(name: &str, source: &str, input: &[f64], simd: bool) -> Vec<f64> 
     let so_path = format!("target/{name}.so");
     assert!(codegen.compile_to_so(&ir, &so_path).is_ok(), "{name} should link");
 
-    let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
-    let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
-        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(&so_path)).unwrap();
+    let func: unsafe extern "C" fn(*const f64, *mut f64) =
+        unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
     // The buffers hold what the kernel says it needs, which covers an output
     // larger than the input.
-    let count: libloading::Symbol<unsafe extern "C" fn() -> i64> =
-        unsafe { lib.get(b"rho_kernel_element_count").unwrap() };
+    let count: unsafe extern "C" fn() -> i64 =
+        unsafe { lib.get("rho_kernel_element_count").unwrap() };
     let needed = (unsafe { count() } as usize).max(input.len());
     let mut padded_input = input.to_vec();
     padded_input.resize(needed, 0.0);
@@ -938,9 +938,9 @@ fn test_zero_copy_binding_writes_the_supplied_address() {
     let so_path = "target/zero_copy.so";
     assert!(codegen.compile_to_so(&ir, so_path).is_ok());
 
-    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
-    let func: libloading::Symbol<unsafe extern "C" fn()> =
-        unsafe { lib.get(b"rho_kernel_exec").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(so_path)).unwrap();
+    let func: unsafe extern "C" fn() =
+        unsafe { lib.get("rho_kernel_exec").unwrap() };
     unsafe { func() };
 
     // No pointer was passed, yet the caller's buffer changed in place.
@@ -1003,9 +1003,9 @@ fn test_tau_binds_the_threshold_symbol() {
         let so_path = format!("target/{name}.so");
         assert!(codegen.compile_to_so(&ir, &so_path).is_ok());
 
-        let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
-        let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
-            unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+        let lib = rho_lang::dl::Library::open(std::path::Path::new(&so_path)).unwrap();
+        let func: unsafe extern "C" fn(*const f64, *mut f64) =
+            unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
         let mut out = vec![0.0; 4];
         unsafe { func(input.as_ptr(), out.as_mut_ptr()) };
         assert_eq!(out, expected, "tau = {tau}");
@@ -1277,9 +1277,9 @@ fn run_bound(name: &str, source: &str, inputs: &[(&str, &[f64])], out_len: usize
     let so_path = format!("target/{name}.so");
     assert!(codegen.compile_to_so(&ir, &so_path).is_ok(), "{name} should link:\n{ir}");
 
-    let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
-    let func: libloading::Symbol<unsafe extern "C" fn()> =
-        unsafe { lib.get(b"rho_kernel_exec").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(&so_path)).unwrap();
+    let func: unsafe extern "C" fn() =
+        unsafe { lib.get("rho_kernel_exec").unwrap() };
     unsafe { func() };
     output
 }
@@ -1770,9 +1770,9 @@ fn test_the_indicator_of_nan_is_one_in_the_kernel_as_in_the_interpreter() {
     assert!(ir.contains("fcmp une"), "the indicator needs an unordered comparison:\n{ir}");
     let so_path = "target/ind_nan.so";
     assert!(codegen.compile_to_so(&ir, so_path).is_ok());
-    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
-    let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
-        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(so_path)).unwrap();
+    let func: unsafe extern "C" fn(*const f64, *mut f64) =
+        unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
     let mut output = vec![0.0f64; 4];
     unsafe { func(input.as_ptr(), output.as_mut_ptr()) };
     assert_eq!(output, meant);
@@ -1901,19 +1901,19 @@ fn run_at(name: &str, source: &str, input: &[f64], precision: Precision) -> Vec<
     let so_path = format!("target/{name}.so");
     assert!(codegen.compile_to_so(&ir, &so_path).is_ok(), "{name} should link");
 
-    let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(&so_path)).unwrap();
     match precision {
         Precision::F64 => {
-            let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
-                unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+            let func: unsafe extern "C" fn(*const f64, *mut f64) =
+                unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
             let mut out = vec![0.0f64; input.len()];
             unsafe { func(input.as_ptr(), out.as_mut_ptr()) };
             out
         }
         Precision::F32 => {
             let narrow: Vec<f32> = input.iter().map(|v| *v as f32).collect();
-            let func: libloading::Symbol<unsafe extern "C" fn(*const f32, *mut f32)> =
-                unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+            let func: unsafe extern "C" fn(*const f32, *mut f32) =
+                unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
             let mut out = vec![0.0f32; narrow.len()];
             unsafe { func(narrow.as_ptr(), out.as_mut_ptr()) };
             out.iter().map(|v| *v as f64).collect()
@@ -2025,9 +2025,9 @@ fn test_the_analysis_follows_the_width_it_was_made_at() {
 // --------------------------------------------------------------------------
 
 /// The spaces a kernel lists in its metadata, in table order: (name, cells, role).
-fn kernel_spaces(lib: &libloading::Library) -> Vec<(String, usize, String)> {
-    let meta: libloading::Symbol<unsafe extern "C" fn() -> *const std::os::raw::c_char> =
-        unsafe { lib.get(b"rho_kernel_metadata").unwrap() };
+fn kernel_spaces(lib: &rho_lang::dl::Library) -> Vec<(String, usize, String)> {
+    let meta: unsafe extern "C" fn() -> *const std::os::raw::c_char =
+        unsafe { lib.get("rho_kernel_metadata").unwrap() };
     let json = unsafe { std::ffi::CStr::from_ptr(meta()) }
         .to_str()
         .unwrap()
@@ -2067,7 +2067,7 @@ fn run_spaces(
     let so_path = format!("target/{name}.so");
     assert!(codegen.compile_to_so(&ir, &so_path).is_ok(), "{name} should link:\n{ir}");
 
-    let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(&so_path)).unwrap();
     let spaces = kernel_spaces(&lib);
     let mut buffers: std::collections::BTreeMap<String, Vec<f64>> = supplied
         .iter()
@@ -2089,8 +2089,8 @@ fn run_spaces(
         })
         .collect();
 
-    let func: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> =
-        unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+    let func: unsafe extern "C" fn(*const *mut f64) =
+        unsafe { lib.get("rho_kernel_exec_spaces").unwrap() };
     unsafe { func(table.as_ptr()) };
     buffers
 }
@@ -2129,7 +2129,7 @@ fn test_metadata_lists_every_space_with_its_role_in_table_order() {
     let ir = codegen.generate_llvm_ir(&block).unwrap();
     let so_path = "target/spaces_roles.so";
     assert!(codegen.compile_to_so(&ir, so_path).is_ok());
-    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(so_path)).unwrap();
 
     // The order is the table order, and the role says what a caller does
     // with each entry: supply it, read it back, or leave it to the kernel.
@@ -2160,9 +2160,9 @@ fn test_exec_spaces_leaves_an_unsupplied_intermediate_to_the_kernel() {
     let ir = codegen.generate_llvm_ir(&block).unwrap();
     let so_path = "target/spaces_gradient_ref.so";
     assert!(codegen.compile_to_so(&ir, so_path).is_ok());
-    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
-    let with_args: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
-        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(so_path)).unwrap();
+    let with_args: unsafe extern "C" fn(*const f64, *mut f64) =
+        unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
     let mut reference = vec![0.0f64; 16];
     unsafe { with_args(input.as_ptr(), reference.as_mut_ptr()) };
 
@@ -2209,9 +2209,9 @@ fn test_exec_spaces_returns_without_writing_when_an_input_is_null() {
     assert_eq!(out["OUTPUT"], sentinel);
 
     // A null table is refused the same way.
-    let lib = unsafe { libloading::Library::new("target/spaces_missing_input.so").unwrap() };
-    let func: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> =
-        unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new("target/spaces_missing_input.so")).unwrap();
+    let func: unsafe extern "C" fn(*const *mut f64) =
+        unsafe { lib.get("rho_kernel_exec_spaces").unwrap() };
     unsafe { func(std::ptr::null()) };
 }
 
@@ -2233,10 +2233,10 @@ fn test_exec_spaces_and_exec_with_args_agree_bit_for_bit() {
     let ir = codegen.generate_llvm_ir(&block).unwrap();
     let so_path = "target/spaces_agree.so";
     assert!(codegen.compile_to_so(&ir, so_path).is_ok(), "{ir}");
-    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(so_path)).unwrap();
 
-    let with_args: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
-        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let with_args: unsafe extern "C" fn(*const f64, *mut f64) =
+        unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
     let mut expected = vec![0.0f64; 12];
     unsafe { with_args(input.as_ptr(), expected.as_mut_ptr()) };
 
@@ -2253,8 +2253,8 @@ fn test_exec_spaces_and_exec_with_args_agree_bit_for_bit() {
         actual.as_mut_ptr(),
         std::ptr::null_mut(),
     ];
-    let exec_spaces: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> =
-        unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+    let exec_spaces: unsafe extern "C" fn(*const *mut f64) =
+        unsafe { lib.get("rho_kernel_exec_spaces").unwrap() };
     unsafe { exec_spaces(table.as_ptr()) };
 
     let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
@@ -2266,11 +2266,11 @@ fn test_exec_spaces_and_exec_with_args_agree_bit_for_bit() {
     let ir = codegen.generate_llvm_ir(&block).unwrap();
     let so_path = "target/spaces_agree_f32.so";
     assert!(codegen.compile_to_so(&ir, so_path).is_ok(), "{ir}");
-    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(so_path)).unwrap();
 
     let narrow: Vec<f32> = input.iter().map(|x| *x as f32).collect();
-    let with_args: libloading::Symbol<unsafe extern "C" fn(*const f32, *mut f32)> =
-        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let with_args: unsafe extern "C" fn(*const f32, *mut f32) =
+        unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
     let mut expected = vec![0.0f32; 12];
     unsafe { with_args(narrow.as_ptr(), expected.as_mut_ptr()) };
 
@@ -2282,8 +2282,8 @@ fn test_exec_spaces_and_exec_with_args_agree_bit_for_bit() {
         actual.as_mut_ptr(),
         std::ptr::null_mut(),
     ];
-    let exec_spaces: libloading::Symbol<unsafe extern "C" fn(*const *mut f32)> =
-        unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+    let exec_spaces: unsafe extern "C" fn(*const *mut f32) =
+        unsafe { lib.get("rho_kernel_exec_spaces").unwrap() };
     unsafe { exec_spaces(table.as_ptr()) };
     let bits32 = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     assert_eq!(bits32(&actual), bits32(&expected));
@@ -2307,7 +2307,7 @@ fn test_equilibrium_target_declares_output_in_the_metadata() {
     );
     assert_eq!(out["OUTPUT"], vec![6.0, 15.0]);
 
-    let lib = unsafe { libloading::Library::new("target/spaces_equilibrium.so").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new("target/spaces_equilibrium.so")).unwrap();
     let spaces = kernel_spaces(&lib);
     assert_eq!(
         spaces,
@@ -2474,13 +2474,13 @@ fn compile_iterating(name: &str, source: &str, tau: f64, cap: usize, simd: bool)
 
 /// Run a compiled kernel over `input` and return (output, sweeps, converged).
 fn run_iterating(so_path: &str, input: &[f64], out_cells: usize) -> (Vec<f64>, i64, bool) {
-    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
-    let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
-        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
-    let sweeps: libloading::Symbol<unsafe extern "C" fn() -> i64> =
-        unsafe { lib.get(b"rho_kernel_sweeps").unwrap() };
-    let converged: libloading::Symbol<unsafe extern "C" fn() -> i64> =
-        unsafe { lib.get(b"rho_kernel_converged").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(so_path)).unwrap();
+    let func: unsafe extern "C" fn(*const f64, *mut f64) =
+        unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
+    let sweeps: unsafe extern "C" fn() -> i64 =
+        unsafe { lib.get("rho_kernel_sweeps").unwrap() };
+    let converged: unsafe extern "C" fn() -> i64 =
+        unsafe { lib.get("rho_kernel_converged").unwrap() };
     let mut output = vec![0.0f64; out_cells];
     unsafe { func(input.as_ptr(), output.as_mut_ptr()) };
     let (s, c) = unsafe { (sweeps(), converged()) };
@@ -2618,9 +2618,9 @@ fn test_iteration_at_single_precision_agrees_with_the_interpreter() {
     let ir = codegen.generate_llvm_ir(&block).unwrap();
     let so_path = "target/iter_f32.so";
     assert!(codegen.compile_to_so(&ir, so_path).is_ok(), "{ir}");
-    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
-    let func: libloading::Symbol<unsafe extern "C" fn(*const f32, *mut f32)> =
-        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(so_path)).unwrap();
+    let func: unsafe extern "C" fn(*const f32, *mut f32) =
+        unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
     let mut out = vec![0.0f32; 6];
     unsafe { func(b.as_ptr(), out.as_mut_ptr()) };
     assert_eq!(
@@ -4284,9 +4284,9 @@ fn test_a_fold_or_a_broadcast_inside_a_loop_makes_the_round_two_passes() {
         }
         // The sweep count is the kernel's.
         let so = compile_iterating(&format!("sv_loop_{name}_ref"), source, tau, 100, true);
-        let lib = unsafe { libloading::Library::new(&so).unwrap() };
-        let spaces: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> = unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
-        let sweeps: libloading::Symbol<unsafe extern "C" fn() -> i64> = unsafe { lib.get(b"rho_kernel_sweeps").unwrap() };
+        let lib = rho_lang::dl::Library::open(std::path::Path::new(&so)).unwrap();
+        let spaces: unsafe extern "C" fn(*const *mut f64) = unsafe { lib.get("rho_kernel_exec_spaces").unwrap() };
+        let sweeps: unsafe extern "C" fn() -> i64 = unsafe { lib.get("rho_kernel_sweeps").unwrap() };
         let mut bufs: Vec<Vec<f64>> = Vec::new();
         let order = kernel_spaces(&lib);
         for (space, cells, _) in &order {
@@ -4699,7 +4699,7 @@ fn test_a_row_stretched_over_rows_keeps_the_vector_path() {
         let ir = codegen.generate_llvm_ir(&block).unwrap();
         let so_path = format!("target/{name}.so");
         codegen.compile_to_so(&ir, &so_path).unwrap();
-        let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
+        let lib = rho_lang::dl::Library::open(std::path::Path::new(&so_path)).unwrap();
         let spaces = kernel_spaces(&lib);
         let mut buffers: std::collections::BTreeMap<String, Vec<f64>> = spaces
             .iter()
@@ -4709,8 +4709,8 @@ fn test_a_row_stretched_over_rows_keeps_the_vector_path() {
             })
             .collect();
         let table: Vec<*mut f64> = spaces.iter().map(|(n, _, _)| buffers.get_mut(n).unwrap().as_mut_ptr()).collect();
-        let exec: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> =
-            unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+        let exec: unsafe extern "C" fn(*const *mut f64) =
+            unsafe { lib.get("rho_kernel_exec_spaces").unwrap() };
         unsafe { exec(table.as_ptr()) };
         for space in ["P", "R", "OUTPUT"] {
             assert_eq!(bits(&buffers[space]), bits(&meant[space].cells), "{name}: {space}");
@@ -4743,9 +4743,9 @@ fn test_a_grid_transformed_in_place_reads_its_cells_as_they_were() {
         let ir = codegen.generate_llvm_ir(&block).unwrap();
         let so_path = format!("target/{name}.so");
         codegen.compile_to_so(&ir, &so_path).unwrap();
-        let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
-        let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
-            unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+        let lib = rho_lang::dl::Library::open(std::path::Path::new(&so_path)).unwrap();
+        let func: unsafe extern "C" fn(*const f64, *mut f64) =
+            unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
         // Apart, and then in place.
         let mut out = vec![0.0; 64];
         unsafe { func(input.as_ptr(), out.as_mut_ptr()) };
@@ -4795,7 +4795,7 @@ fn test_a_flow_that_reads_its_own_space_reads_it_as_it_was() {
         let ir = codegen.generate_llvm_ir(&block).unwrap();
         let so_path = format!("target/{name}.so");
         codegen.compile_to_so(&ir, &so_path).unwrap();
-        let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
+        let lib = rho_lang::dl::Library::open(std::path::Path::new(&so_path)).unwrap();
         let spaces = kernel_spaces(&lib);
         let mut buffers: std::collections::BTreeMap<String, Vec<f64>> = spaces
             .iter()
@@ -4805,8 +4805,8 @@ fn test_a_flow_that_reads_its_own_space_reads_it_as_it_was() {
             })
             .collect();
         let table: Vec<*mut f64> = spaces.iter().map(|(n, _, _)| buffers.get_mut(n).unwrap().as_mut_ptr()).collect();
-        let exec: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> =
-            unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+        let exec: unsafe extern "C" fn(*const *mut f64) =
+            unsafe { lib.get("rho_kernel_exec_spaces").unwrap() };
         unsafe { exec(table.as_ptr()) };
         assert_eq!(bits(&buffers["OUTPUT"]), bits(&meant["OUTPUT"].cells), "{name}");
     }
@@ -5031,8 +5031,8 @@ fn test_an_intermediate_read_once_cell_for_cell_is_computed_inside_its_reader() 
     assert_eq!(bits(&out), bits(&meant["OUTPUT"].cells));
     // The spaces entry, with and without buffers for A and B: the output is
     // the same, and a buffer passed for a fused space is filled all the same.
-    let lib = unsafe { libloading::Library::new(so).unwrap() };
-    let spaces: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> = unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(so)).unwrap();
+    let spaces: unsafe extern "C" fn(*const *mut f64) = unsafe { lib.get("rho_kernel_exec_spaces").unwrap() };
     let order = kernel_spaces(&lib);
     for pass_intermediates in [false, true] {
         let mut bufs: Vec<Vec<f64>> = order.iter().map(|(_, cells, _)| vec![0.0; *cells]).collect();
@@ -5110,8 +5110,8 @@ fn test_scratch_is_kept_between_calls_and_the_bits_do_not_change() {
     let mut env: Env<f64> = Env::new();
     env.insert("INPUT".to_string(), Grid::from(vec![64, 1024], grid.clone()));
     let meant = interpret_with(&block, &env, &Options { tau: 1e-9, max_sweeps: 50 }).unwrap()["OUTPUT"].cells.clone();
-    let lib = unsafe { libloading::Library::new(so).unwrap() };
-    let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> = unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(so)).unwrap();
+    let func: unsafe extern "C" fn(*const f64, *mut f64) = unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
     for call in 0..3 {
         let mut out = vec![0.0f64; 65536];
         unsafe { func(grid.as_ptr(), out.as_mut_ptr()) };
@@ -5226,12 +5226,12 @@ fn test_zeroize_overwrites_what_a_call_left_on_the_stack() {
     }
 
     let input: Vec<f64> = (0..256).map(|i| 1000.0 + (i as f64) * 0.375).collect();
-    let lib = unsafe { libloading::Library::new(so).unwrap() };
-    let scanner = unsafe { libloading::Library::new(scan_so).unwrap() };
-    let exec: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
-        unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
-    let zeroize: libloading::Symbol<unsafe extern "C" fn()> = unsafe { lib.get(b"rho_kernel_zeroize").unwrap() };
-    let scan: libloading::Symbol<unsafe extern "C" fn(i64, f64, f64) -> i64> = unsafe { scanner.get(b"scan").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(so)).unwrap();
+    let scanner = rho_lang::dl::Library::open(std::path::Path::new(scan_so)).unwrap();
+    let exec: unsafe extern "C" fn(*const f64, *mut f64) =
+        unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
+    let zeroize: unsafe extern "C" fn() = unsafe { lib.get("rho_kernel_zeroize").unwrap() };
+    let scan: unsafe extern "C" fn(i64, f64, f64) -> i64 = unsafe { scanner.get("scan").unwrap() };
     let mut out = vec![0.0; 256];
     unsafe { exec(input.as_ptr(), out.as_mut_ptr()) };
     let first = bits(&out);
@@ -5437,9 +5437,9 @@ fn test_calls_at_once_each_have_their_own_table() {
         let grids: Vec<Vec<f64>> = (0..8).map(|t| (0..cells).map(|i| ((i as f64) * 0.37 + t as f64).sin()).collect()).collect();
         let alone: Vec<Vec<u64>> = grids.iter().map(|g| bits(&run_iterating(&so_path, g, cells).0)).collect();
         assert!(alone.windows(2).all(|w| w[0] != w[1]));
-        let lib = unsafe { libloading::Library::new(&so_path).unwrap() };
-        let func: libloading::Symbol<unsafe extern "C" fn(*const f64, *mut f64)> =
-            unsafe { lib.get(b"rho_kernel_exec_with_args").unwrap() };
+        let lib = rho_lang::dl::Library::open(std::path::Path::new(&so_path)).unwrap();
+        let func: unsafe extern "C" fn(*const f64, *mut f64) =
+            unsafe { lib.get("rho_kernel_exec_with_args").unwrap() };
         std::thread::scope(|s| {
             for (grid, want) in grids.iter().zip(&alone) {
                 let (func, name) = (&func, &name);
@@ -5478,8 +5478,8 @@ fn test_a_fused_space_takes_no_memory_unless_passed() {
     let meant = interpret(&block, &env, 0.0).unwrap();
     let so_path = "target/fused_stack.so";
     codegen.compile_to_so(&ir, so_path).unwrap();
-    let lib = unsafe { libloading::Library::new(so_path).unwrap() };
-    let spaces: libloading::Symbol<unsafe extern "C" fn(*const *mut f64)> = unsafe { lib.get(b"rho_kernel_exec_spaces").unwrap() };
+    let lib = rho_lang::dl::Library::open(std::path::Path::new(so_path)).unwrap();
+    let spaces: unsafe extern "C" fn(*const *mut f64) = unsafe { lib.get("rho_kernel_exec_spaces").unwrap() };
     // Spaces in metadata order: A, OUTPUT, X.
     for pass_a in [false, true] {
         let mut a = vec![0.0f64; 256];

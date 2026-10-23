@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **No dependencies.** `rhoc` and the library are built from this
+  repository and Rust's standard library alone: the command line is read
+  by hand in place of clap (the same flags, `--flag VALUE` and
+  `--flag=VALUE`, `--help`, `--version`), errors are plain `Box<dyn Error>`
+  and a hand-written `Display` in place of anyhow and thiserror, the audit
+  DAG is a small graph of its own in place of petgraph (its trace in the
+  same order), kernels are loaded with dlopen (`rho_lang::dl`) in place of
+  libloading, and nom, declared but unused, is gone. Every kernel source
+  of Basis compiles to the same bytes as before.
+
 Found while writing the arithmetic of ML-KEM in ρ (the Rhodium project):
 seven NTT layers, a matrix-vector product mod q, and the tools that work
 needs.

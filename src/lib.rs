@@ -3,6 +3,7 @@ pub mod ast;
 pub mod codegen;
 pub mod consttime;
 pub mod dag;
+pub mod dl;
 pub mod error;
 pub mod numeric;
 pub mod interp;

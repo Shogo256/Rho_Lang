@@ -55,13 +55,11 @@ fn run_so<T: Copy + Default>(
     }
     let mut via_args = single_input.then(|| vec![T::default(); cells]);
     unsafe {
-        let lib = libloading::Library::new(so).unwrap();
-        let spaces: libloading::Symbol<unsafe extern "C" fn(*const *mut T)> =
-            lib.get(b"rho_kernel_exec_spaces").unwrap();
+        let lib = rho_lang::dl::Library::open(std::path::Path::new(so)).unwrap();
+        let spaces: unsafe extern "C" fn(*const *mut T) = lib.get("rho_kernel_exec_spaces").unwrap();
         spaces(table.as_ptr());
         if let Some(out) = via_args.as_mut() {
-            let run: libloading::Symbol<unsafe extern "C" fn(*const T, *mut T)> =
-                lib.get(b"rho_kernel_exec_with_args").unwrap();
+            let run: unsafe extern "C" fn(*const T, *mut T) = lib.get("rho_kernel_exec_with_args").unwrap();
             run(inputs["INPUT"].as_ptr(), out.as_mut_ptr());
         }
     }

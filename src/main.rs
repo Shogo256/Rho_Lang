@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-use clap::Parser;
 use rho_lang::codegen::LlvmCodeGen;
 use rho_lang::dag::RhoDag;
 use rho_lang::parser::parse_rho_program;
@@ -9,6 +8,17 @@ use std::path::{Path, PathBuf};
 
 /// The glyph, as the terminal draws it. Shown by `rhoc` on its own, at the
 /// top of `--help`, and at the start of every compile.
+/// Errors as `run` returns them: a message, or a disruption that knows its
+/// line, told apart by downcasting.
+type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// Return the formatted message as an error.
+macro_rules! bail {
+    ($($t:tt)*) => {
+        return Err(format!($($t)*).into())
+    };
+}
+
 const BANNER: &str = r#"
    _ __
   | '_ \      ρ (RHO)
@@ -21,158 +31,211 @@ fn banner() -> String {
     BANNER.replace("ρ (RHO)", concat!("ρ (RHO) ", env!("CARGO_PKG_VERSION")))
 }
 
-#[derive(Parser, Debug)]
-#[command(name = "rhoc")]
-#[command(version)]
-#[command(before_help = BANNER)]
-#[command(about = "Compile a ρ program to a native kernel, and run it, or write it as JAX or a circuit", long_about = None)]
+#[derive(Debug)]
 struct Args {
-    /// Input .rho source file
-    #[arg(required = true)]
     input: PathBuf,
-
-    /// Output shared library (.so) path
-    #[arg(short, long, default_value = "libkernel.so")]
     output: PathBuf,
-
-    /// Value bound to the threshold symbol 𝜏
-    #[arg(long, default_value_t = 0.0)]
     tau: f64,
-
-    /// Bind a space to a memory address for the zero-copy entrypoint,
-    /// e.g. --bind INPUT=0x7f2c00000000. Repeatable; overrides &[0x...].
-    #[arg(long, value_name = "NAME=ADDR")]
     bind: Vec<String>,
-
-    /// Display Active Audit DAG Trace ($)
-    #[arg(long)]
     dump_dag: bool,
-
-    /// Compute at single precision. Halves the memory traffic these kernels
-    /// are bound by, and widens the doubt every proof carries.
-    #[arg(long)]
     f32: bool,
-
-    /// The most sweeps a `⇒` may take before it stops regardless of 𝜏.
-    /// Required by a program that iterates: the cap is what makes the kernel
-    /// terminate, and it is part of what the kernel computes.
-    #[arg(long, value_name = "N")]
     max_iter: Option<usize>,
-
-    /// Emit only scalar loops, skipping vector lowering
-    #[arg(long)]
     no_simd: bool,
-
-    /// Threads every sweep is split across; 0 takes one per CPU. The kernel
-    /// still honours RHO_THREADS in the environment when it runs.
-    #[arg(long, value_name = "N", default_value_t = 0)]
     threads: usize,
-
-    /// Compile for any x86-64 rather than for this machine. By default the
-    /// kernel uses every vector width the machine it is built on has.
-    #[arg(long)]
     portable: bool,
-
-    /// Display generated LLVM IR
-    #[arg(long)]
     dump_llvm: bool,
-
-    /// Also write the kernel as a static library (`.a`) to link into a
-    /// program, its symbols renamed by --symbol-prefix.
-    #[arg(long, value_name = "LIB.a", requires = "symbol_prefix")]
     emit_static: Option<PathBuf>,
-
-    /// With --emit-static, what every exported symbol starts with in place
-    /// of `rho_kernel` (`PREFIX_exec_spaces`, `PREFIX_metadata`, ...), so that
-    /// several kernels link into one program.
-    #[arg(long, value_name = "PREFIX")]
     symbol_prefix: Option<String>,
-
-    /// Write the source's functions as Lean 4 definitions over the
-    /// integers, for proofs about them, and stop: nothing is compiled, and
-    /// a source of definitions alone is accepted. A function outside the
-    /// whole-number subset is named in a comment and left out.
-    #[arg(long, value_name = "FILE.lean")]
     emit_lean: Option<PathBuf>,
-
-    /// With --emit-lean, the namespace of the definitions (default `Rho`).
-    #[arg(long, value_name = "NAME", requires = "emit_lean")]
     lean_namespace: Option<String>,
-
-    /// With --emit-lean, write the program block alone (as `kernel`), not the
-    /// functions: its calls then name the functions of an enclosing
-    /// namespace, written once from the definitions' own file.
-    #[arg(long, requires = "emit_lean")]
     lean_program_only: bool,
-
-    /// Also write the program as a SystemVerilog streaming pipeline
-    /// (rho_kernel.sv and a Verilator harness) into this directory.
-    #[arg(long, value_name = "DIR")]
     emit_sv: Option<PathBuf>,
-
-    /// With --emit-sv, fuse every intermediate one flow reads cell for cell
-    /// into that flow's stage, as the kernel does: fewer stages, counters,
-    /// registers and replay memories, and a longer path through a stage, so
-    /// a slower clock.
-    #[arg(long)]
     fuse: bool,
-
-    /// Make the circuit's cells fixed point, WIDTH.FRAC bits (e.g. 32.16),
-    /// which Yosys synthesises; without it they are `real`, for simulation.
-    #[arg(long, value_name = "W.F")]
     fixed: Option<String>,
-
-    /// Also write the program as a JAX module (a `rho(...)` function over
-    /// jax arrays, and `rho_jit`), for CPU, GPU and TPU through XLA.
-    #[arg(long, value_name = "FILE.py")]
     emit_jax: Option<PathBuf>,
-
-    /// Run the compiled kernel once, with this input space read from a file:
-    /// raw little-endian doubles when the file ends in .bin, numbers
-    /// separated by whitespace otherwise. Repeat for every input. OUTPUT is
-    /// printed as text unless --write names a file for it.
-    #[arg(long, value_name = "SPACE=FILE")]
     run: Vec<String>,
-
-    /// After --run, write this space to a file (.bin for raw doubles, text
-    /// otherwise, one line per row). Any space a flow writes may be named,
-    /// intermediates included. Repeatable.
-    #[arg(long, value_name = "SPACE=FILE")]
     write: Vec<String>,
-
-    /// Refuse the program unless it keeps the rules for secret cells: no
-    /// division or residue by a non-constant, no sqrt, exp, log, sin, cos or
-    /// fractional power, no `⇒`, and `⌷` only at positions made of `⍳`,
-    /// constants and --public spaces.
-    #[arg(long)]
     constant_time: bool,
-
-    /// Say what the compiler made of each flow: the sweeps a call runs,
-    /// vector or one cell at a time and why, the folds computed as passes of
-    /// their own, which intermediates fused into which sweep, what a `⇒`
-    /// runs every round, and, with --emit-sv, the circuit's stages,
-    /// memories and multipliers.
-    #[arg(long)]
     explain: bool,
-
-    /// Spaces that hold no secret, such as tables, for --constant-time.
-    /// Repeat, or separate with commas.
-    #[arg(long, value_name = "NAME,...", value_delimiter = ',')]
     public: Vec<String>,
 }
 
-fn main() -> anyhow::Result<()> {
+/// The flags, as `--help` lists them.
+const OPTIONS: &str = r#"  -o, --output <PATH>
+          Output shared library (.so) path [default: libkernel.so]
+      --tau <VALUE>
+          Value bound to the threshold symbol 𝜏 [default: 0.0]
+      --bind <NAME=ADDR>
+          Bind a space to a memory address for the zero-copy entrypoint, e.g. --bind INPUT=0x7f2c00000000. Repeatable; overrides &[0x...].
+      --dump-dag
+          Display Active Audit DAG Trace ($)
+      --f32
+          Compute at single precision. Halves the memory traffic these kernels are bound by, and widens the doubt every proof carries.
+      --max-iter <N>
+          The most sweeps a `⇒` may take before it stops regardless of 𝜏. Required by a program that iterates: the cap is what makes the kernel terminate, and it is part of what the kernel computes.
+      --no-simd
+          Emit only scalar loops, skipping vector lowering
+      --threads <N>
+          Threads every sweep is split across; 0 takes one per CPU. The kernel still honours RHO_THREADS in the environment when it runs. [default: 0]
+      --portable
+          Compile for any x86-64 rather than for this machine. By default the kernel uses every vector width the machine it is built on has.
+      --dump-llvm
+          Display generated LLVM IR
+      --emit-static <LIB.a>
+          Also write the kernel as a static library (`.a`) to link into a program, its symbols renamed by --symbol-prefix.
+      --symbol-prefix <PREFIX>
+          With --emit-static, what every exported symbol starts with in place of `rho_kernel` (`PREFIX_exec_spaces`, `PREFIX_metadata`, ...), so that several kernels link into one program.
+      --emit-lean <FILE.lean>
+          Write the source's functions as Lean 4 definitions over the integers, for proofs about them, and stop: nothing is compiled, and a source of definitions alone is accepted. A function outside the whole-number subset is named in a comment and left out.
+      --lean-namespace <NAME>
+          With --emit-lean, the namespace of the definitions (default `Rho`).
+      --lean-program-only
+          With --emit-lean, write the program block alone (as `kernel`), not the functions: its calls then name the functions of an enclosing namespace, written once from the definitions' own file.
+      --emit-sv <DIR>
+          Also write the program as a SystemVerilog streaming pipeline (rho_kernel.sv and a Verilator harness) into this directory.
+      --fuse
+          With --emit-sv, fuse every intermediate one flow reads cell for cell into that flow's stage, as the kernel does: fewer stages, counters, registers and replay memories, and a longer path through a stage, so a slower clock.
+      --fixed <W.F>
+          Make the circuit's cells fixed point, WIDTH.FRAC bits (e.g. 32.16), which Yosys synthesises; without it they are `real`, for simulation.
+      --emit-jax <FILE.py>
+          Also write the program as a JAX module (a `rho(...)` function over jax arrays, and `rho_jit`), for CPU, GPU and TPU through XLA.
+      --run <SPACE=FILE>
+          Run the compiled kernel once, with this input space read from a file: raw little-endian doubles when the file ends in .bin, numbers separated by whitespace otherwise. Repeat for every input. OUTPUT is printed as text unless --write names a file for it.
+      --write <SPACE=FILE>
+          After --run, write this space to a file (.bin for raw doubles, text otherwise, one line per row). Any space a flow writes may be named, intermediates included. Repeatable.
+      --constant-time
+          Refuse the program unless it keeps the rules for secret cells: no division or residue by a non-constant, no sqrt, exp, log, sin, cos or fractional power, no `⇒`, and `⌷` only at positions made of `⍳`, constants and --public spaces.
+      --explain
+          Say what the compiler made of each flow: the sweeps a call runs, vector or one cell at a time and why, the folds computed as passes of their own, which intermediates fused into which sweep, what a `⇒` runs every round, and, with --emit-sv, the circuit's stages, memories and multipliers.
+      --public <NAME,...>
+          Spaces that hold no secret, such as tables, for --constant-time. Repeat, or separate with commas.
+  -h, --help
+          Print help
+  -V, --version
+          Print version"#;
+
+fn usage() -> String {
+    format!("{}\nCompile a ρ program to a native kernel, and run it, or write it as JAX or a circuit\n\nUsage: rhoc [OPTIONS] <INPUT>\n\nArguments:\n  <INPUT>\n          Input .rho source file\n\nOptions:\n{OPTIONS}\n", banner())
+}
+
+/// The command line, read by hand: `--flag VALUE`, `--flag=VALUE`, `-o
+/// VALUE`, and the input file as the one positional argument. A fault comes
+/// back as a message for `main` to print.
+fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
+    // The value of a flag: after `=`, else the next argument.
+    fn value(flag: &str, inline: &mut Option<String>, it: &mut impl Iterator<Item = String>) -> Result<String, String> {
+        inline.take().or_else(|| it.next()).ok_or_else(|| format!("{flag} needs a value"))
+    }
+    fn number<T: std::str::FromStr>(flag: &str, v: String) -> Result<T, String> {
+        v.parse().map_err(|_| format!("{flag}: '{v}' is not a number"))
+    }
+    let mut args = Args {
+        input: PathBuf::new(),
+        output: PathBuf::from("libkernel.so"),
+        tau: 0.0,
+        bind: Vec::new(),
+        dump_dag: false,
+        f32: false,
+        max_iter: None,
+        no_simd: false,
+        threads: 0,
+        portable: false,
+        dump_llvm: false,
+        emit_static: None,
+        symbol_prefix: None,
+        emit_lean: None,
+        lean_namespace: None,
+        lean_program_only: false,
+        emit_sv: None,
+        fuse: false,
+        fixed: None,
+        emit_jax: None,
+        run: Vec::new(),
+        write: Vec::new(),
+        constant_time: false,
+        explain: false,
+        public: Vec::new(),
+    };
+    let mut input = None;
+    let mut it = raw.skip(1);
+    while let Some(arg) = it.next() {
+        if !arg.starts_with('-') || arg == "-" {
+            if input.replace(PathBuf::from(&arg)).is_some() {
+                return Err(format!("unexpected argument '{arg}': one input file only"));
+            }
+            continue;
+        }
+        let (flag, mut inline) = match arg.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
+            _ => (arg.clone(), None),
+        };
+        match flag.as_str() {
+            "-h" | "--help" => {
+                print!("{}", usage());
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                println!("rhoc {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "--output" | "-o" => args.output = PathBuf::from(value(&flag, &mut inline, &mut it)?),
+            "--tau" => args.tau = number(&flag, value(&flag, &mut inline, &mut it)?)?,
+            "--bind" => args.bind.push(value(&flag, &mut inline, &mut it)?),
+            "--dump-dag" => args.dump_dag = true,
+            "--f32" => args.f32 = true,
+            "--max-iter" => args.max_iter = Some(number(&flag, value(&flag, &mut inline, &mut it)?)?),
+            "--no-simd" => args.no_simd = true,
+            "--threads" => args.threads = number(&flag, value(&flag, &mut inline, &mut it)?)?,
+            "--portable" => args.portable = true,
+            "--dump-llvm" => args.dump_llvm = true,
+            "--emit-static" => args.emit_static = Some(PathBuf::from(value(&flag, &mut inline, &mut it)?)),
+            "--symbol-prefix" => args.symbol_prefix = Some(value(&flag, &mut inline, &mut it)?),
+            "--emit-lean" => args.emit_lean = Some(PathBuf::from(value(&flag, &mut inline, &mut it)?)),
+            "--lean-namespace" => args.lean_namespace = Some(value(&flag, &mut inline, &mut it)?),
+            "--lean-program-only" => args.lean_program_only = true,
+            "--emit-sv" => args.emit_sv = Some(PathBuf::from(value(&flag, &mut inline, &mut it)?)),
+            "--fuse" => args.fuse = true,
+            "--fixed" => args.fixed = Some(value(&flag, &mut inline, &mut it)?),
+            "--emit-jax" => args.emit_jax = Some(PathBuf::from(value(&flag, &mut inline, &mut it)?)),
+            "--run" => args.run.push(value(&flag, &mut inline, &mut it)?),
+            "--write" => args.write.push(value(&flag, &mut inline, &mut it)?),
+            "--constant-time" => args.constant_time = true,
+            "--explain" => args.explain = true,
+            "--public" => args.public.extend(value(&flag, &mut inline, &mut it)?.split(',').map(String::from)),
+            _ => return Err(format!("unexpected argument '{arg}'; rhoc --help lists the flags")),
+        }
+        if inline.is_some() {
+            return Err(format!("{flag} takes no value"));
+        }
+    }
+    args.input = input.ok_or("the input .rho file is required")?;
+    if args.emit_static.is_some() && args.symbol_prefix.is_none() {
+        return Err("--emit-static needs --symbol-prefix".to_string());
+    }
+    if args.lean_namespace.is_some() && args.emit_lean.is_none() {
+        return Err("--lean-namespace needs --emit-lean".to_string());
+    }
+    if args.lean_program_only && args.emit_lean.is_none() {
+        return Err("--lean-program-only needs --emit-lean".to_string());
+    }
+    Ok(args)
+}
+
+fn main() {
     // `rhoc` alone: the glyph and the one line that gets someone started.
     if std::env::args_os().len() == 1 {
         print!("{}", banner());
         println!("  usage: rhoc program.rho [--run INPUT=file] [--emit-jax m.py] [--emit-sv dir]");
         println!("         rhoc --help for every flag");
         println!();
-        return Ok(());
+        return;
     }
-    let args = Args::parse();
+    let args = parse_args(std::env::args()).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
     match run(&args) {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(err) => {
             // A parse or lowering failure knows its line; show it under a caret.
             if let Some(disruption) = err.downcast_ref::<rho_lang::error::HarmonyDisruption>() {
@@ -181,7 +244,8 @@ fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             }
-            Err(err)
+            eprintln!("Error: {err}");
+            std::process::exit(1);
         }
     }
 }
@@ -196,12 +260,12 @@ fn fmt_bound(v: f64) -> String {
     }
 }
 
-fn run(args: &Args) -> anyhow::Result<()> {
+fn run(args: &Args) -> AnyResult<()> {
 
     print!("{}", banner());
 
     let source_code = fs::read_to_string(&args.input)
-        .map_err(|e| anyhow::anyhow!("Failed to read source file: {}", e))?;
+        .map_err(|e| format!("Failed to read source file: {}", e))?;
 
     if let Some(path) = &args.emit_lean {
         let (functions, statements) = rho_lang::parser::parse_unexpanded(&source_code)?;
@@ -237,7 +301,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
             for b in &breaches {
                 eprintln!("  line {}: {}", b.line, b.detail);
             }
-            anyhow::bail!("not constant time: {} place(s) above", breaches.len());
+            bail!("not constant time: {} place(s) above", breaches.len());
         }
         println!("  └─ Constant time: no data-dependent latency, rounds or addresses (OK)");
     }
@@ -306,21 +370,21 @@ fn run(args: &Args) -> anyhow::Result<()> {
         .iter()
         .any(|s| matches!(s, rho_lang::ast::Statement::Iterate { .. }));
     match args.max_iter {
-        Some(0) => anyhow::bail!("--max-iter must be at least 1: a ⇒ always sweeps once"),
+        Some(0) => bail!("--max-iter must be at least 1: a ⇒ always sweeps once"),
         Some(cap) => codegen = codegen.with_max_sweeps(cap),
-        None if iterates => anyhow::bail!(
+        None if iterates => bail!(
             "this program iterates (⇒); say how many sweeps it may take with --max-iter N"
         ),
         None => {}
     }
     for entry in &args.bind {
         let (name, addr) = entry.split_once('=').ok_or_else(|| {
-            anyhow::anyhow!("--bind expects NAME=ADDR, got '{entry}'")
+            format!("--bind expects NAME=ADDR, got '{entry}'")
         })?;
         let digits = addr.trim().trim_start_matches("0x").trim_start_matches("0X");
         let radix = if addr.trim() == digits { 10 } else { 16 };
         let value = u64::from_str_radix(digits, radix)
-            .map_err(|e| anyhow::anyhow!("--bind address '{addr}' is not a number: {e}"))?;
+            .map_err(|e| format!("--bind address '{addr}' is not a number: {e}"))?;
         codegen = codegen.bind(name.trim(), value);
     }
     let llvm_ir = codegen.generate_llvm_ir(&block).map_err(|e| block.attribute(e))?;
@@ -363,10 +427,10 @@ fn run(args: &Args) -> anyhow::Result<()> {
             Some(spec) => {
                 let (w, f) = spec
                     .split_once('.')
-                    .ok_or_else(|| anyhow::anyhow!("--fixed expects WIDTH.FRAC, such as 32.16, got '{spec}'"))?;
+                    .ok_or_else(|| format!("--fixed expects WIDTH.FRAC, such as 32.16, got '{spec}'"))?;
                 rho_lang::codegen::sv::Numbers::Fixed {
-                    width: w.parse().map_err(|_| anyhow::anyhow!("--fixed width '{w}' is not a number"))?,
-                    frac: f.parse().map_err(|_| anyhow::anyhow!("--fixed fraction '{f}' is not a number"))?,
+                    width: w.parse().map_err(|_| format!("--fixed width '{w}' is not a number"))?,
+                    frac: f.parse().map_err(|_| format!("--fixed fraction '{f}' is not a number"))?,
                 }
             }
         };
@@ -401,34 +465,34 @@ fn run(args: &Args) -> anyhow::Result<()> {
 }
 
 /// `NAME=FILE` arguments as pairs.
-fn name_file(items: &[String], flag: &str) -> anyhow::Result<Vec<(String, PathBuf)>> {
+fn name_file(items: &[String], flag: &str) -> AnyResult<Vec<(String, PathBuf)>> {
     items
         .iter()
         .map(|item| {
             let (name, file) = item
                 .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("{flag} expects SPACE=FILE, got '{item}'"))?;
+                .ok_or_else(|| format!("{flag} expects SPACE=FILE, got '{item}'"))?;
             Ok((name.trim().to_string(), PathBuf::from(file.trim())))
         })
         .collect()
 }
 
 /// A space's cells from a file: raw doubles for `.bin`, text otherwise.
-fn read_cells(path: &Path, cells: usize, name: &str) -> anyhow::Result<Vec<f64>> {
+fn read_cells(path: &Path, cells: usize, name: &str) -> AnyResult<Vec<f64>> {
     let values: Vec<f64> = if path.extension().is_some_and(|e| e == "bin") {
-        let bytes = fs::read(path).map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+        let bytes = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         if bytes.len() % 8 != 0 {
-            anyhow::bail!("{} holds {} bytes, not a whole number of doubles", path.display(), bytes.len());
+            bail!("{} holds {} bytes, not a whole number of doubles", path.display(), bytes.len());
         }
         bytes.as_chunks::<8>().0.iter().map(|c| f64::from_le_bytes(*c)).collect()
     } else {
-        let text = fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+        let text = fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         text.split_whitespace()
-            .map(|w| w.parse::<f64>().map_err(|_| anyhow::anyhow!("{}: '{w}' is not a number", path.display())))
-            .collect::<anyhow::Result<_>>()?
+            .map(|w| w.parse::<f64>().map_err(|_| format!("{}: '{w}' is not a number", path.display())))
+            .collect::<Result<_, String>>()?
     };
     if values.len() != cells {
-        anyhow::bail!(
+        bail!(
             "{} holds {} values, but {name} has {cells} cells",
             path.display(),
             values.len()
@@ -439,7 +503,7 @@ fn read_cells(path: &Path, cells: usize, name: &str) -> anyhow::Result<Vec<f64>>
 
 /// A space's cells to a file: raw doubles for `.bin`, else text with one
 /// line per row (the last axis across).
-fn write_cells(path: &Path, shape: &[usize], values: &[f64]) -> anyhow::Result<()> {
+fn write_cells(path: &Path, shape: &[usize], values: &[f64]) -> AnyResult<()> {
     if path.extension().is_some_and(|e| e == "bin") {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         fs::write(path, bytes)?;
@@ -469,13 +533,13 @@ fn run_kernel(
     codegen: &LlvmCodeGen,
     so_path: &str,
     precision: rho_lang::numeric::Precision,
-) -> anyhow::Result<()> {
+) -> AnyResult<()> {
     let inputs = name_file(&args.run, "--run")?;
     let outputs = name_file(&args.write, "--write")?;
     let shapes = &codegen.space_shapes;
     for (name, _) in inputs.iter().chain(outputs.iter()) {
         if !shapes.contains_key(name) {
-            anyhow::bail!("there is no space named {name}; the program declares {}", shapes.keys().cloned().collect::<Vec<_>>().join(", "));
+            bail!("there is no space named {name}; the program declares {}", shapes.keys().cloned().collect::<Vec<_>>().join(", "));
         }
     }
     let print_output = shapes.contains_key("OUTPUT") && !outputs.iter().any(|(n, _)| n == "OUTPUT");
@@ -490,7 +554,7 @@ fn run_kernel(
         let values: Option<Vec<f64>> = match role {
             "input" => {
                 let (_, path) = inputs.iter().find(|(n, _)| n == name).ok_or_else(|| {
-                    anyhow::anyhow!("--run needs a file for the input {name} (shape {shape:?}): --run {name}=FILE")
+                    format!("--run needs a file for the input {name} (shape {shape:?}): --run {name}=FILE")
                 })?;
                 Some(read_cells(path, cells, name)?)
             }
@@ -518,14 +582,12 @@ fn run_kernel(
         .collect();
     // dlopen searches the library path for a bare name; the kernel is a file.
     let so_file = fs::canonicalize(so_path).unwrap_or_else(|_| PathBuf::from(so_path));
-    let lib = unsafe { libloading::Library::new(&so_file) }
-        .map_err(|e| anyhow::anyhow!("cannot load {}: {e}", so_file.display()))?;
+    let lib = rho_lang::dl::Library::open(&so_file).map_err(|e| format!("cannot load {}: {e}", so_file.display()))?;
     unsafe {
-        let exec: libloading::Symbol<unsafe extern "C" fn(*const *mut std::ffi::c_void)> =
-            lib.get(b"rho_kernel_exec_spaces").map_err(|e| anyhow::anyhow!("{e}"))?;
+        let exec: unsafe extern "C" fn(*const *mut std::ffi::c_void) = lib.get("rho_kernel_exec_spaces")?;
         exec(table.as_ptr());
-        let sweeps: libloading::Symbol<unsafe extern "C" fn() -> i64> = lib.get(b"rho_kernel_sweeps").map_err(|e| anyhow::anyhow!("{e}"))?;
-        let converged: libloading::Symbol<unsafe extern "C" fn() -> i64> = lib.get(b"rho_kernel_converged").map_err(|e| anyhow::anyhow!("{e}"))?;
+        let sweeps: unsafe extern "C" fn() -> i64 = lib.get("rho_kernel_sweeps")?;
+        let converged: unsafe extern "C" fn() -> i64 = lib.get("rho_kernel_converged")?;
         if codegen.iterates() {
             eprintln!("sweeps {} converged {}", sweeps(), if converged() != 0 { "yes" } else { "no" });
         }

@@ -111,7 +111,10 @@ pip install rho-lang                         # once a release is on PyPI
 maturin build --release && pip install target/wheels/rho_lang-*.whl   # your own build
 ```
 
-To work on the compiler itself (Rust 1.88+ and clang):
+The compiler depends on no crate: its command line, errors, dataflow graph
+and library loading are written in `src/`, so building it fetches nothing
+but Rust's standard library. To work on the compiler itself (Rust 1.88+
+and clang):
 
 ```bash
 git clone https://github.com/Escoffier1156/Rho_Lang.git && cd Rho_Lang

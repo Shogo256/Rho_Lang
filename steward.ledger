@@ -1,0 +1,100 @@
+# ρ's own code, the part each piece belongs to, the standard it follows
+# and the checks that keep it. Kept by Steward (../Steward).
+# Run in Basis's development shell (nix develop path:../Basis), which has
+# clang, verilator, yosys and JAX, with rustup's stable rustc first on the
+# path. The circuit and JAX tests skip themselves without their tools, so
+# those parts check for the tools first and fail instead.
+
+project = ρ
+
+own = src/**/*.rs
+own = src/**/*.c
+
+lock = Cargo.lock
+
+toolchain = rustc --version
+toolchain = clang --version | head -n 1
+toolchain = verilator --version
+toolchain = yosys -V
+toolchain = python3 -c 'import jax; print("jax", jax.__version__)'
+
+stale = 90
+
+[language]
+files = src/ast.rs
+files = src/parser.rs
+files = src/error.rs
+files = src/lib.rs
+standard = ρ's grammar and glyphs (README.md)
+verify = cargo test --release --offline --test compiler_test -- parse alias disruption names_its_line rejected
+recheck = 2027-04-23
+
+[analysis]
+files = src/dag.rs
+files = src/solver.rs
+files = src/symbolic.rs
+standard = IEEE 754-2019 binary64 and binary32 rounding
+verify = cargo test --release --offline --test compiler_test -- constraint proved solver intervals analysis denominator division range
+recheck = 2027-04-23
+
+[interpreter]
+files = src/interp.rs
+files = src/numeric.rs
+standard = ρ's semantics (README.md)
+standard = IEEE 754-2019
+verify = cargo test --release --offline --lib
+verify = cargo test --release --offline --test compiler_test -- interpreter
+recheck = 2027-04-23
+
+[constant-time]
+files = src/consttime.rs
+standard = the rules of rhoc --constant-time (README.md)
+verify = cargo test --release --offline --test compiler_test -- constant_time zeroize
+recheck = 2027-04-23
+
+[llvm-backend]
+files = src/codegen/mod.rs
+files = src/codegen/llvm.rs
+files = src/codegen/fuse.rs
+files = src/codegen/rho_rt.c
+standard = LLVM Language Reference Manual (the clang named in the toolchain)
+standard = System V AMD64 ABI (the kernels' C entry points)
+verify = cargo test --release --offline --test compiler_test
+verify = cargo build --release --offline --bin difftest
+verify = for seed in 20260909 7 424242; do ./target/release/difftest $seed 40 || exit 1; done
+verify = for seed in 20260909 7 424242; do DIFFTEST_MODQ=1 ./target/release/difftest $seed 300 || exit 1; done
+recheck = 2027-04-23
+
+[circuit]
+files = src/codegen/sv.rs
+standard = IEEE 1800-2017 (SystemVerilog)
+verify = command -v verilator && command -v yosys
+verify = cargo test --release --offline --test compiler_test -- circuit
+verify = cargo build --release --offline --bin difftest && DIFFTEST_SV=1 ./target/release/difftest 20260909 40
+recheck = 2027-04-23
+
+[lean]
+files = src/codegen/lean.rs
+standard = Lean 4
+verify = cargo test --release --offline --test compiler_test -- lean
+recheck = 2027-04-23
+
+[jax]
+files = src/codegen/jax.rs
+standard = JAX's jax.numpy and jax.lax
+verify = python3 -c 'import jax'
+verify = cargo test --release --offline --test compiler_test -- jax
+recheck = 2027-04-23
+
+[loader-and-cli]
+files = src/dl.rs
+files = src/main.rs
+standard = POSIX.1-2017 dlopen and dlsym
+verify = cargo test --release --offline --test compiler_test -- rhoc_run explain exec_spaces link
+recheck = 2027-04-23
+
+[difftest]
+files = src/bin/difftest.rs
+standard = agreement with the interpreter, bit for bit
+verify = cargo build --release --offline --bin difftest && ./target/release/difftest 99 40
+recheck = 2027-04-23

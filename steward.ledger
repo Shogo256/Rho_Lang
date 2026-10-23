@@ -90,7 +90,9 @@ recheck = 2027-04-23
 files = src/dl.rs
 files = src/main.rs
 standard = POSIX.1-2017 dlopen and dlsym
+standard = Win32 LoadLibraryW and GetProcAddress
 verify = cargo test --release --offline --test compiler_test -- rhoc_run explain exec_spaces link
+verify = cargo check --offline --target x86_64-pc-windows-gnu --all-targets
 recheck = 2027-04-23
 
 [difftest]

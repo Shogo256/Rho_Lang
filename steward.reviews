@@ -8,3 +8,4 @@
 2026-10-23	jax	946f800eb8316bec19023bccb5ab0373ecc29ee552b4975ea7135be3afc4af06	174a31b24e7ce138	baseline at fcdb557: the ledger was written and every check passed
 2026-10-23	loader-and-cli	de16ef727fb1a0835deb2a348320a6793bc4230643fa20f65b4aa1ad5b992ab9	174a31b24e7ce138	baseline at fcdb557: the ledger was written and every check passed
 2026-10-23	difftest	004d7587a3740ee3f79c1828056c5dfbbec0dcce211ff24ad6ed04d143d8b61e	174a31b24e7ce138	baseline at fcdb557: the ledger was written and every check passed
+2026-10-23	loader-and-cli	31c454e2d24658647aec641a84dbbceae68362b71feb4d342eed9f0263367831	174a31b24e7ce138	src/dl.rs: Windows loader (LoadLibraryW, GetProcAddress, FreeLibrary) beside dlopen; checked for x86_64-pc-windows-gnu, the Unix path unchanged in behaviour

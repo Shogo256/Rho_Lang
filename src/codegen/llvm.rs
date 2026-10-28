@@ -150,11 +150,35 @@ impl Sweep {
 }
 
 /// What a fold's loops need to know about the axis they walk.
+/// The coordinates of one cell, known from the loops that reach it.
+struct CoordHint {
+    idx: String,
+    shape: Vec<usize>,
+    axes: Vec<String>,
+}
+
+/// One `⍳` in a position that is a whole-number combination of coordinates.
+struct AffineTerm {
+    coefficient: i64,
+    axis: Option<usize>,
+    operand: Expr,
+    lifts: Vec<usize>,
+}
+
+/// A `⌷` position of the form `c0 + Σ ci · ⍳`, which is an integer the
+/// cell's coordinates fix.
+struct AffinePosition {
+    constant: i64,
+    terms: Vec<AffineTerm>,
+}
+
 struct FoldGeometry<'a> {
     op: FoldOp,
     running: bool,
     extent: usize,
     inner: usize,
+    /// The axis being walked, in `shape`.
+    axis: usize,
     shape: &'a [usize],
 }
 
@@ -208,6 +232,12 @@ pub struct LlvmCodeGen {
     /// Source line of the flow being lowered, so a lowering failure can point
     /// at the statement the reader wrote.
     current_line: std::cell::Cell<usize>,
+    /// While a fold walks a line, the coordinates of the cell being read:
+    /// the index symbol they belong to, the shape they index, and one
+    /// symbol per axis. A read at that index takes its coordinates from
+    /// here rather than dividing the index up again, which, inside the
+    /// innermost loop of a fold, was most of the work.
+    coords: RefCell<Option<CoordHint>>,
     /// Threads a sweep is split across; 0 lets the runtime take one per CPU.
     /// RHO_THREADS in the environment overrides it at run time.
     pub threads: usize,
@@ -289,6 +319,7 @@ impl LlvmCodeGen {
             written_spaces: BTreeSet::new(),
             elements: 0,
             current_line: std::cell::Cell::new(0),
+            coords: RefCell::new(None),
             threads: 0,
             native: true,
             grain: 16384,
@@ -2412,6 +2443,7 @@ impl LlvmCodeGen {
             running,
             extent,
             inner,
+            axis: a,
             shape: &shape,
         };
         let landed = if bufs.parallel {
@@ -2468,12 +2500,51 @@ impl LlvmCodeGen {
         g: &FoldGeometry,
         counter: &mut usize,
     ) -> Result<()> {
+        // The lines of a fold are independent, and the chain of one line's
+        // steps is what bounds its speed (an fadd waits on the last). So
+        // W lines are walked together, each with its own accumulator: the
+        // same steps in the same order per line, hence the same bits as
+        // one at a time, with W chains in flight instead of one. Lines
+        // past the last whole group of W are walked one at a time.
+        let w = self.lanes().max(1);
+        let group = format!("{label}.g");
+        ir.push_str(&format!("  %{label}.span = sub i64 {hi}, {lo}\n"));
+        ir.push_str(&format!("  %{label}.whole = udiv i64 %{label}.span, {w}\n"));
+        ir.push_str(&format!("  %{label}.grouped = mul i64 %{label}.whole, {w}\n"));
+        ir.push_str(&format!("  %{label}.mid = add i64 {lo}, %{label}.grouped\n"));
+        self.emit_fold_group(ir, bufs, &group, pred, lo, &format!("%{label}.mid"), buffer, operand, g, w, counter)?;
+        ir.push_str(&format!("{group}.end:\n"));
+        let single = format!("{label}.s");
+        self.emit_fold_group(ir, bufs, &single, &format!("{group}.end"), &format!("%{label}.mid"), hi, buffer, operand, g, 1, counter)?;
+        ir.push_str(&format!("{single}.end:\n"));
+        ir.push_str(&format!("  br label %{label}.end\n\n"));
+        Ok(())
+    }
+
+    /// The loops that walk `w` lines at a time over the surviving cells
+    /// `[lo, hi)`, which the caller makes a multiple of `w` long. Control
+    /// leaves for `{label}.end`, which the caller lays down.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_fold_group(
+        &self,
+        ir: &mut String,
+        bufs: &Buffers,
+        label: &str,
+        pred: &str,
+        lo: &str,
+        hi: &str,
+        buffer: &str,
+        operand: &Expr,
+        g: &FoldGeometry,
+        w: usize,
+        counter: &mut usize,
+    ) -> Result<()> {
         let elem = self.precision.llvm_type();
         let align = self.precision.bytes();
         let (op, running, extent, inner) = (g.op, g.running, g.extent, g.inner);
         ir.push_str(&format!("  br label %{label}.header\n\n"));
 
-        // Outer loop: one iteration per surviving cell.
+        // Outer loop: one iteration per group of w surviving cells.
         ir.push_str(&format!("{label}.header:\n"));
         ir.push_str(&format!(
             "  %{label}.j = phi i64 [ {lo}, %{pred} ], [ %{label}.j.next, %{label}.tail ]\n"
@@ -2483,28 +2554,60 @@ impl LlvmCodeGen {
             "  br i1 %{label}.go, label %{label}.body, label %{label}.end\n\n"
         ));
 
-        // Map the surviving index back to where its axis starts.
+        // Map each surviving index back to where its line starts, and work
+        // out the line's coordinates once: those before the axis from the
+        // outer index, those after it from the inner one. The axis's own
+        // coordinate is the step.
+        let axis = g.axis;
+        let outer_strides = crate::ast::strides_of(&g.shape[..axis]);
+        let inner_strides = crate::ast::strides_of(&g.shape[axis + 1..]);
         ir.push_str(&format!("{label}.body:\n"));
-        ir.push_str(&format!("  %{label}.o = udiv i64 %{label}.j, {inner}\n"));
-        ir.push_str(&format!("  %{label}.t = urem i64 %{label}.j, {inner}\n"));
-        ir.push_str(&format!(
-            "  %{label}.block = mul i64 %{label}.o, {}\n",
-            extent * inner
-        ));
-        ir.push_str(&format!(
-            "  %{label}.base = add i64 %{label}.block, %{label}.t\n"
-        ));
+        for l in 0..w {
+            ir.push_str(&format!("  %{label}.j{l} = add i64 %{label}.j, {l}\n"));
+            ir.push_str(&format!("  %{label}.o{l} = udiv i64 %{label}.j{l}, {inner}\n"));
+            ir.push_str(&format!("  %{label}.t{l} = urem i64 %{label}.j{l}, {inner}\n"));
+            ir.push_str(&format!(
+                "  %{label}.block{l} = mul i64 %{label}.o{l}, {}\n",
+                extent * inner
+            ));
+            ir.push_str(&format!(
+                "  %{label}.base{l} = add i64 %{label}.block{l}, %{label}.t{l}\n"
+            ));
+            // The outermost axis of each run needs no remainder: the quotient
+            // is already below its extent, and saying so (rather than leaving
+            // a urem for the optimiser to see through) is what lets the
+            // lanes' reads be seen as consecutive.
+            for (k, stride) in outer_strides.iter().enumerate() {
+                ir.push_str(&format!("  %{label}.c{l}_{k}q = udiv i64 %{label}.o{l}, {stride}\n"));
+                if k == 0 {
+                    ir.push_str(&format!("  %{label}.c{l}_{k} = add i64 %{label}.c{l}_{k}q, 0\n"));
+                } else {
+                    ir.push_str(&format!("  %{label}.c{l}_{k} = urem i64 %{label}.c{l}_{k}q, {}\n", g.shape[k]));
+                }
+            }
+            for (k, stride) in inner_strides.iter().enumerate() {
+                let ax = axis + 1 + k;
+                ir.push_str(&format!("  %{label}.c{l}_{ax}q = udiv i64 %{label}.t{l}, {stride}\n"));
+                if k == 0 {
+                    ir.push_str(&format!("  %{label}.c{l}_{ax} = add i64 %{label}.c{l}_{ax}q, 0\n"));
+                } else {
+                    ir.push_str(&format!("  %{label}.c{l}_{ax} = urem i64 %{label}.c{l}_{ax}q, {}\n", g.shape[ax]));
+                }
+            }
+        }
         ir.push_str(&format!("  br label %{label}.inner\n\n"));
 
-        // Inner loop: walk the axis, folding as it goes.
+        // Inner loop: walk the axis, folding each line as it goes.
         ir.push_str(&format!("{label}.inner:\n"));
         ir.push_str(&format!(
             "  %{label}.m = phi i64 [ 0, %{label}.body ], [ %{label}.m.next, %{label}.step ]\n"
         ));
-        ir.push_str(&format!(
-            "  %{label}.acc = phi {elem} [ {}, %{label}.body ], [ %{label}.acc.next, %{label}.step ]\n",
-            self.f64_literal(op.identity())
-        ));
+        for l in 0..w {
+            ir.push_str(&format!(
+                "  %{label}.acc{l} = phi {elem} [ {}, %{label}.body ], [ %{label}.acc{l}.next, %{label}.step ]\n",
+                self.f64_literal(op.identity())
+            ));
+        }
         ir.push_str(&format!(
             "  %{label}.more = icmp ult i64 %{label}.m, {extent}\n"
         ));
@@ -2516,58 +2619,73 @@ impl LlvmCodeGen {
         ir.push_str(&format!(
             "  %{label}.off = mul i64 %{label}.m, {inner}\n"
         ));
-        ir.push_str(&format!(
-            "  %{label}.at = add i64 %{label}.base, %{label}.off\n"
-        ));
-        let element = self.emit_expr(
-            operand,
-            ir,
-            bufs,
-            &format!("%{label}.at"),
-            counter,
-            Mode::Scalar(self.precision),
-            g.shape,
-            &[],
-        )?;
-        match op {
-            FoldOp::Sum => ir.push_str(&format!(
-                "  %{label}.acc.next = fadd {elem} %{label}.acc, {element}\n"
-            )),
-            FoldOp::Product => ir.push_str(&format!(
-                "  %{label}.acc.next = fmul {elem} %{label}.acc, {element}\n"
-            )),
-            FoldOp::Max | FoldOp::Min => {
-                let pred_op = if matches!(op, FoldOp::Max) { "ogt" } else { "olt" };
+        for l in 0..w {
+            ir.push_str(&format!(
+                "  %{label}.at{l} = add i64 %{label}.base{l}, %{label}.off\n"
+            ));
+            let axes: Vec<String> = (0..g.shape.len())
+                .map(|k| if k == axis { format!("%{label}.m") } else { format!("%{label}.c{l}_{k}") })
+                .collect();
+            *self.coords.borrow_mut() = Some(CoordHint {
+                idx: format!("%{label}.at{l}"),
+                shape: g.shape.to_vec(),
+                axes,
+            });
+            let element = self.emit_expr(
+                operand,
+                ir,
+                bufs,
+                &format!("%{label}.at{l}"),
+                counter,
+                Mode::Scalar(self.precision),
+                g.shape,
+                &[],
+            );
+            *self.coords.borrow_mut() = None;
+            let element = element?;
+            let acc = format!("%{label}.acc{l}");
+            match op {
+                FoldOp::Sum => ir.push_str(&format!(
+                    "  {acc}.next = fadd {elem} {acc}, {element}\n"
+                )),
+                FoldOp::Product => ir.push_str(&format!(
+                    "  {acc}.next = fmul {elem} {acc}, {element}\n"
+                )),
+                FoldOp::Max | FoldOp::Min => {
+                    let pred_op = if matches!(op, FoldOp::Max) { "ogt" } else { "olt" };
+                    ir.push_str(&format!(
+                        "  {acc}.win = fcmp {pred_op} {elem} {element}, {acc}\n"
+                    ));
+                    ir.push_str(&format!(
+                        "  {acc}.next = select i1 {acc}.win, {elem} {element}, {elem} {acc}\n"
+                    ));
+                }
+            }
+            if running {
+                // Every step of a scan is an answer, so it is stored as it goes.
                 ir.push_str(&format!(
-                    "  %{label}.win = fcmp {pred_op} {elem} {element}, %{label}.acc\n"
+                    "  %{label}.here{l} = getelementptr inbounds {elem}, ptr {buffer}, i64 %{label}.at{l}\n"
                 ));
                 ir.push_str(&format!(
-                    "  %{label}.acc.next = select i1 %{label}.win, {elem} {element}, {elem} %{label}.acc\n"
+                    "  store {elem} {acc}.next, ptr %{label}.here{l}, align {align}\n"
                 ));
             }
-        }
-        if running {
-            // Every step of a scan is an answer, so it is stored as it goes.
-            ir.push_str(&format!(
-                "  %{label}.here = getelementptr inbounds {elem}, ptr {buffer}, i64 %{label}.at\n"
-            ));
-            ir.push_str(&format!(
-                "  store {elem} %{label}.acc.next, ptr %{label}.here, align {align}\n"
-            ));
         }
         ir.push_str(&format!("  %{label}.m.next = add i64 %{label}.m, 1\n"));
         ir.push_str(&format!("  br label %{label}.inner\n\n"));
 
         ir.push_str(&format!("{label}.tail:\n"));
         if !running {
-            ir.push_str(&format!(
-                "  %{label}.slot = getelementptr inbounds {elem}, ptr {buffer}, i64 %{label}.j\n"
-            ));
-            ir.push_str(&format!(
-                "  store {elem} %{label}.acc, ptr %{label}.slot, align {align}\n"
-            ));
+            for l in 0..w {
+                ir.push_str(&format!(
+                    "  %{label}.slot{l} = getelementptr inbounds {elem}, ptr {buffer}, i64 %{label}.j{l}\n"
+                ));
+                ir.push_str(&format!(
+                    "  store {elem} %{label}.acc{l}, ptr %{label}.slot{l}, align {align}\n"
+                ));
+            }
         }
-        ir.push_str(&format!("  %{label}.j.next = add i64 %{label}.j, 1\n"));
+        ir.push_str(&format!("  %{label}.j.next = add i64 %{label}.j, {w}\n"));
         ir.push_str(&format!("  br label %{label}.header\n\n"));
         Ok(())
     }
@@ -2970,6 +3088,7 @@ impl LlvmCodeGen {
 
         let src_strides = crate::ast::strides_of(source);
         let res_strides = crate::ast::strides_of(result_shape);
+        let known = self.known_coords(idx, result_shape);
 
         let mut terms: Vec<String> = Vec::new();
         for axis in 0..result_shape.len() {
@@ -2979,7 +3098,9 @@ impl LlvmCodeGen {
             }
             let coord = Self::fresh(counter);
             let scaled = Self::fresh(counter);
-            if res_strides[axis] == 1 {
+            if let Some(axes) = &known {
+                ir.push_str(&format!("  {coord} = add i64 {}, 0\n", axes[axis]));
+            } else if res_strides[axis] == 1 {
                 ir.push_str(&format!(
                     "  {coord} = urem i64 {idx}, {}\n",
                     result_shape[axis]
@@ -3607,6 +3728,15 @@ impl LlvmCodeGen {
                 })?;
                 let ptr = self.lookup(bufs, &name)?;
                 let count = self.shape_for(&name).iter().product::<usize>().max(1);
+                // A position that is a whole-number combination of coordinates
+                // (`⍳0N + ⍳1H`, `2 × ⍳0X - 1`) is an integer the interpreter
+                // computes exactly in f64 and floors to itself, so it is
+                // computed here in integers; and its range is known from the
+                // axes' extents, so when it lies inside the space the read is
+                // a plain load, with no test and no select per cell.
+                if let Some(terms) = Self::affine_position(index, lifts) {
+                    return self.emit_affine_gather(ir, &ptr, count, &terms, idx, counter, mode, result_shape);
+                }
                 let position =
                     self.emit_expr(index, ir, bufs, idx, counter, mode, result_shape, lifts)?;
                 if let Mode::Vector(w, _) = mode {
@@ -3659,58 +3789,9 @@ impl LlvmCodeGen {
             // boundary, turned into a number. The operand is measured, never
             // read.
             Expr::Index { axis, operand } => {
-                let shape = Self::expr_shape(operand, &self.space_shapes).ok_or_else(|| {
-                    HarmonyDisruption::LoweringErr {
-                        line: self.current_line.get(),
-                        detail: "⍳ needs an operand with a known shape".to_string(),
-                    }
-                })?;
-                let (stride, extent) = self.axis_geometry(&shape, *axis)?;
-                let view = Self::lifted_shape(&shape, lifts);
-                let read_at = self.emit_index_map(ir, idx, &view, result_shape, counter)?;
-                let int_ty = mode.int_ty();
-                let lane_idx = match mode {
-                    Mode::Scalar(_) => read_at,
-                    Mode::Vector(w, _) => {
-                        let seed = Self::fresh(counter);
-                        let splat = Self::fresh(counter);
-                        let lanes = Self::fresh(counter);
-                        let offsets: Vec<String> = (0..w).map(|l| format!("i64 {l}")).collect();
-                        ir.push_str(&format!(
-                            "  {seed} = insertelement {int_ty} poison, i64 {read_at}, i64 0\n"
-                        ));
-                        ir.push_str(&format!(
-                            "  {splat} = shufflevector {int_ty} {seed}, {int_ty} poison, <{w} x i32> zeroinitializer\n"
-                        ));
-                        ir.push_str(&format!(
-                            "  {lanes} = add {int_ty} {splat}, <{}>\n",
-                            offsets.join(", ")
-                        ));
-                        lanes
-                    }
-                };
-                let pos = if stride == 1 {
-                    let p = Self::fresh(counter);
-                    ir.push_str(&format!(
-                        "  {p} = urem {int_ty} {lane_idx}, {}\n",
-                        mode.int_splat(extent as u64)
-                    ));
-                    p
-                } else {
-                    let q = Self::fresh(counter);
-                    let p = Self::fresh(counter);
-                    ir.push_str(&format!(
-                        "  {q} = udiv {int_ty} {lane_idx}, {}\n",
-                        mode.int_splat(stride as u64)
-                    ));
-                    ir.push_str(&format!(
-                        "  {p} = urem {int_ty} {q}, {}\n",
-                        mode.int_splat(extent as u64)
-                    ));
-                    p
-                };
+                let (pos, _) = self.emit_coordinate(ir, *axis, operand, idx, counter, mode, result_shape, lifts)?;
                 let out = Self::fresh(counter);
-                ir.push_str(&format!("  {out} = uitofp {int_ty} {pos} to {ty}\n"));
+                ir.push_str(&format!("  {out} = uitofp {} {pos} to {ty}\n", mode.int_ty()));
                 Ok(out)
             }
 
@@ -4107,6 +4188,258 @@ impl LlvmCodeGen {
                 "  {out} = fadd {dbl} {scaled}, {}\n",
                 splat("double", "0.0".to_string())
             ));
+        }
+    }
+
+    /// The coordinate of the cell along one axis of the operand's shape,
+    /// from zero, as an integer of the mode's width — the same arithmetic a
+    /// shift uses to find its boundary — and the axis's extent. The operand
+    /// is measured, never read.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_coordinate(
+        &self,
+        ir: &mut String,
+        axis: Option<usize>,
+        operand: &Expr,
+        idx: &str,
+        counter: &mut usize,
+        mode: Mode,
+        result_shape: &[usize],
+        lifts: &[usize],
+    ) -> Result<(String, usize)> {
+        let shape = Self::expr_shape(operand, &self.space_shapes).ok_or_else(|| {
+            HarmonyDisruption::LoweringErr {
+                line: self.current_line.get(),
+                detail: "⍳ needs an operand with a known shape".to_string(),
+            }
+        })?;
+        let (stride, extent) = self.axis_geometry(&shape, axis)?;
+        let int_ty = mode.int_ty();
+        // The coordinate is known from the loops when the operand's shape
+        // lines up with the result's axis for axis: the cell's own
+        // coordinate there, or zero along an axis the operand is one wide.
+        if let (Mode::Scalar(_), Some(axes)) = (mode, self.known_coords(idx, result_shape)) {
+            let a = axis.unwrap_or_else(|| crate::ast::default_axis(&shape));
+            if lifts.is_empty() && shape.len() == result_shape.len() && a < shape.len() {
+                if shape[a] == result_shape[a] {
+                    let pos = Self::fresh(counter);
+                    ir.push_str(&format!("  {pos} = add i64 {}, 0\n", axes[a]));
+                    return Ok((pos, extent));
+                }
+                if shape[a] == 1 {
+                    return Ok(("0".to_string(), extent));
+                }
+            }
+        }
+        let view = Self::lifted_shape(&shape, lifts);
+        let read_at = self.emit_index_map(ir, idx, &view, result_shape, counter)?;
+        let lane_idx = match mode {
+            Mode::Scalar(_) => read_at,
+            Mode::Vector(w, _) => {
+                let seed = Self::fresh(counter);
+                let splat = Self::fresh(counter);
+                let lanes = Self::fresh(counter);
+                let offsets: Vec<String> = (0..w).map(|l| format!("i64 {l}")).collect();
+                ir.push_str(&format!(
+                    "  {seed} = insertelement {int_ty} poison, i64 {read_at}, i64 0\n"
+                ));
+                ir.push_str(&format!(
+                    "  {splat} = shufflevector {int_ty} {seed}, {int_ty} poison, <{w} x i32> zeroinitializer\n"
+                ));
+                ir.push_str(&format!(
+                    "  {lanes} = add {int_ty} {splat}, <{}>\n",
+                    offsets.join(", ")
+                ));
+                lanes
+            }
+        };
+        let pos = if stride == 1 {
+            let p = Self::fresh(counter);
+            ir.push_str(&format!(
+                "  {p} = urem {int_ty} {lane_idx}, {}\n",
+                mode.int_splat(extent as u64)
+            ));
+            p
+        } else {
+            let q = Self::fresh(counter);
+            let p = Self::fresh(counter);
+            ir.push_str(&format!(
+                "  {q} = udiv {int_ty} {lane_idx}, {}\n",
+                mode.int_splat(stride as u64)
+            ));
+            ir.push_str(&format!(
+                "  {p} = urem {int_ty} {q}, {}\n",
+                mode.int_splat(extent as u64)
+            ));
+            p
+        };
+        Ok((pos, extent))
+    }
+
+    /// The cell's coordinates when the loops around it have said what they
+    /// are, for this index into this shape.
+    fn known_coords(&self, idx: &str, shape: &[usize]) -> Option<Vec<String>> {
+        let hint = self.coords.borrow();
+        let h = hint.as_ref()?;
+        (h.idx == idx && h.shape == shape).then(|| h.axes.clone())
+    }
+
+    /// `index` as a whole-number combination of coordinates: the constant
+    /// term and, per `⍳`, its coefficient, axis, operand and the lifts it
+    /// sits under. None when anything in it is not a whole number, a `⍳`,
+    /// a sum, a difference or a product with a whole number — then the
+    /// position is a value the data decides, read as a gather.
+    fn affine_position(index: &Expr, lifts: &[usize]) -> Option<AffinePosition> {
+        fn whole(v: f64) -> Option<i64> {
+            (v == v.trunc() && v.abs() < 9.0e15).then_some(v as i64)
+        }
+        fn walk(e: &Expr, scale: i64, lifts: &[usize], out: &mut AffinePosition) -> Option<()> {
+            match e {
+                Expr::Number(v) => {
+                    out.constant = out.constant.checked_add(scale.checked_mul(whole(*v)?)?)?;
+                    Some(())
+                }
+                Expr::Index { axis, operand } => {
+                    out.terms.push(AffineTerm {
+                        coefficient: scale,
+                        axis: *axis,
+                        operand: (**operand).clone(),
+                        lifts: lifts.to_vec(),
+                    });
+                    Some(())
+                }
+                Expr::Lift { axis, operand } => {
+                    let mut nested = lifts.to_vec();
+                    nested.push(*axis);
+                    walk(operand, scale, &nested, out)
+                }
+                Expr::AuditTrace(inner) => walk(inner, scale, lifts, out),
+                Expr::BinaryOp { op: BinaryOpKind::Add, lhs, rhs } => {
+                    walk(lhs, scale, lifts, out)?;
+                    walk(rhs, scale, lifts, out)
+                }
+                Expr::BinaryOp { op: BinaryOpKind::Sub, lhs, rhs } => {
+                    walk(lhs, scale, lifts, out)?;
+                    walk(rhs, scale.checked_neg()?, lifts, out)
+                }
+                Expr::BinaryOp { op: BinaryOpKind::Mul, lhs, rhs } => match (&**lhs, &**rhs) {
+                    (Expr::Number(v), other) | (other, Expr::Number(v)) => {
+                        walk(other, scale.checked_mul(whole(*v)?)?, lifts, out)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        let mut out = AffinePosition { constant: 0, terms: Vec::new() };
+        walk(index, 1, lifts, &mut out)?;
+        // A position with no coordinate in it is a constant the value
+        // path reads just as well; the gain here is per-cell arithmetic.
+        (!out.terms.is_empty()).then_some(out)
+    }
+
+    /// `⌷` at a position that is a whole-number combination of coordinates:
+    /// the position in integer arithmetic, and the bounds test only when the
+    /// position's range, known from the axes' extents, can leave the space.
+    /// The bits are the value path's: the interpreter's f64 arithmetic on
+    /// whole numbers below 2^53 is exact, and the floor of an integer is
+    /// itself.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_affine_gather(
+        &self,
+        ir: &mut String,
+        ptr: &str,
+        count: usize,
+        affine: &AffinePosition,
+        idx: &str,
+        counter: &mut usize,
+        mode: Mode,
+        result_shape: &[usize],
+    ) -> Result<String> {
+        let int_ty = mode.int_ty();
+        let elem = self.precision.llvm_type();
+        let ty = mode.ty();
+        let (mut low, mut high) = (affine.constant as i128, affine.constant as i128);
+        let mut acc = mode.int_splat(affine.constant as u64);
+        for term in &affine.terms {
+            let (coord, extent) =
+                self.emit_coordinate(ir, term.axis, &term.operand, idx, counter, mode, result_shape, &term.lifts)?;
+            let reach = term.coefficient as i128 * (extent as i128 - 1);
+            low += reach.min(0);
+            high += reach.max(0);
+            let scaled = Self::fresh(counter);
+            let next = Self::fresh(counter);
+            ir.push_str(&format!(
+                "  {scaled} = mul {int_ty} {coord}, {}\n",
+                mode.int_splat(term.coefficient as u64)
+            ));
+            ir.push_str(&format!("  {next} = add {int_ty} {acc}, {scaled}\n"));
+            acc = next;
+        }
+        let inside_always = low >= 0 && high < count as i128;
+        match mode {
+            Mode::Scalar(_) => {
+                let gep = Self::fresh(counter);
+                let val = Self::fresh(counter);
+                if inside_always {
+                    ir.push_str(&format!("  {gep} = getelementptr inbounds {elem}, ptr {ptr}, i64 {acc}\n"));
+                    ir.push_str(&format!("  {val} = load {elem}, ptr {gep}, align {}\n", self.precision.bytes()));
+                    return Ok(val);
+                }
+                let not_before = Self::fresh(counter);
+                let not_past = Self::fresh(counter);
+                let inside = Self::fresh(counter);
+                let safe = Self::fresh(counter);
+                let out = Self::fresh(counter);
+                ir.push_str(&format!("  {not_before} = icmp sge i64 {acc}, 0\n"));
+                ir.push_str(&format!("  {not_past} = icmp slt i64 {acc}, {count}\n"));
+                ir.push_str(&format!("  {inside} = and i1 {not_before}, {not_past}\n"));
+                ir.push_str(&format!("  {safe} = select i1 {inside}, i64 {acc}, i64 0\n"));
+                ir.push_str(&format!("  {gep} = getelementptr inbounds {elem}, ptr {ptr}, i64 {safe}\n"));
+                ir.push_str(&format!("  {val} = load {elem}, ptr {gep}, align {}\n", self.precision.bytes()));
+                ir.push_str(&format!(
+                    "  {out} = select i1 {inside}, {elem} {val}, {elem} {}\n",
+                    self.f64_literal(0.0)
+                ));
+                Ok(out)
+            }
+            Mode::Vector(w, _) => {
+                // Lane by lane: the positions need not be consecutive.
+                let bty = mode.bool_ty();
+                let (inside, safe) = if inside_always {
+                    (None, acc.clone())
+                } else {
+                    let not_before = Self::fresh(counter);
+                    let not_past = Self::fresh(counter);
+                    let inside = Self::fresh(counter);
+                    let safe = Self::fresh(counter);
+                    ir.push_str(&format!("  {not_before} = icmp sge {int_ty} {acc}, zeroinitializer\n"));
+                    ir.push_str(&format!("  {not_past} = icmp slt {int_ty} {acc}, {}\n", mode.int_splat(count as u64)));
+                    ir.push_str(&format!("  {inside} = and {bty} {not_before}, {not_past}\n"));
+                    ir.push_str(&format!("  {safe} = select {bty} {inside}, {int_ty} {acc}, {int_ty} zeroinitializer\n"));
+                    (Some(inside), safe)
+                };
+                let mut vec = "poison".to_string();
+                for l in 0..w {
+                    let at = Self::fresh(counter);
+                    let gep = Self::fresh(counter);
+                    let val = Self::fresh(counter);
+                    let next = Self::fresh(counter);
+                    ir.push_str(&format!("  {at} = extractelement {int_ty} {safe}, i32 {l}\n"));
+                    ir.push_str(&format!("  {gep} = getelementptr inbounds {elem}, ptr {ptr}, i64 {at}\n"));
+                    ir.push_str(&format!("  {val} = load {elem}, ptr {gep}, align {}\n", self.precision.bytes()));
+                    ir.push_str(&format!("  {next} = insertelement {ty} {vec}, {elem} {val}, i32 {l}\n"));
+                    vec = next;
+                }
+                match inside {
+                    None => Ok(vec),
+                    Some(inside) => {
+                        let out = Self::fresh(counter);
+                        ir.push_str(&format!("  {out} = select {bty} {inside}, {ty} {vec}, {ty} {}\n", mode.zero()));
+                        Ok(out)
+                    }
+                }
+            }
         }
     }
 

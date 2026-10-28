@@ -296,7 +296,7 @@ fn expression(
             if !transposable.is_empty() && rng.below(4) == 0 {
                 return format!("(⍉{})", transposable[rng.below(transposable.len())]);
             }
-            match rng.below(9) {
+            match rng.below(10) {
                 0 => format!("(⍳{axis}{name})"),
                 1 => format!("({} ⌽{axis} {name})", [-3i64, -2, -1, 1, 2, 3, 5][rng.below(7)]),
                 2 => format!("(⌽{axis}{name})"),
@@ -313,6 +313,15 @@ fn expression(
                 8 => format!(
                     "(({name} × {}) ⌷ {})",
                     ["0.5", "1.0", "3.0", "-2.0"][rng.below(4)],
+                    spaces[rng.below(spaces.len())].0
+                ),
+                // The coordinate scaled and moved: still a whole number the
+                // coordinates fix, read without a gather, and as often as
+                // not past an end of the space read.
+                9 => format!(
+                    "((({}) × (⍳{axis}{name})) + {}) ⌷ {}",
+                    ["2.0", "3.0", "-1.0"][rng.below(3)],
+                    [-3i64, 0, 1, 4][rng.below(4)],
                     spaces[rng.below(spaces.len())].0
                 ),
                 // Any space at all reshapes to the wanted shape, reading

@@ -258,6 +258,7 @@ the kernel; the circuit numbers come from Yosys 0.67 and nextpnr 0.11.
 |---|---|
 | Three flows over a million cells | 1.4 ms (was 11.6 before fusion and kept scratch) |
 | Jacobi through a `step` body, four rounds, a million cells | 11 ms (was 51) |
+| A 321-tap FIR over 160 samples as a `⌷` window and a fold | 13 µs (was 95; a sliding dot product in plain Rust: 10–11) |
 | Threads on cache-resident grids | 3–4x, bit-identical to one thread; a million cells is memory-bound |
 | A 16×16 stencil as a circuit, Q16.16 | 401 LUT4 at 75.8 MHz on an iCE40 HX8K |
 | A 48-cell Jacobi loop as a circuit, Q16.16 | 642 LUT4, 3 block RAMs at 89 MHz on an ECP5 (104 MHz through the `step` body) |

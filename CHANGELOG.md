@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+Found while timing a 321-tap FIR written as a window read by `⌷`
+(`◇+1 (((⍳0N + ⍳1H) ⌷ X) × H)` over 160 samples), which took 95 µs where a
+sliding dot product in plain Rust took 11:
+
+- **A fold walks several lines at once.** The lines of a fold are
+  independent, and one line's chain of additions was what bounded its
+  speed. The kernel now folds W lines together (four at f64, eight at
+  f32), each with its own accumulator, in the same step order per line —
+  so the bits are unchanged — with W chains in flight instead of one.
+  Scans too; lines past the last whole group are walked one at a time.
+- **A `⌷` at a whole-number combination of coordinates is a plain read.**
+  `⍳0N + ⍳1H`, `2 × ⍳0X - 1`: the position is an integer the interpreter
+  computes exactly in f64 and floors to itself, so it is computed in
+  integers, and its range is known from the axes' extents, so when it
+  cannot leave the space the read carries no bounds test and no select.
+  When it can, the test is an integer compare. A position the data
+  decides (`I ⌷ X`) is still a gather.
+- **A fold's line knows its coordinates.** Inside the fold's innermost
+  loop every read used to divide the cell's index back into coordinates
+  (a `udiv` and `urem` per axis per read); the loops that reach the cell
+  now hand its coordinates down, and the outermost coordinate of each run
+  carries no remainder, which is what lets the lanes' reads be seen as
+  consecutive.
+
+The FIR: 95 → 13 µs (the plain-Rust sliding dot product: 10–11). The
+differential test generates the scaled and moved positions as well.
+
 - **No dependencies.** `rhoc` and the library are built from this
   repository and Rust's standard library alone: the command line is read
   by hand in place of clap (the same flags, `--flag VALUE` and

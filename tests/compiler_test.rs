@@ -5607,3 +5607,105 @@ fn test_a_vector_step_is_one_register_at_either_precision() {
     let ir32 = LlvmCodeGen::new("lanes32").with_precision(Precision::F32).generate_llvm_ir(&block).unwrap();
     assert!(ir32.contains("<8 x float>") && !ir32.contains("<4 x float>"), "{ir32}");
 }
+
+/// The programs of a case, run through the compiled kernel at both
+/// precisions and compared with the interpreter bit for bit.
+fn kernel_matches_interpreter(name: &str, source: &str, inputs: &[(&str, Vec<usize>, Vec<f64>)], out_cells: usize) {
+    let block = parse_rho_program(source).unwrap();
+    for (threads, grain) in [(1usize, 16384usize), (3, 1)] {
+        let mut env: Env<f64> = Env::new();
+        for (n, shape, data) in inputs {
+            env.insert(n.to_string(), Grid::from(shape.clone(), data.clone()));
+        }
+        let meant = interpret_with(&block, &env, &Options { tau: 0.0, max_sweeps: 1 }).unwrap()["OUTPUT"].cells.clone();
+        let mut codegen = LlvmCodeGen::new(&format!("{name}_{threads}")).with_threads(threads).with_grain(grain);
+        let ir = codegen.generate_llvm_ir(&block).unwrap();
+        let so = format!("target/{name}_{threads}.so");
+        codegen.compile_to_so(&ir, &so).unwrap();
+        let lib = rho_lang::dl::Library::open(std::path::Path::new(&so)).unwrap();
+        let spaces: unsafe extern "C" fn(*const *mut f64) = unsafe { lib.get("rho_kernel_exec_spaces").unwrap() };
+        let order = kernel_spaces(&lib);
+        let mut bufs: Vec<Vec<f64>> = order
+            .iter()
+            .map(|(space, cells, _)| inputs.iter().find(|(m, _, _)| m == space).map(|(_, _, d)| d.clone()).unwrap_or_else(|| vec![0.0; *cells]))
+            .collect();
+        let ptrs: Vec<*mut f64> = bufs.iter_mut().map(|b| b.as_mut_ptr()).collect();
+        unsafe { spaces(ptrs.as_ptr()) };
+        let out = order.iter().position(|(s, _, _)| s == "OUTPUT").unwrap();
+        assert_eq!(bufs[out].len(), out_cells, "{name}");
+        assert_eq!(bits(&bufs[out]), bits(&meant), "{name} with {threads} threads: kernel vs interpreter\n{ir}");
+    }
+}
+
+#[test]
+fn test_a_fold_walks_several_lines_at_once_with_the_same_bits() {
+    // Lines are folded W at a time, each with its own chain; the order of
+    // steps within a line is unchanged, so the bits are. Line counts that
+    // are not a multiple of W leave a tail walked one at a time; the fold
+    // axis is innermost, outermost and in the middle; every operation; a
+    // scan; and the lines split across threads.
+    let grid: Vec<f64> = (0..5 * 7 * 6).map(|i| ((i as f64) * 0.31).sin() * 3.0 + (i % 4) as f64 * 0.125).collect();
+    let cases: [(&str, &str, usize); 7] = [
+        ("fold_inner_sum", "{\n    INPUT:◯ □ 5 7 6\n    (◇+2 (INPUT × INPUT)) → =\n}", 35),
+        ("fold_mid_prod", "{\n    INPUT:◯ □ 5 7 6\n    (◇×1 ((INPUT × 0.5) + 0.75)) → =\n}", 30),
+        ("fold_outer_max", "{\n    INPUT:◯ □ 5 7 6\n    (◇>0 INPUT) → =\n}", 42),
+        ("fold_inner_min", "{\n    INPUT:◯ □ 5 7 6\n    (◇<2 (▷2INPUT - INPUT)) → =\n}", 35),
+        ("scan_inner", "{\n    INPUT:◯ □ 5 7 6\n    (◈+2 INPUT) → =\n}", 210),
+        ("scan_mid", "{\n    INPUT:◯ □ 5 7 6\n    (◈>1 INPUT) → =\n}", 210),
+        ("fold_lifted", "{\n    INPUT:◯ □ 5 7 6\n    ROW:◯ □ 1 7 1\n    (◇+1 (INPUT × ROW)) → =\n}", 30),
+    ];
+    let row: Vec<f64> = (0..7).map(|i| (i as f64) * 0.5 - 1.0).collect();
+    for (name, source, cells) in cases {
+        let mut inputs = vec![("INPUT", vec![5, 7, 6], grid.clone())];
+        if source.contains("ROW:") {
+            inputs.push(("ROW", vec![1, 7, 1], row.clone()));
+        }
+        kernel_matches_interpreter(name, source, &inputs, cells);
+    }
+}
+
+#[test]
+fn test_a_gather_at_a_whole_number_combination_of_coordinates_is_a_plain_read() {
+    // `⌷` at a position that is a whole-number combination of coordinates
+    // reads without a gather: the IR has no floor in it, and no bounds test
+    // when the position cannot leave the space. The bits are the
+    // interpreter's whether the position stays inside (a FIR window), runs
+    // past an end (then zero), is scaled, negative, or sits under a lift,
+    // and whether the read is in a fold's line or a vector sweep.
+    let x: Vec<f64> = (0..48).map(|i| ((i as f64) * 0.7).sin() * 3.0 + (i % 7) as f64 * 0.125).collect();
+    let h: Vec<f64> = (0..5).map(|i| 1.0 / (i as f64 + 1.0)).collect();
+    let cases: [(&str, &str, usize, bool); 7] = [
+        // the FIR: n + k over X[0..48) with n < 44, k < 5 stays inside
+        ("fir", "{\n    X:◯ □ 48\n    H:◯ □ 1 5\n    N:◯ □ 44 1\n    ◇+1 (((⍳0N + ⍳1H) ⌷ X) × H) → =\n}", 44, false),
+        // the same window past the end: n + k reaches 51, zero there
+        ("fir_past", "{\n    X:◯ □ 48\n    H:◯ □ 1 5\n    N:◯ □ 47 1\n    ◇+1 (((⍳0N + ⍳1H) ⌷ X) × H) → =\n}", 47, true),
+        // a vector sweep: the cell two before, zero at the start
+        ("shift_by_gather", "{\n    X:◯ □ 48\n    ((⍳0X - 2.0) ⌷ X) → =\n}", 48, true),
+        // scaled: every other cell, which runs past the end halfway
+        ("stride_two", "{\n    X:◯ □ 48\n    (((2.0 × ⍳0X) + 1.0) ⌷ X) → =\n}", 48, true),
+        // negative scale: the cells in reverse, inside throughout
+        ("reversed", "{\n    X:◯ □ 48\n    ((47.0 - ⍳0X) ⌷ X) → =\n}", 48, false),
+        // two coordinates of a grid: the row-major place, inside throughout
+        ("grid", "{\n    X:◯ □ 48\n    G:◯ □ 6 8\n    (((⍳0G × 8.0) + ⍳1G) ⌷ X) → =\n}", 48, false),
+        // the column from a one-row space stretched over the grid
+        ("grid_stretched", "{\n    X:◯ □ 48\n    G:◯ □ 6 8\n    R:◯ □ 1 8\n    (((⍳0G × 8.0) + ⍳1R) ⌷ X) → =\n}", 48, false),
+    ];
+    for (name, source, cells, past) in cases {
+        let block = parse_rho_program(source).unwrap();
+        let ir = LlvmCodeGen::new(name).generate_llvm_ir(&block).unwrap();
+        let floors = ir.lines().filter(|l| l.contains("@llvm.floor") && !l.starts_with("declare")).count();
+        assert_eq!(floors, 0, "{name}: a floor remains\n{ir}");
+        assert_eq!(ir.contains("icmp slt i64") || ir.contains("icmp slt <"), past, "{name}: bounds test\n{ir}");
+        let mut inputs = vec![("X", vec![48], x.clone())];
+        if source.contains("H:") {
+            inputs.push(("H", vec![1, 5], h.clone()));
+        }
+        if source.contains("G:") {
+            inputs.push(("G", vec![6, 8], x.clone()));
+        }
+        if source.contains("R:") {
+            inputs.push(("R", vec![1, 8], x[..8].to_vec()));
+        }
+        kernel_matches_interpreter(name, source, &inputs, cells);
+    }
+}

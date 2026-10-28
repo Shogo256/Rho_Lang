@@ -121,6 +121,12 @@ git clone https://github.com/Escoffier1156/Rho_Lang.git && cd Rho_Lang
 cargo build --release && cargo test
 ```
 
+### Show `.rho` files with ρ's icon
+
+```bash
+sh editors/linux/install.sh            # GNOME Files, Dolphin and other freedesktop file managers
+```
+
 ### Compile and run
 
 ```bash

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The ρ source file type, so file managers show .rho files with ρ's icon. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="text/x-rho">
+    <comment>ρ source</comment>
+    <comment xml:lang="ja">ρ ソース</comment>
+    <sub-class-of type="text/plain"/>
+    <glob pattern="*.rho"/>
+    <icon name="text-x-rho"/>
+  </mime-type>
+</mime-info>

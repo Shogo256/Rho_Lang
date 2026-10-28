@@ -378,6 +378,37 @@ fn expression(
                 };
                 return format!("({anchored} {op} {})", stretching[rng.below(stretching.len())].0);
             }
+            // A space an axis short of `want` (a fold's result, a second
+            // input, one cell) stretches once `□` gives it a unit axis where
+            // the axis is missing. One time in four the lift is left out:
+            // the ranks then differ, and every target must refuse the program
+            // alike, as the interpreter does.
+            let liftable: Vec<(&String, usize)> = spaces
+                .iter()
+                .filter(|(_, shape)| shape.len() + 1 == want.len())
+                .flat_map(|(n, shape)| {
+                    (0..=shape.len())
+                        .filter(|&a| {
+                            rho_lang::ast::shape_with_unit_axis(shape, a).is_some_and(|lifted| {
+                                rho_lang::ast::broadcast_shapes(&lifted, want).as_deref() == Some(want)
+                            })
+                        })
+                        .map(move |a| (n, a))
+                })
+                .collect();
+            if !liftable.is_empty() && !matching.is_empty() && rng.below(3) == 0 {
+                let anchored = if spaces.iter().any(|(n, _)| lhs.contains(n.as_str())) {
+                    lhs
+                } else {
+                    matching[rng.below(matching.len())].0.clone()
+                };
+                let (n, a) = liftable[rng.below(liftable.len())];
+                return if rng.below(4) == 0 {
+                    format!("({anchored} {op} {n})")
+                } else {
+                    format!("({anchored} {op} (□{a} {n}))")
+                };
+            }
             let rhs = expression(rng, depth - 1, spaces, want);
             // Anchor the pair to a space if neither side reached one.
             if !matching.is_empty()
@@ -581,6 +612,43 @@ fn constrain(rng: &mut Rng, source: &str, range: (f64, f64)) -> Option<(String, 
     let line = format!("    ! (OUTPUT {} {:.1})\n    OUTPUT → =\n", claim.op, claim.bound);
     let constrained = source.replacen("    OUTPUT → =\n", &line, 1);
     (constrained != source).then_some((constrained, claim))
+}
+
+/// The inputs a program declares, in the order the JAX module takes them
+/// (as the program declares them).
+fn jax_inputs(block: &rho_lang::ast::ToposBlock) -> Vec<String> {
+    block
+        .statements
+        .iter()
+        .filter_map(|s| match s {
+            rho_lang::ast::Statement::SpaceDef(d) => Some(d.name.clone()),
+            rho_lang::ast::Statement::ExtBind(b) => Some(b.space.name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first cell where the JAX run is not the interpreter's within rounding:
+/// 2^10 units in the last place of the largest finite cell, so that XLA's own
+/// order of a fold and its own `exp` pass and a cell stretched otherwise, or
+/// left at zero, does not. NaN matches NaN, an infinity itself.
+fn jax_gap(expected: &[f64], actual: &[f64]) -> Option<usize> {
+    if expected.len() != actual.len() {
+        return Some(expected.len().min(actual.len()));
+    }
+    let scale = expected
+        .iter()
+        .fold(0.0f64, |m, x| if x.is_finite() { m.max(x.abs()) } else { m });
+    let ulp = f64::from_bits(scale.to_bits() + 1) - scale;
+    expected.iter().zip(actual).position(|(e, a)| {
+        if e.is_nan() || a.is_nan() {
+            e.is_nan() != a.is_nan()
+        } else if e.is_infinite() || a.is_infinite() {
+            e != a
+        } else {
+            (e - a).abs() > 1024.0 * ulp
+        }
+    })
 }
 
 /// The first line of a diagnostic, for tallying why programs were skipped.
@@ -844,7 +912,15 @@ fn main() {
     let mut fused_compared = 0usize;
     let mut stepping = 0usize;
     let mut narrow_mismatches = 0usize;
+    let mut refused = 0usize;
     let mut unsound = 0usize;
+    let mut lifting = 0usize;
+    // The JAX leg: every program compared is also run as the JAX module and
+    // held to the interpreter, within rounding (XLA orders some folds its own
+    // way and has its own `exp`). Off unless asked for, and skipped without a
+    // python that imports jax ($RHO_JAX_PYTHON or python3): each run starts one.
+    let jax_leg = std::env::var("DIFFTEST_JAX").is_ok() && rho_lang::codegen::jax::available();
+    let (mut jax_compared, mut jax_mismatches, mut jax_failed) = (0usize, 0usize, 0usize);
     let mut claims_checked = 0usize;
     let mut proofs_checked = 0usize;
     // Constraints placed just outside the believed range, and how many the
@@ -889,10 +965,17 @@ fn main() {
         if let Some(aux_shape) = &aux {
             env.insert("AUX".to_string(), Grid::from(aux_shape.clone(), inputs["AUX"].clone()));
         }
+        // The checks let it through, so the interpreter must run it: a
+        // program it refuses while a target would compile it is one the
+        // targets disagree on (a fold's one cell against a lifted grid
+        // compiled to a kernel reading past the cell, where the interpreter
+        // refused it and JAX stretched it).
         let interpreted = match interpret_with(&block, &env, &RUN) {
             Ok(i) => i,
             Err(e) => {
-                skipped += 1;
+                refused += 1;
+                println!("REFUSED BY THE INTERPRETER ALONE (round {round}, shape {shape:?}): {}", short(&e));
+                println!("{source}\n");
                 *reasons.entry(format!("interp: {}", short(&e))).or_insert(0) += 1;
                 continue;
             }
@@ -1104,6 +1187,38 @@ fn main() {
                 }
             }
         }
+        // `□` also declares a space; as a lift it follows a parenthesis.
+        if source.contains("(□") {
+            lifting += 1;
+        }
+        if jax_leg {
+            let feed: Vec<Vec<f64>> = jax_inputs(&block)
+                .iter()
+                .map(|n| inputs[n].clone())
+                .collect();
+            let dir = std::path::PathBuf::from(format!("target/diffjax{round}"));
+            match rho_lang::codegen::jax::emit(&block, RUN.tau, Some(SWEEPS), Precision::F64)
+                .map_err(|e| e.to_string())
+                .and_then(|module| {
+                    rho_lang::codegen::jax::run(&module, &dir, &feed).map_err(|e| e.to_string())
+                }) {
+                Ok(run) => {
+                    jax_compared += 1;
+                    if let Some(cell) = jax_gap(&expected.cells, &run.output) {
+                        jax_mismatches += 1;
+                        println!("JAX MISMATCH at cell {cell} (round {round}, shape {shape:?})");
+                        println!("{source}");
+                        println!("  interpreted {:?}", expected.cells[cell]);
+                        println!("  jax         {:?}\n", run.output.get(cell));
+                    }
+                }
+                Err(e) => {
+                    jax_failed += 1;
+                    println!("JAX FAILED (round {round}, shape {shape:?})\n{source}\n{e}\n");
+                }
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
         let mut so_runs = vec![("exec_spaces", output)];
         if let Some(via_args) = output_args {
             so_runs.push(("exec_with_args", via_args));
@@ -1127,8 +1242,9 @@ fn main() {
 
     println!(
         "seed {seed}: compared {compared} ({two_inputs} with two inputs, {iterating} iterating, \
-         {stepping} through a function), \
-         skipped {skipped}, mismatches {mismatches}, f32 mismatches {narrow_mismatches}, \
+         {stepping} through a function, \
+         {lifting} stretching through a lift), skipped {skipped}, refused by the interpreter \
+         alone {refused}, mismatches {mismatches}, f32 mismatches {narrow_mismatches}, \
          claims checked {claims_checked} ({proofs_checked} proved constraints, \
          {derived_unproved} of {derived} derived ones left open), unsound {unsound}"
     );
@@ -1137,13 +1253,24 @@ fn main() {
             "  circuit: {circuit_compared} compared ({fused_compared} of them fused), {circuit_mismatches} mismatches, {circuit_failed} failed to build"
         );
     }
+    if jax_leg {
+        println!("  jax: {jax_compared} compared, {jax_mismatches} mismatches, {jax_failed} failed to run");
+    }
     if std::env::var("DIFFTEST_VERBOSE").is_ok() {
         for (reason, count) in &reasons {
             println!("  skipped {count:4} x {reason}");
         }
     }
     std::process::exit(
-        if mismatches > 0 || narrow_mismatches > 0 || unsound > 0 || circuit_mismatches > 0 || circuit_failed > 0 {
+        if mismatches > 0
+            || narrow_mismatches > 0
+            || refused > 0
+            || unsound > 0
+            || circuit_mismatches > 0
+            || circuit_failed > 0
+            || jax_mismatches > 0
+            || jax_failed > 0
+        {
             1
         } else {
             0

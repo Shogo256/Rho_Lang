@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+Found by a program outside ρ (an echo canceller's learning step) whose
+results differed from the same arithmetic in Rust: `(W + (STEP × (□0 G)))`,
+STEP a fold's one cell of shape [1] and `□0 G` of shape [1, 2048]. The
+compiled kernel multiplied the first weight only and read zero past the
+cell; the reference interpreter refuses the program (the ranks differ);
+the JAX module stretched it, as numpy does. Three targets, three answers,
+and nothing of ρ's own noticed:
+
+- **The shape check knows the intermediates.** It ran over the flows with
+  only the declared spaces' shapes, so an operand that was an intermediate
+  had no shape and every pairing with it passed. The flows are now checked
+  in the order they run, each target taking the shape its flow produces
+  before the next is checked: a mismatch of ranks with an intermediate is
+  an error with its line, as with a declared space. Lift the one cell
+  (`□0 STEP`) and it stretches.
+- **A flow of literals alone is refused**, and a fold or a scan of them:
+  "an expression with no space in it has no shape", as the interpreter
+  says when it runs one. The kernel used to compile `3.0 → T` and give T
+  a shape of its own choosing.
+- **The differential test counts a program the interpreter refuses as a
+  finding**, where it used to skip it: the checks let it through, so a
+  target would have compiled it. Against the compiler before these fixes
+  it finds 71 in 300 rounds (10 of them ranks that differ, 61 literals).
+  It now writes stretching through a lift (`□a X`, a space an axis short),
+  and one time in four leaves the lift out, which every target must refuse
+  alike. And with `DIFFTEST_JAX` it runs each program compared as the JAX
+  module too, held to the interpreter within 2^10 units in the last place
+  of the largest cell: XLA's numpy rules are a reading of the program of
+  their own, which is how this one showed.
+
+Six programs among ρ's own tests had shapes that did not agree, all in
+tests of something else (parsing, the order of loads, kept scratch); they
+now agree, and the tests check what they did.
+
+The JAX leg's first run (seed 20260909, 120 rounds) held 85 programs to the
+interpreter and found 3 that differ, of two kinds left for after this:
+
+- **XLA divides by a constant as a multiplication by its reciprocal**: -2.5 /
+  -6.0 is 0x1.aaaaaaaaaaaaap-2 under JAX, 0x1.aaaaaaaaaaaabp-2 divided. One
+  ulp, which a roll (`?` hashes the bits) turns into another number, and a
+  division by a cosine near zero into 4e-13 of the result.
+- **A NaN in a min or max fold or scan**: the interpreter's step keeps the
+  cell it has when the comparison fails, so a NaN is passed over; XLA's
+  `cummin` and `cummax` carry it on. One program came out inf in the
+  interpreter and NaN in JAX.
+
 Found while timing a 321-tap FIR written as a window read by `⌷`
 (`◇+1 (((⍳0N + ⍳1H) ⌷ X) × H)` over 160 samples), which took 95 µs where a
 sliding dot product in plain Rust took 11:

@@ -3139,7 +3139,7 @@ fn test_diffusion_on_a_ring_relaxes_to_the_mean() {
 #[test]
 fn test_reshape_parses_a_literal_shape_and_binds_tightly() {
     let block = parse_rho_program(
-        "{\n    INPUT:◯ □ 3 4\n    (4 3 ⍴ INPUT) → A\n    (2 2 3 \\ INPUT) → B\n    (A + 12 1 ⍴ INPUT) → =\n}",
+        "{\n    INPUT:◯ □ 3 4\n    (4 3 ⍴ INPUT) → A\n    (2 2 3 \\ INPUT) → B\n    ((12 1 ⍴ A) + 12 1 ⍴ INPUT) → =\n}",
     )
     .unwrap();
     let flows: Vec<&Expr> = block
@@ -3234,7 +3234,7 @@ fn test_reshape_makes_a_matrix_of_a_vector_and_keeps_the_range() {
 #[test]
 fn test_transpose_parses_alone_or_with_a_permutation() {
     let block = parse_rho_program(
-        "{\n    INPUT:◯ □ 3 4\n    (⍉INPUT) → A\n    (1 0 ⍉ INPUT) → B\n    (A + 'B) → =\n}",
+        "{\n    INPUT:◯ □ 3 4\n    (⍉INPUT) → A\n    (1 0 ⍉ INPUT) → B\n    (INPUT + 'B) → =\n}",
     )
     .unwrap();
     let flows: Vec<&Expr> = block
@@ -3368,7 +3368,7 @@ fn test_transpose_writes_a_product_with_a_transposed_factor() {
 #[test]
 fn test_take_and_drop_parse_with_a_literal_count_and_an_axis() {
     let block = parse_rho_program(
-        "{\n    INPUT:◯ □ 3 4\n    (2 ↑ INPUT) → A\n    (-1 ↓0 INPUT) → B\n    (1 ^. INPUT) → C\n    (1 _.0 INPUT) → D\n    (A + 3 ↑ INPUT) → =\n}",
+        "{\n    INPUT:◯ □ 3 4\n    (2 ↑ INPUT) → A\n    (-1 ↓0 INPUT) → B\n    (1 ^. INPUT) → C\n    (1 _.0 INPUT) → D\n    (C + 3 ↑ INPUT) → =\n}",
     )
     .unwrap();
     let flows: Vec<&Expr> = block
@@ -4582,8 +4582,10 @@ fn test_a_bound_space_streams_into_the_circuit_like_any_input() {
 
 #[test]
 fn test_what_is_not_yet_a_circuit_says_so() {
+    // A flow of literals alone has no shape: refused before any target.
+    let err = parse_rho_program("{\n    INPUT:◯ □ 4 4\n    (1.0 + 2.0) → OUTPUT\n    OUTPUT → =\n}").unwrap_err();
+    assert!(err.to_string().contains("no shape"), "{err}");
     for (source, what) in [
-        ("{\n    INPUT:◯ □ 4 4\n    (1.0 + 2.0) → OUTPUT\n    OUTPUT → =\n}", "no shape"),
         ("{\n    INPUT:◯ □ 4 4\n    (▷1 (□1 INPUT)) → =\n}", "computed value"),
     ] {
         let block = parse_rho_program(source).unwrap();
@@ -5353,7 +5355,7 @@ fn test_a_parts_loads_come_in_slot_order() {
     // node's address, so their order followed the allocator: the same
     // program could give other IR from a build that allocated differently.
     // The loads now come in slot order.
-    let source = "{\n    INPUT:◯ □ 6 8\n    (exp INPUT) → E\n    (E / (□1 (◇+1 E))) → N\n    (N + (□0 (◈+0 N)) + (□1 (◇>1 N))) → =\n}";
+    let source = "{\n    INPUT:◯ □ 6 8\n    (exp INPUT) → E\n    (E / (□1 (◇+1 E))) → N\n    (N + (◈+0 N) + (□1 (◇>1 N))) → =\n}";
     let block = parse_rho_program(source).unwrap();
     let ir = LlvmCodeGen::new("slot_order").generate_llvm_ir(&block).unwrap();
     let mut parts = 0;
@@ -5456,7 +5458,7 @@ fn test_calls_at_once_each_have_their_own_table() {
 
     // Scratch kept between calls is the kernel's one copy: such a kernel
     // says it is not reentrant.
-    let big = parse_rho_program("{\n    INPUT:◯ □ 100 100\n    (INPUT × 2.0) → A\n    (A + (◇+1 A)) → =\n}").unwrap();
+    let big = parse_rho_program("{\n    INPUT:◯ □ 100 100\n    (INPUT × 2.0) → A\n    (A + (□1 (◇+1 A))) → =\n}").unwrap();
     let ir = LlvmCodeGen::new("kept").generate_llvm_ir(&big).unwrap();
     assert!(ir.contains("scratch kept between calls"), "{ir}");
     assert!(ir.contains("reentrant\\22:false"), "{ir}");

@@ -1793,20 +1793,134 @@ pub fn validate_dimension_shapes(block: &ToposBlock) -> Result<()> {
         Ok(())
     }
 
-    for (index, stmt) in block.statements.iter().enumerate() {
-        match stmt {
-            Statement::Flow { src, .. } | Statement::Constraint(src) => {
-                check_broadcast(src, &space_shapes, block.line_of(index))?
+    // Whether every space `expr` reads has a shape known by now: if so, a
+    // shape `expr_shape` cannot give is absent, not unknown.
+    fn knows_every_space(expr: &Expr, shapes: &BTreeMap<String, Vec<usize>>) -> bool {
+        match expr {
+            Expr::Var(name) => shapes.contains_key(name),
+            Expr::Number(_) => true,
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                knows_every_space(lhs, shapes) && knows_every_space(rhs, shapes)
             }
-            Statement::Iterate { prelude, src, .. } => {
-                for flow in prelude {
-                    if let Statement::Flow { src, .. } = flow {
-                        check_broadcast(src, &space_shapes, block.line_of(index))?;
-                    }
+            Expr::Gather { index, operand } => {
+                knows_every_space(index, shapes) && knows_every_space(operand, shapes)
+            }
+            Expr::Call { args, .. } => args.iter().all(|a| knows_every_space(a, shapes)),
+            Expr::Shift { operand, .. }
+            | Expr::Builtin { operand, .. }
+            | Expr::Rotate { operand, .. }
+            | Expr::Reverse { operand, .. }
+            | Expr::Reshape { operand, .. }
+            | Expr::Transpose { operand, .. }
+            | Expr::Take { operand, .. }
+            | Expr::Drop { operand, .. }
+            | Expr::Index { operand, .. }
+            | Expr::Lift { operand, .. }
+            | Expr::Scan { operand, .. }
+            | Expr::Reduce { operand, .. }
+            | Expr::AuditTrace(operand) => knows_every_space(operand, shapes),
+        }
+    }
+
+    // A flow of literals alone has no shape, and neither has a fold or a scan
+    // of them: the reference interpreter refuses both when it runs, so they
+    // are refused here, before any target is made from them.
+    fn check_has_shape(expr: &Expr, shapes: &BTreeMap<String, Vec<usize>>, line: usize) -> Result<()> {
+        if !knows_every_space(expr, shapes) {
+            return Ok(());
+        }
+        if get_expr_shape(expr, shapes).is_none() {
+            return Err(HarmonyDisruption::LoweringErr {
+                detail: "an expression with no space in it has no shape".to_string(),
+                line,
+            });
+        }
+        fn shapeless_fold(expr: &Expr, shapes: &BTreeMap<String, Vec<usize>>) -> Option<&'static str> {
+            match expr {
+                Expr::Reduce { operand, .. } if get_expr_shape(operand, shapes).is_none() => {
+                    Some("a fold needs an operand with a shape")
                 }
-                check_broadcast(src, &space_shapes, block.line_of(index))?
+                Expr::Scan { operand, .. } if get_expr_shape(operand, shapes).is_none() => {
+                    Some("a scan needs an operand with a shape")
+                }
+                Expr::BinaryOp { lhs, rhs, .. } => {
+                    shapeless_fold(lhs, shapes).or_else(|| shapeless_fold(rhs, shapes))
+                }
+                Expr::Gather { index, operand } => {
+                    shapeless_fold(index, shapes).or_else(|| shapeless_fold(operand, shapes))
+                }
+                Expr::Call { args, .. } => args.iter().find_map(|a| shapeless_fold(a, shapes)),
+                Expr::Shift { operand, .. }
+                | Expr::Builtin { operand, .. }
+                | Expr::Rotate { operand, .. }
+                | Expr::Reverse { operand, .. }
+                | Expr::Reshape { operand, .. }
+                | Expr::Transpose { operand, .. }
+                | Expr::Take { operand, .. }
+                | Expr::Drop { operand, .. }
+                | Expr::Index { operand, .. }
+                | Expr::Lift { operand, .. }
+                | Expr::Scan { operand, .. }
+                | Expr::Reduce { operand, .. }
+                | Expr::AuditTrace(operand) => shapeless_fold(operand, shapes),
+                Expr::Var(_) | Expr::Number(_) => None,
             }
-            _ => {}
+        }
+        match shapeless_fold(expr, shapes) {
+            Some(detail) => Err(HarmonyDisruption::LoweringErr {
+                detail: detail.to_string(),
+                line,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    // In the order the flows run, each target taking the shape its flow
+    // produces before the next is checked: an intermediate's shape is known
+    // to the flows after it, as it is to the interpreter, so a mismatch of
+    // ranks between it and another (a fold's one cell against a lifted grid)
+    // is an error with its line, not a kernel that reads past the cell.
+    fn check_flow(
+        src: &Expr,
+        target: Option<&String>,
+        shapes: &mut BTreeMap<String, Vec<usize>>,
+        line: usize,
+    ) -> Result<()> {
+        check_broadcast(src, shapes, line)?;
+        check_has_shape(src, shapes, line)?;
+        if let (Some(target), Some(shape)) = (target, get_expr_shape(src, shapes)) {
+            shapes.entry(target.clone()).or_insert(shape);
+        }
+        Ok(())
+    }
+
+    {
+        let mut shapes = space_shapes.clone();
+        for (index, stmt) in block.statements.iter().enumerate() {
+            let line = block.line_of(index);
+            match stmt {
+                Statement::Flow { src, target } => {
+                    let target = match target {
+                        FlowTarget::Var(t) => Some(t),
+                        FlowTarget::Equilibrium => None,
+                    };
+                    check_flow(src, target, &mut shapes, line)?
+                }
+                Statement::Constraint(src) => check_broadcast(src, &shapes, line)?,
+                Statement::Iterate { prelude, src, .. } => {
+                    for flow in prelude {
+                        if let Statement::Flow { src, target } = flow {
+                            let target = match target {
+                                FlowTarget::Var(t) => Some(t),
+                                FlowTarget::Equilibrium => None,
+                            };
+                            check_flow(src, target, &mut shapes, line)?;
+                        }
+                    }
+                    check_flow(src, None, &mut shapes, line)?
+                }
+                _ => {}
+            }
         }
     }
 

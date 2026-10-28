@@ -5,6 +5,7 @@ pub mod consttime;
 pub mod dag;
 pub mod dl;
 pub mod error;
+pub mod hint;
 pub mod numeric;
 pub mod interp;
 pub mod parser;

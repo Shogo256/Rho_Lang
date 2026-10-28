@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **A refusal says how ρ writes the line.** Under the caret, a hint for a
+  line written the way another notation writes it: a fold or a scan after
+  its operand, APL's `+/` `+\` `∘.×`, NumPy's or Python's `np.sum(X)`
+  `exp(X)` `max(A, B)` `X.T` `reduce(+, X)` `Σ X`, an index `X[i+1]`, an
+  assignment `S = expr` or `S ← expr`, `**`, `mod`, a parenthesis left open
+  or one too many, a misspelt name (a space, a built-in or a function), a
+  space one axis short (`□k`, with the axis), a `⇒` into a space with no
+  starting value, no output, a shift of an expression, a declaration out
+  of order. Each proposed line is applied and the program parsed and
+  shape-checked before it is shown; a line can carry two habits at once;
+  when two readings pass, both are shown. A loop keyword gets a word on
+  how ρ says it instead. `--lang ja` or `RHO_LANG=ja` prints the hints in
+  Japanese; the text of every hint is one table, `rho_lang::hint`.
+- **The habits are a leg of the differential test.** Every generated
+  program is rewritten line by line in those habits
+  (`rho_lang::hint::mutations`), and each rewrite the compiler refuses must
+  get a hint whose change gives back a program computing the same cells,
+  bit for bit; a test does the same over the examples. A habit added to
+  the rewrites is a habit the hints are held to.
+- **A line that is not a statement is refused.** It was dropped without a
+  word, so `S = expr`, `X:◯ 8` or `a → b → c` passed as though they meant
+  something and failed lines later, if at all. A declaration's shape is
+  now read strictly too: `◯ □` in that order, then whole numbers of at
+  least one (a dimension that did not parse used to vanish), and a bound
+  space's address must be hexadecimal. Every `.rho` file of the projects
+  that use ρ compiles as before.
+
 Found by a program outside ρ (an echo canceller's learning step) whose
 results differed from the same arithmetic in Rust: `(W + (STEP × (□0 G)))`,
 STEP a fold's one cell of shape [1] and `□0 G` of shape [1, 2048]. The

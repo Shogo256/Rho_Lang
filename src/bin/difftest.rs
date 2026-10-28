@@ -915,6 +915,7 @@ fn main() {
     let mut refused = 0usize;
     let mut unsound = 0usize;
     let mut lifting = 0usize;
+    let (mut habits_refused, mut habits_restored, mut habits_lost) = (0usize, 0usize, 0usize);
     // The JAX leg: every program compared is also run as the JAX module and
     // held to the interpreter, within rounding (XLA orders some folds its own
     // way and has its own `exp`). Off unless asked for, and skipped without a
@@ -985,6 +986,31 @@ fn main() {
             *reasons.entry("no OUTPUT".to_string()).or_insert(0) += 1;
             continue;
         };
+
+        // The habits leg: the program rewritten the way APL, NumPy, Python
+        // or a typo would write a line of it. Each is either still a program
+        // of its own, or refused with a hint whose change gives back a
+        // program computing these same cells, bit for bit.
+        for (kind, mutated) in rho_lang::hint::mutations(&source) {
+            let Err(err) = parse_rho_program(&mutated) else { continue };
+            habits_refused += 1;
+            let hints = rho_lang::hint::suggest(&mutated, &err);
+            let back = hints.iter().any(|h| {
+                h.apply(&mutated)
+                    .and_then(|fixed| parse_rho_program(&fixed).ok())
+                    .and_then(|b| interpret_with(&b, &env, &RUN).ok())
+                    .and_then(|out| out.get("OUTPUT").map(|g| first_gap(&expected.cells, &g.cells).is_none()))
+                    .unwrap_or(false)
+            });
+            if back {
+                habits_restored += 1;
+            } else {
+                habits_lost += 1;
+                if habits_lost <= 3 {
+                    println!("HABIT WITHOUT A HINT BACK [{kind}] (round {round})\n{mutated}\n{err}\n{}", rho_lang::hint::render(&hints, rho_lang::hint::Lang::En));
+                }
+            }
+        }
 
         // Three threads and a grain of one cell: every sweep, however small,
         // is split into parts, so the head/body/tail of each part and the
@@ -1248,6 +1274,7 @@ fn main() {
          claims checked {claims_checked} ({proofs_checked} proved constraints, \
          {derived_unproved} of {derived} derived ones left open), unsound {unsound}"
     );
+    println!("  habits: {habits_refused} refused, {habits_restored} given back by a hint, {habits_lost} not");
     if circuit_leg {
         println!(
             "  circuit: {circuit_compared} compared ({fused_compared} of them fused), {circuit_mismatches} mismatches, {circuit_failed} failed to build"
@@ -1270,6 +1297,7 @@ fn main() {
             || circuit_failed > 0
             || jax_mismatches > 0
             || jax_failed > 0
+            || habits_lost > 0
         {
             1
         } else {

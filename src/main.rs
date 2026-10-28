@@ -58,6 +58,7 @@ struct Args {
     constant_time: bool,
     explain: bool,
     public: Vec<String>,
+    lang: Option<String>,
 }
 
 /// The flags, as `--help` lists them.
@@ -107,6 +108,8 @@ const OPTIONS: &str = r#"  -o, --output <PATH>
           Refuse the program unless it keeps the rules for secret cells: no division or residue by a non-constant, no sqrt, exp, log, sin, cos or fractional power, no `⇒`, and `⌷` only at positions made of `⍳`, constants and --public spaces.
       --explain
           Say what the compiler made of each flow: the sweeps a call runs, vector or one cell at a time and why, the folds computed as passes of their own, which intermediates fused into which sweep, what a `⇒` runs every round, and, with --emit-sv, the circuit's stages, memories and multipliers.
+      --lang <en|ja>
+          The language of the hints printed under a refusal (how the line is written in ρ). RHO_LANG sets it too. [default: en]
       --public <NAME,...>
           Spaces that hold no secret, such as tables, for --constant-time. Repeat, or separate with commas.
   -h, --help
@@ -155,6 +158,7 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         constant_time: false,
         explain: false,
         public: Vec::new(),
+        lang: None,
     };
     let mut input = None;
     let mut it = raw.skip(1);
@@ -201,6 +205,7 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args, String> {
             "--write" => args.write.push(value(&flag, &mut inline, &mut it)?),
             "--constant-time" => args.constant_time = true,
             "--explain" => args.explain = true,
+            "--lang" => args.lang = Some(value(&flag, &mut inline, &mut it)?),
             "--public" => args.public.extend(value(&flag, &mut inline, &mut it)?.split(',').map(String::from)),
             _ => return Err(format!("unexpected argument '{arg}'; rhoc --help lists the flags")),
         }
@@ -241,6 +246,11 @@ fn main() {
             if let Some(disruption) = err.downcast_ref::<rho_lang::error::HarmonyDisruption>() {
                 if let Ok(source) = fs::read_to_string(&args.input) {
                     eprintln!("{}", disruption.render(&source));
+                    let lang = rho_lang::hint::Lang::resolve(args.lang.as_deref());
+                    let hints = rho_lang::hint::suggest(&source, disruption);
+                    if !hints.is_empty() {
+                        eprint!("{}", rho_lang::hint::render(&hints, lang));
+                    }
                     std::process::exit(1);
                 }
             }

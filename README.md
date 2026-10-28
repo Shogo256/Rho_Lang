@@ -148,6 +148,27 @@ rhoc examples/matrix_add.rho --run INPUT=in.txt    # runs it: prints OUTPUT, one
 | `--constant-time`, `--public NAME,…` | Refuse the program unless its cells may be secrets: no division or residue by a non-constant, no `sqrt` `exp` `log` `sin` `cos` or fractional power, no `⇒`, and `⌷` only at positions made of `⍳`, constants and the `--public` spaces |
 | `--explain` | Say what each flow became: the sweeps a call runs, vector or one cell at a time and why, the folds computed first, what fused into what, a `⇒`'s rounds; with `--emit-sv`, the circuit's stages, products and memories |
 | `--dump-llvm`, `--dump-dag`, `--no-simd` | Print the IR, print the dataflow, emit scalar loops only |
+| `--lang <en\|ja>` | The language of the hints under a refusal (`RHO_LANG` too; default English) |
+
+### When a line is refused
+
+A refusal names its line and, when the line looks like another notation's
+way of writing it — a fold after its operand, APL's `+/`, NumPy's
+`np.sum(X)`, an index `X[i+1]`, `S = expr`, a parenthesis left open, a
+misspelt name, a space one axis short — says how ρ writes it:
+
+```
+3 |     X ◇+1 → =
+  |     ^
+  = hint: a fold or a scan comes before what it walks: `◇+1 X`, not `X ◇+1`
+  = try (3): (◇+1 X) → =
+```
+
+Every `try` line has been parsed and shape-checked with the rest of the
+program before it is printed, and when two readings both pass, both are
+shown. The differential test rewrites the programs it generates in those
+habits and holds every hint to giving back a program that computes the
+same cells, bit for bit. `--lang ja` prints the hints in Japanese.
 
 ### From Python
 

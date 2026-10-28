@@ -4585,14 +4585,11 @@ fn test_what_is_not_yet_a_circuit_says_so() {
     // A flow of literals alone has no shape: refused before any target.
     let err = parse_rho_program("{\n    INPUT:◯ □ 4 4\n    (1.0 + 2.0) → OUTPUT\n    OUTPUT → =\n}").unwrap_err();
     assert!(err.to_string().contains("no shape"), "{err}");
-    for (source, what) in [
-        ("{\n    INPUT:◯ □ 4 4\n    (▷1 (□1 INPUT)) → =\n}", "computed value"),
-    ] {
-        let block = parse_rho_program(source).unwrap();
-        let err = rho_lang::codegen::sv::emit(&block, 0.0, Some(8), rho_lang::codegen::sv::Numbers::Real).unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("SystemVerilog subset") && text.contains(what), "{text}");
-    }
+    let (source, what) = ("{\n    INPUT:◯ □ 4 4\n    (▷1 (□1 INPUT)) → =\n}", "computed value");
+    let block = parse_rho_program(source).unwrap();
+    let err = rho_lang::codegen::sv::emit(&block, 0.0, Some(8), rho_lang::codegen::sv::Numbers::Real).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("SystemVerilog subset") && text.contains(what), "{text}");
 }
 
 #[test]
@@ -5710,4 +5707,89 @@ fn test_a_gather_at_a_whole_number_combination_of_coordinates_is_a_plain_read() 
         }
         kernel_matches_interpreter(name, source, &inputs, cells);
     }
+}
+
+/// The cells of OUTPUT for a program over fixed inputs, by the interpreter.
+fn interpreted_output(source: &str) -> Option<Vec<u64>> {
+    use rho_lang::ast::Statement;
+    let block = parse_rho_program(source).ok()?;
+    let mut env: Env<f64> = Env::new();
+    let mut seed = 0.37f64;
+    for stmt in &block.statements {
+        let decl = match stmt {
+            Statement::SpaceDef(d) => d,
+            Statement::ExtBind(b) => &b.space,
+            _ => continue,
+        };
+        let cells: usize = decl.dimensions.iter().product::<usize>().max(1);
+        let data: Vec<f64> = (0..cells).map(|i| { seed += 0.11; ((i as f64) * seed).sin() * 2.0 + 0.5 }).collect();
+        env.insert(decl.name.clone(), Grid::from(decl.dimensions.clone(), data));
+    }
+    let out = interpret_with(&block, &env, &Options { tau: 1e-9, max_sweeps: 40 }).ok()?;
+    Some(bits(&out.get("OUTPUT")?.cells))
+}
+
+#[test]
+fn test_a_habit_from_another_notation_gets_a_hint_that_gives_the_program_back() {
+    // Programs that compile, each line rewritten the way APL, NumPy, Python
+    // or a typo would write it (`rho_lang::hint::mutations`). Every such
+    // program is either still a valid program of its own, or refused with
+    // a hint whose change gives back a program computing the same cells as
+    // the original, bit for bit. A hint that does not is a failure: a hint
+    // never points somewhere the writer did not mean to go.
+    let mut corpus: Vec<(String, String)> = Vec::new();
+    for entry in std::fs::read_dir("examples").unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "rho") {
+            corpus.push((path.display().to_string(), std::fs::read_to_string(&path).unwrap()));
+        }
+    }
+    let inline = [
+        "{\n    X:◯ □ 4 8\n    (◇+1 (X × X)) → S\n    (S / 8.0) → =\n}\n",
+        "{\n    INPUT:◯ □ 16\n    (▽INPUT - ▷INPUT) → D\n    (exp (D × 0.5)) → =\n}\n",
+        "{\n    INPUT:◯ □ 6 8\n    ROW:◯ □ 6\n    (INPUT - (□1 ROW)) → CENTRED\n    (◇> CENTRED) → =\n}\n",
+        "{\n    INPUT:◯ □ 32\n    INPUT → X\n    ((INPUT + ▷X + ▽X) / 4.0) ⇒ X\n    X → =\n}\n",
+        "smooth:{ U ((▷U + U + ▽U) / 3.0) }\n{\n    SIGNAL:◯ □ 24\n    (smooth (smooth SIGNAL)) → =\n}\n",
+        "{\n    A:◯ □ 5\n    B:◯ □ 7\n    ((□1 A) × (□0 B)) → =\n}\n",
+        "{\n    VALUES:◯ □ 3 9\n    (◈+ (abs VALUES)) → =\n}\n",
+    ];
+    for (k, src) in inline.iter().enumerate() {
+        corpus.push((format!("inline {k}"), src.to_string()));
+    }
+    let (mut refused, mut restored, mut still_valid) = (0usize, 0usize, 0usize);
+    let mut failures: Vec<String> = Vec::new();
+    let mut by_kind: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+    for (name, src) in &corpus {
+        let Some(meant) = interpreted_output(src) else { continue };
+        for (kind, mutated) in rho_lang::hint::mutations(src) {
+            let err = match parse_rho_program(&mutated) {
+                Ok(_) => {
+                    still_valid += 1;
+                    if std::env::var("RHO_SHOW_VALID").is_ok() {
+                        eprintln!("still valid [{kind}] {name}:\n{mutated}");
+                    }
+                    continue;
+                }
+                Err(e) => e,
+            };
+            refused += 1;
+            let entry = by_kind.entry(kind).or_default();
+            entry.0 += 1;
+            let hints = rho_lang::hint::suggest(&mutated, &err);
+            let back = hints.iter().any(|h| h.apply(&mutated).and_then(|f| interpreted_output(&f)).as_ref() == Some(&meant));
+            if back {
+                restored += 1;
+                entry.1 += 1;
+            } else {
+                let shown = rho_lang::hint::render(&hints, rho_lang::hint::Lang::En);
+                failures.push(format!("{name} [{kind}]\n{mutated}\n{err}\n{shown}"));
+            }
+        }
+    }
+    eprintln!("habits: {refused} refused, {restored} given back by a hint, {still_valid} still valid programs");
+    for (kind, (n, ok)) in &by_kind {
+        eprintln!("  {kind:14} {ok}/{n}");
+    }
+    assert!(refused > 50, "too few mutations refused to mean anything: {refused}");
+    assert!(failures.is_empty(), "{} habits without a hint that gives the program back:\n\n{}", failures.len(), failures.join("\n---\n"));
 }

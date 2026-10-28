@@ -953,31 +953,38 @@ fn parse_line(line: &str) -> Result<Option<Statement>> {
                 target,
             }));
         }
+        return Err(HarmonyDisruption::LoweringErr {
+            detail: "a flow has one arrow: `expr → NAME`; write a chain as one line per flow".to_string(),
+            line: 0,
+        });
     }
 
-    Ok(None)
+    // Anything else was once dropped without a word, which let `S = expr`
+    // or `X:◯ 8` pass as though they meant something.
+    Err(HarmonyDisruption::LoweringErr {
+        detail: "this line is not a statement of ρ: a declaration `NAME:◯ □ dims`, a flow `expr → NAME`, a fixed point `expr ⇒ NAME`, a constraint `! expr` or a trace `$ expr`".to_string(),
+        line: 0,
+    })
 }
 
 fn parse_ext_binding(line: &str) -> Result<ExternalBinding> {
     let parts: Vec<&str> = line.split(':').collect();
     if parts.len() < 3 {
-        return Err(HarmonyDisruption::GlyphErr {
-            symbol: line.to_string(),
-            line: 1,
-            column: 1,
+        return Err(HarmonyDisruption::LoweringErr {
+            detail: "a bound space is written `&[0xADDRESS]:NAME:◯ □ dims`".to_string(),
+            line: 0,
         });
     }
 
-    let addr_part = parts[0].trim().trim_start_matches("&[").trim_end_matches(']');
-    let addr = u64::from_str_radix(addr_part.trim_start_matches("0x"), 16).unwrap_or(0);
+    let addr_part = parts[0].trim().trim_start_matches("&[").trim_end_matches(']').trim();
+    let digits = addr_part.trim_start_matches("0x").trim_start_matches("0X");
+    let addr = u64::from_str_radix(digits, 16).map_err(|_| HarmonyDisruption::LoweringErr {
+        detail: format!("`{addr_part}` is not an address: write it in hexadecimal, `&[0x7A4F]`"),
+        line: 0,
+    })?;
 
     let space_name = parts[1].trim().to_string();
-
-    let dims_part = parts[2].replace("◯", "").replace("□", "");
-    let dimensions: Vec<usize> = dims_part
-        .split_whitespace()
-        .filter_map(|s| s.parse::<usize>().ok())
-        .collect();
+    let dimensions = parse_shape(&parts[2..].join(":"), &space_name)?;
 
     Ok(ExternalBinding {
         address: addr,
@@ -988,15 +995,43 @@ fn parse_ext_binding(line: &str) -> Result<ExternalBinding> {
     })
 }
 
-fn parse_space_decl(line: &str) -> Result<SpaceDecl> {
-    let parts: Vec<&str> = line.split(':').collect();
-    let name = parts[0].trim().to_string();
-    let rest = parts[1].replace("◯", "").replace("□", "");
-    let dimensions: Vec<usize> = rest
-        .split_whitespace()
-        .filter_map(|s| s.parse::<usize>().ok())
-        .collect();
+/// `◯ □ d0 d1 …`: the shape of a declaration, every dimension a whole
+/// number of at least one. Anything else is refused with what was meant,
+/// rather than read around: a dimension that did not parse used to vanish.
+fn parse_shape(text: &str, name: &str) -> Result<Vec<usize>> {
+    let t = text.trim();
+    let rest = t
+        .strip_prefix("◯ □")
+        .or_else(|| t.strip_prefix("◯□"))
+        .ok_or_else(|| HarmonyDisruption::LoweringErr {
+            detail: format!("`{name}` is declared `{name}:◯ □ dims`: the circle, then the square, then the dimensions"),
+            line: 0,
+        })?;
+    let mut dims = Vec::new();
+    for word in rest.split_whitespace() {
+        match word.parse::<usize>() {
+            Ok(d) if d >= 1 => dims.push(d),
+            _ => {
+                return Err(HarmonyDisruption::LoweringErr {
+                    detail: format!("`{word}` is not a dimension of `{name}`: dimensions are whole numbers of at least 1, separated by spaces"),
+                    line: 0,
+                })
+            }
+        }
+    }
+    if dims.is_empty() {
+        return Err(HarmonyDisruption::LoweringErr {
+            detail: format!("`{name}` has no dimensions: write them after `◯ □`"),
+            line: 0,
+        });
+    }
+    Ok(dims)
+}
 
+fn parse_space_decl(line: &str) -> Result<SpaceDecl> {
+    let (name, rest) = line.split_once(':').unwrap_or((line, ""));
+    let name = name.trim().to_string();
+    let dimensions = parse_shape(rest, &name)?;
     Ok(SpaceDecl { name, dimensions })
 }
 

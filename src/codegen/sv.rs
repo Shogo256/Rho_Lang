@@ -2424,6 +2424,13 @@ fn functions(numbers: Numbers) -> String {
 }
 
 const REAL_FUNCTIONS: &str = r#"
+  // NaN read from the bits: an all-ones exponent with a fraction. `x != x`
+  // says the same in IEEE arithmetic, but Verilator 5.02x folds it to false.
+  function automatic logic rho_is_nan(input real x);
+    logic [63:0] b;
+    b = $realtobits(x);
+    return (b[62:52] == 11'h7FF) && (b[51:0] != 52'h0);
+  endfunction
   // A comparison masks: the left value where it holds, zero elsewhere.
   function automatic real rho_mask(input logic holds, input real l);
     return holds ? l : $bitstoreal(64'h0);
@@ -2439,8 +2446,8 @@ const REAL_FUNCTIONS: &str = r#"
   // IEEE 754-2019 maximum / minimum: a NaN propagates, -0 orders below +0.
   function automatic real rho_extreme(input real l, input real r, input logic greater);
     real by_value, by_sign, ordered;
-    if (l != l) return l;
-    if (r != r) return r;
+    if (rho_is_nan(l)) return l;
+    if (rho_is_nan(r)) return r;
     by_value = greater ? ((l > r) ? l : r) : ((l < r) ? l : r);
     by_sign = greater ? ((1.0 / l > 1.0 / r) ? l : r) : ((1.0 / l < 1.0 / r) ? l : r);
     ordered = (l == r) ? by_sign : by_value;
@@ -2456,7 +2463,7 @@ const REAL_FUNCTIONS: &str = r#"
   // The roll: splitmix64's finaliser over the bits, the top 53 scaled into [0, 1).
   function automatic real rho_roll(input real x);
     longint unsigned z;
-    z = (x != x) ? 64'd0 : $realtobits(x);
+    z = rho_is_nan(x) ? 64'd0 : $realtobits(x);
     z = z + 64'h9E3779B97F4A7C15;
     z = (z ^ (z >> 30)) * 64'hBF58476D1CE4E5B9;
     z = (z ^ (z >> 27)) * 64'h94D049BB133111EB;

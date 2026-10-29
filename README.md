@@ -1,6 +1,6 @@
 # ρ (RHO)
 
-[![CI](https://github.com/Escoffier1156/Rho_Lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Escoffier1156/Rho_Lang/actions/workflows/ci.yml)
+[![CI](https://github.com/Shogo256/Rho_Lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Shogo256/Rho_Lang/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 ```
@@ -117,7 +117,7 @@ but Rust's standard library. To work on the compiler itself (Rust 1.88+
 and clang):
 
 ```bash
-git clone https://github.com/Escoffier1156/Rho_Lang.git && cd Rho_Lang
+git clone https://github.com/Shogo256/Rho_Lang.git && cd Rho_Lang
 cargo build --release && cargo test
 ```
 
@@ -353,7 +353,7 @@ the list above says it leaves out.
 
 ## Read on
 
-- [Wiki](https://github.com/Escoffier1156/Rho_Lang/wiki) — getting started, the syntax reference, how it is verified
+- [Wiki](https://github.com/Shogo256/Rho_Lang/wiki) — getting started, the syntax reference, how it is verified
 - [CHANGELOG.md](CHANGELOG.md)
 - Bugs go to Issues, with the `.rho` that shows them
 

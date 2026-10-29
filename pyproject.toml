@@ -24,7 +24,7 @@ classifiers = [
 dynamic = ["version"]
 
 [project.urls]
-Repository = "https://github.com/Escoffier1156/Rho_Lang"
+Repository = "https://github.com/Shogo256/Rho_Lang"
 
 [tool.maturin]
 # The wheel carries the `rhoc` binary as a script and the pure-Python `rho`

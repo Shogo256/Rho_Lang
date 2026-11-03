@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 — 2026-11-03
+
+What changed since 1.0, in one paragraph: a refused line now says how ρ
+writes it (in English or Japanese), and every habit the hints cover is a
+leg of the differential test; lines that were dropped without a word are
+refused; the kernel folds several lines at once and reads an affine `⌷`
+without a gather (a 321-tap FIR 95 → 13 µs); single precision runs eight
+lanes; `rhoc` gains `--emit-static`, `--emit-lean`, `--explain`,
+`--constant-time` and `--fuse`; the build depends on no crate; and the
+JAX module and the circuit were brought into line with the interpreter
+wherever the differential test found them apart (NaN in folds, constant
+division, `ind`, Verilator 5.02x). The details follow.
 
 - **A refusal says how ρ writes the line.** Under the caret, a hint for a
   line written the way another notation writes it: a fold or a scan after
